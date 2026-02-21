@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 
-const POLL_MS = 4000;
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const START_MODEL_OPTIONS = ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"];
 const REASONING_MODE_OPTIONS = ["default", "minimal", "low", "medium", "high", "xhigh"];
@@ -246,6 +245,11 @@ function terminalSocketUrl(chatId) {
   return `${protocol}://${window.location.host}/api/chats/${chatId}/terminal`;
 }
 
+function hubEventsSocketUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${window.location.host}/api/events`;
+}
+
 function ExpandIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
@@ -300,7 +304,7 @@ function CloseIcon() {
   );
 }
 
-function ChatTerminal({ chatId, running, onSubmitInput }) {
+function ChatTerminal({ chatId, running }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
   const [status, setStatus] = useState(running ? "connecting" : "offline");
@@ -347,48 +351,12 @@ function ChatTerminal({ chatId, running, onSubmitInput }) {
       return true;
     };
 
-    const containsSubmitSignal = (text) => {
-      const payload = String(text || "");
-      if (!payload) {
-        return false;
-      }
-      if (payload.includes("\r") || payload.includes("\n")) {
-        return true;
-      }
-      // Some terminal modes emit Enter as escape sequences.
-      return payload.includes("\x1bOM") || payload.includes("\x1b[13~");
-    };
-
-    let lastSubmitSignalAt = 0;
-    const triggerSubmitRefresh = () => {
-      if (typeof onSubmitInput !== "function") {
-        return;
-      }
-      const now = Date.now();
-      if (now - lastSubmitSignalAt < 100) {
-        return;
-      }
-      lastSubmitSignalAt = now;
-      onSubmitInput(chatId);
-    };
-
-    const notifySubmit = (text) => {
-      if (!containsSubmitSignal(text)) {
-        return;
-      }
-      triggerSubmitRefresh();
-    };
-
     const sendPasteText = (text) => {
       const normalized = String(text || "").replace(/\r\n/g, "\n");
       if (!normalized) {
         return false;
       }
-      const sent = sendInput(normalized);
-      if (sent) {
-        notifySubmit(normalized);
-      }
-      return sent;
+      return sendInput(normalized);
     };
 
     const sendResize = () => {
@@ -401,13 +369,19 @@ function ChatTerminal({ chatId, running, onSubmitInput }) {
     };
 
     const inputDisposable = terminal.onData((data) => {
-      if (sendInput(data)) {
-        notifySubmit(data);
-      }
+      sendInput(data);
     });
     const keyDisposable = terminal.onKey(({ domEvent }) => {
-      if (domEvent.key === "Enter") {
-        triggerSubmitRefresh();
+      if (
+        domEvent.key === "Enter" &&
+        !domEvent.shiftKey &&
+        !domEvent.altKey &&
+        !domEvent.ctrlKey &&
+        !domEvent.metaKey
+      ) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "submit" }));
+        }
       }
     });
 
@@ -487,7 +461,7 @@ function ChatTerminal({ chatId, running, onSubmitInput }) {
       }
       terminal.dispose();
     };
-  }, [chatId, running, onSubmitInput]);
+  }, [chatId, running]);
 
   return (
     <div className="terminal-shell chat-terminal-shell" ref={shellRef}>
@@ -689,6 +663,43 @@ function normalizeOpenAiAccountSession(rawSession) {
   };
 }
 
+function normalizeOpenAiTitleTestResult(rawResult) {
+  if (!rawResult || typeof rawResult !== "object") {
+    return null;
+  }
+  const rawConnectivity = rawResult.connectivity && typeof rawResult.connectivity === "object"
+    ? rawResult.connectivity
+    : {};
+  const rawIssues = Array.isArray(rawResult.issues) ? rawResult.issues : [];
+  return {
+    ok: Boolean(rawResult.ok),
+    title: String(rawResult.title || ""),
+    model: String(rawResult.model || ""),
+    prompt: String(rawResult.prompt || ""),
+    error: String(rawResult.error || ""),
+    issues: rawIssues.map((item) => String(item || "")).filter(Boolean),
+    connectivity: {
+      apiKeyConnected: Boolean(rawConnectivity.api_key_connected),
+      apiKeyHint: String(rawConnectivity.api_key_hint || ""),
+      apiKeyUpdatedAt: String(rawConnectivity.api_key_updated_at || ""),
+      accountConnected: Boolean(rawConnectivity.account_connected),
+      accountAuthMode: String(rawConnectivity.account_auth_mode || ""),
+      accountUpdatedAt: String(rawConnectivity.account_updated_at || ""),
+      titleGenerationAuthMode: String(rawConnectivity.title_generation_auth_mode || "none")
+    }
+  };
+}
+
+function resolveTitleGenerationAuthMode(providerStatus) {
+  if (providerStatus?.accountConnected) {
+    return "chatgpt_account";
+  }
+  if (providerStatus?.connected) {
+    return "api_key";
+  }
+  return "none";
+}
+
 function buildProxiedOpenAiLoginUrl(loginUrl) {
   const raw = String(loginUrl || "").trim();
   if (!raw) {
@@ -817,7 +828,6 @@ function HubApp() {
   const [collapsedProjectChats, setCollapsedProjectChats] = useState({});
   const [chatStartSettingsByProject, setChatStartSettingsByProject] = useState({});
   const [fullscreenChatId, setFullscreenChatId] = useState("");
-  const titleRefreshTimersRef = useRef(new Map());
   const createChatQueueRef = useRef(new Map());
   const createChatActiveProjectsRef = useRef(new Set());
   const [pendingSessions, setPendingSessions] = useState([]);
@@ -840,9 +850,15 @@ function HubApp() {
   const [openAiAccountCancelling, setOpenAiAccountCancelling] = useState(false);
   const [openAiAccountDisconnecting, setOpenAiAccountDisconnecting] = useState(false);
   const [openAiAccountCallbackInput, setOpenAiAccountCallbackInput] = useState("");
+  const [openAiTitleTestPrompt, setOpenAiTitleTestPrompt] = useState("");
+  const [openAiTitleTestRunning, setOpenAiTitleTestRunning] = useState(false);
+  const [openAiTitleTestResult, setOpenAiTitleTestResult] = useState(null);
+  const stateRefreshInFlightRef = useRef(false);
+  const stateRefreshQueuedRef = useRef(false);
+  const authRefreshInFlightRef = useRef(false);
+  const authRefreshQueuedRef = useRef(false);
 
-  const refreshState = useCallback(async () => {
-    const payload = await fetchJson("/api/state");
+  const applyStatePayload = useCallback((payload) => {
     setHubState(payload);
     const serverChatMap = new Map((payload.chats || []).map((chat) => [chat.id, chat]));
     setPendingSessions((prev) =>
@@ -885,6 +901,11 @@ function HubApp() {
     });
   }, []);
 
+  const refreshState = useCallback(async () => {
+    const payload = await fetchJson("/api/state");
+    applyStatePayload(payload);
+  }, [applyStatePayload]);
+
   const refreshAuthSettings = useCallback(async () => {
     const [authPayload, sessionPayload] = await Promise.all([
       fetchJson("/api/settings/auth"),
@@ -895,6 +916,50 @@ function HubApp() {
     setOpenAiAccountSession(normalizeOpenAiAccountSession(sessionPayload?.session));
     setOpenAiAuthLoaded(true);
   }, []);
+
+  const queueStateRefresh = useCallback(() => {
+    if (stateRefreshInFlightRef.current) {
+      stateRefreshQueuedRef.current = true;
+      return;
+    }
+    stateRefreshInFlightRef.current = true;
+    refreshState()
+      .then(() => {
+        setError("");
+      })
+      .catch((err) => {
+        setError(err.message || String(err));
+      })
+      .finally(() => {
+        stateRefreshInFlightRef.current = false;
+        if (stateRefreshQueuedRef.current) {
+          stateRefreshQueuedRef.current = false;
+          queueStateRefresh();
+        }
+      });
+  }, [refreshState]);
+
+  const queueAuthRefresh = useCallback(() => {
+    if (authRefreshInFlightRef.current) {
+      authRefreshQueuedRef.current = true;
+      return;
+    }
+    authRefreshInFlightRef.current = true;
+    refreshAuthSettings()
+      .then(() => {
+        setError("");
+      })
+      .catch((err) => {
+        setError(err.message || String(err));
+      })
+      .finally(() => {
+        authRefreshInFlightRef.current = false;
+        if (authRefreshQueuedRef.current) {
+          authRefreshQueuedRef.current = false;
+          queueAuthRefresh();
+        }
+      });
+  }, [refreshAuthSettings]);
 
   const visibleChats = useMemo(() => {
     const serverChats = hubState.chats || [];
@@ -955,63 +1020,131 @@ function HubApp() {
     return merged;
   }, [hubState.chats, pendingSessions]);
 
-  const hasPendingTitleGeneration = useMemo(
-    () => visibleChats.some((chat) => String(chat.title_status || "").toLowerCase() === "pending"),
-    [visibleChats]
-  );
-
   useEffect(() => {
-    let mounted = true;
-
-    async function refreshAndHandleError() {
-      try {
-        await Promise.all([refreshState(), refreshAuthSettings()]);
-        if (mounted) {
+    let cancelled = false;
+    Promise.all([refreshState(), refreshAuthSettings()])
+      .then(() => {
+        if (!cancelled) {
           setError("");
         }
-      } catch (err) {
-        if (mounted) {
+      })
+      .catch((err) => {
+        if (!cancelled) {
           setError(err.message || String(err));
         }
-      }
-    }
-
-    refreshAndHandleError();
-    const interval = setInterval(refreshAndHandleError, POLL_MS);
-
+      });
     return () => {
-      mounted = false;
-      clearInterval(interval);
+      cancelled = true;
     };
   }, [refreshState, refreshAuthSettings]);
 
-  useEffect(() => () => {
-    for (const timeouts of titleRefreshTimersRef.current.values()) {
-      for (const timeoutId of timeouts) {
-        window.clearTimeout(timeoutId);
-      }
-    }
-    titleRefreshTimersRef.current.clear();
-  }, []);
-
   useEffect(() => {
-    if (!hasPendingTitleGeneration) {
-      return undefined;
-    }
-    let cancelled = false;
-    const tick = () => {
-      if (cancelled) {
+    let stopped = false;
+    let reconnectTimer = null;
+    let ws = null;
+
+    const applyAuthPayload = (authPayload) => {
+      const provider = authPayload?.providers?.openai;
+      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(provider));
+      setOpenAiAuthLoaded(true);
+    };
+
+    const applyOpenAiSessionPayload = (sessionPayload) => {
+      setOpenAiAccountSession(normalizeOpenAiAccountSession(sessionPayload?.session));
+      if (sessionPayload?.account_connected) {
+        setOpenAiProviderStatus((prev) => ({
+          ...prev,
+          accountConnected: true,
+          accountAuthMode: String(sessionPayload?.account_auth_mode || prev.accountAuthMode || "chatgpt"),
+          accountUpdatedAt: String(sessionPayload?.account_updated_at || prev.accountUpdatedAt || "")
+        }));
+      }
+    };
+
+    const connect = () => {
+      if (stopped) {
         return;
       }
-      refreshState().catch(() => {});
+      ws = new WebSocket(hubEventsSocketUrl());
+      ws.addEventListener("message", (event) => {
+        if (typeof event.data !== "string") {
+          return;
+        }
+        let parsed = null;
+        try {
+          parsed = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        const eventType = String(parsed?.type || "");
+        const payload = parsed?.payload || {};
+        if (eventType === "pong") {
+          return;
+        }
+        if (eventType === "snapshot") {
+          if (payload.state) {
+            applyStatePayload(payload.state);
+          }
+          if (payload.auth) {
+            applyAuthPayload(payload.auth);
+          }
+          if (payload.openai_account_session) {
+            applyOpenAiSessionPayload(payload.openai_account_session);
+          }
+          if (payload.project_build_logs && typeof payload.project_build_logs === "object") {
+            setProjectBuildLogs((prev) => ({ ...prev, ...payload.project_build_logs }));
+          }
+          return;
+        }
+        if (eventType === "state_changed") {
+          queueStateRefresh();
+          return;
+        }
+        if (eventType === "auth_changed") {
+          queueAuthRefresh();
+          return;
+        }
+        if (eventType === "openai_account_session") {
+          applyOpenAiSessionPayload(payload);
+          return;
+        }
+        if (eventType === "project_build_log") {
+          const projectId = String(payload.project_id || "");
+          if (!projectId) {
+            return;
+          }
+          const text = String(payload.text || "");
+          const replace = Boolean(payload.replace);
+          setProjectBuildLogs((prev) => ({
+            ...prev,
+            [projectId]: replace ? text : `${prev[projectId] || ""}${text}`
+          }));
+        }
+      });
+      ws.addEventListener("close", () => {
+        if (stopped) {
+          return;
+        }
+        reconnectTimer = window.setTimeout(connect, 800);
+      });
+      ws.addEventListener("error", () => {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          ws.close();
+        }
+      });
     };
-    tick();
-    const interval = window.setInterval(tick, 1200);
+
+    connect();
     return () => {
-      cancelled = true;
-      window.clearInterval(interval);
+      stopped = true;
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+      }
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close();
+      }
     };
-  }, [hasPendingTitleGeneration, refreshState]);
+  }, [applyStatePayload, queueAuthRefresh, queueStateRefresh]);
 
   useEffect(() => {
     setProjectDrafts((prev) => {
@@ -1079,84 +1212,22 @@ function HubApp() {
   }, [hubState.projects]);
 
   useEffect(() => {
-    let stopped = false;
-    const activeProjects = hubState.projects.filter((project) => {
-      const status = String(project.build_status || "");
-      return status === "building";
+    const activeProjectIds = new Set(
+      hubState.projects
+        .filter((project) => String(project.build_status || "") === "building")
+        .map((project) => project.id)
+    );
+    setProjectBuildLogs((prev) => {
+      if (activeProjectIds.size === 0) {
+        return {};
+      }
+      const next = {};
+      for (const projectId of activeProjectIds) {
+        next[projectId] = prev[projectId] || "";
+      }
+      return next;
     });
-
-    if (activeProjects.length === 0) {
-      setProjectBuildLogs({});
-      return undefined;
-    }
-
-    async function refreshProjectLogs() {
-      const updates = {};
-      await Promise.all(
-        activeProjects.map(async (project) => {
-          try {
-            updates[project.id] = await fetchText(`/api/projects/${project.id}/build-logs`);
-          } catch {
-            updates[project.id] = "";
-          }
-        })
-      );
-      if (!stopped) {
-        setProjectBuildLogs((prev) => {
-          const next = {};
-          for (const project of activeProjects) {
-            if (prev[project.id] !== undefined) {
-              next[project.id] = prev[project.id];
-            }
-          }
-          return { ...next, ...updates };
-        });
-      }
-    }
-
-    refreshProjectLogs();
-    const interval = setInterval(refreshProjectLogs, 1500);
-    return () => {
-      stopped = true;
-      clearInterval(interval);
-    };
   }, [hubState.projects]);
-
-  useEffect(() => {
-    if (!openAiAccountSession?.running) {
-      return undefined;
-    }
-    let cancelled = false;
-
-    async function refreshAccountSession() {
-      try {
-        const payload = await fetchJson("/api/settings/auth/openai/account/session");
-        if (cancelled) {
-          return;
-        }
-        setOpenAiAccountSession(normalizeOpenAiAccountSession(payload?.session));
-        if (payload?.account_connected) {
-          setOpenAiProviderStatus((prev) => ({
-            ...prev,
-            accountConnected: true,
-            accountAuthMode: String(payload?.account_auth_mode || prev.accountAuthMode || "chatgpt"),
-            accountUpdatedAt: String(payload?.account_updated_at || prev.accountUpdatedAt || "")
-          }));
-        }
-      } catch {
-        if (!cancelled) {
-          setOpenAiAccountSession((prev) => prev);
-        }
-      }
-    }
-
-    refreshAccountSession();
-    const interval = setInterval(refreshAccountSession, 1500);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [openAiAccountSession?.id, openAiAccountSession?.running]);
 
   const projectsById = useMemo(() => {
     const map = new Map();
@@ -1622,6 +1693,62 @@ function HubApp() {
     }
   }
 
+  async function handleTestOpenAiTitleGeneration(event) {
+    event.preventDefault();
+    const prompt = String(openAiTitleTestPrompt || "").trim();
+    const titleAuthMode = resolveTitleGenerationAuthMode(openAiProviderStatus);
+    if (!prompt) {
+      setOpenAiTitleTestResult({
+        ok: false,
+        title: "",
+        model: "",
+        prompt: "",
+        error: "Enter a prompt before running the title-generation test.",
+        issues: ["Enter a prompt before running the title-generation test."],
+        connectivity: {
+          apiKeyConnected: openAiProviderStatus.connected,
+          apiKeyHint: openAiProviderStatus.keyHint,
+          apiKeyUpdatedAt: openAiProviderStatus.updatedAt,
+          accountConnected: openAiProviderStatus.accountConnected,
+          accountAuthMode: openAiProviderStatus.accountAuthMode,
+          accountUpdatedAt: openAiProviderStatus.accountUpdatedAt,
+          titleGenerationAuthMode: titleAuthMode
+        }
+      });
+      return;
+    }
+
+    setOpenAiTitleTestRunning(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/openai/title-test", {
+        method: "POST",
+        body: JSON.stringify({ prompt })
+      });
+      setOpenAiTitleTestResult(normalizeOpenAiTitleTestResult(payload));
+    } catch (err) {
+      const message = err.message || String(err);
+      setOpenAiTitleTestResult({
+        ok: false,
+        title: "",
+        model: "",
+        prompt,
+        error: message,
+        issues: [message],
+        connectivity: {
+          apiKeyConnected: openAiProviderStatus.connected,
+          apiKeyHint: openAiProviderStatus.keyHint,
+          apiKeyUpdatedAt: openAiProviderStatus.updatedAt,
+          accountConnected: openAiProviderStatus.accountConnected,
+          accountAuthMode: openAiProviderStatus.accountAuthMode,
+          accountUpdatedAt: openAiProviderStatus.accountUpdatedAt,
+          titleGenerationAuthMode: titleAuthMode
+        }
+      });
+    } finally {
+      setOpenAiTitleTestRunning(false);
+    }
+  }
+
   const chatsByProject = useMemo(() => {
     const byProject = new Map();
     for (const project of hubState.projects) {
@@ -1760,26 +1887,6 @@ function HubApp() {
     }
   }
 
-  const scheduleChatTitleRefresh = useCallback((chatId) => {
-    const key = String(chatId || "");
-    if (!key) {
-      return;
-    }
-    const existing = titleRefreshTimersRef.current.get(key) || [];
-    for (const timeoutId of existing) {
-      window.clearTimeout(timeoutId);
-    }
-    const requestRefresh = () => {
-      refreshState().catch(() => {});
-    };
-    const timeoutIds = [
-      window.setTimeout(requestRefresh, 250),
-      window.setTimeout(requestRefresh, 1200),
-      window.setTimeout(requestRefresh, 2800),
-    ];
-    titleRefreshTimersRef.current.set(key, timeoutIds);
-  }, [refreshState]);
-
   function renderChatCard(chat) {
     const resolvedChatId = resolveServerChatId(chat);
     const chatHasServer = hasServerChat(chat);
@@ -1795,7 +1902,7 @@ function HubApp() {
     const isFullscreenChat = fullscreenChatId === chat.id;
     const containerClassName = ["card", isFullscreenChat ? "chat-card-popped" : ""].filter(Boolean).join(" ");
     const titleText = chat.display_name || chat.name;
-    const titleStateLabel = titleStatus === "pending" ? "Updating title" : titleStatus === "error" ? "Title error" : "";
+    const titleStateLabel = titleStatus === "error" ? "Title error" : "";
     const rowSubtitle = isStarting
       ? "Starting chat and preparing terminal..."
       : chat.display_subtitle || "No recent assistant summary yet.";
@@ -1914,7 +2021,7 @@ function HubApp() {
                 </div>
               </div>
             ) : isRunning ? (
-              <ChatTerminal chatId={resolvedChatId} running={isRunning} onSubmitInput={scheduleChatTitleRefresh} />
+              <ChatTerminal chatId={resolvedChatId} running={isRunning} />
             ) : chatHasServer ? (
               <div className="stack compact">
                 <div className="meta chat-terminal-stopped">Chat is stopped. Start it to reconnect the terminal.</div>
@@ -2624,6 +2731,75 @@ function HubApp() {
                         </button>
                       </div>
                     </form>
+                  </div>
+                  <div className="settings-auth-block">
+                    <h4>Test Chat Title Generation</h4>
+                    <p className="meta">
+                      Runs a live title-generation request through the same backend path used by chat titles.
+                      Account credentials are used first when connected, then API key.
+                    </p>
+                    <form className="stack compact" onSubmit={handleTestOpenAiTitleGeneration}>
+                      <textarea
+                        value={openAiTitleTestPrompt}
+                        onChange={(event) => setOpenAiTitleTestPrompt(event.target.value)}
+                        placeholder="Enter a sample user prompt (for example: debug websocket reconnect flake in CI)"
+                        spellCheck={false}
+                      />
+                      <div className="actions">
+                        <button type="submit" className="btn-secondary" disabled={openAiTitleTestRunning}>
+                          {openAiTitleTestRunning ? <SpinnerLabel text="Testing..." /> : "Run title test"}
+                        </button>
+                      </div>
+                    </form>
+                    {openAiTitleTestResult ? (
+                      <div className="stack compact">
+                        <div className="meta">
+                          Test result:{" "}
+                          <span className={`project-build-state ${openAiTitleTestResult.ok ? "ready" : "failed"}`}>
+                            {openAiTitleTestResult.ok ? "success" : "failed"}
+                          </span>
+                        </div>
+                        <div className="meta">
+                          Title generation auth mode: {openAiTitleTestResult.connectivity.titleGenerationAuthMode}
+                        </div>
+                        <div className="meta">
+                          API key connected:{" "}
+                          {openAiTitleTestResult.connectivity.apiKeyConnected
+                            ? `yes (${openAiTitleTestResult.connectivity.apiKeyHint || "saved"})`
+                            : "no"}
+                        </div>
+                        <div className="meta">
+                          API key updated: {formatTimestamp(openAiTitleTestResult.connectivity.apiKeyUpdatedAt)}
+                        </div>
+                        <div className="meta">
+                          OpenAI account connected:{" "}
+                          {openAiTitleTestResult.connectivity.accountConnected
+                            ? `yes (${openAiTitleTestResult.connectivity.accountAuthMode || "chatgpt"})`
+                            : "no"}
+                        </div>
+                        <div className="meta">
+                          OpenAI account updated: {formatTimestamp(openAiTitleTestResult.connectivity.accountUpdatedAt)}
+                        </div>
+                        {openAiTitleTestResult.model ? (
+                          <div className="meta">Model: {openAiTitleTestResult.model}</div>
+                        ) : null}
+                        {openAiTitleTestResult.title ? (
+                          <div className="meta">
+                            Generated title: <code>{openAiTitleTestResult.title}</code>
+                          </div>
+                        ) : null}
+                        {openAiTitleTestResult.error ? (
+                          <div className="meta build-error">{openAiTitleTestResult.error}</div>
+                        ) : null}
+                        {openAiTitleTestResult.issues.length > 0 ? (
+                          <ul className="settings-auth-help-list">
+                            {openAiTitleTestResult.issues.map((issue, index) => (
+                              <li key={`title-test-issue-${index}`}>{issue}</li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
                   <p className="meta settings-auth-note">
                     API keys are stored only on this machine with restricted file permissions and are never returned by the API

@@ -276,6 +276,12 @@ def _resolve_base_image(
     default=False,
     help="Build/reuse snapshot image and exit without starting the agent.",
 )
+@click.option(
+    "--no-alt-screen",
+    is_flag=True,
+    default=False,
+    help="Pass --no-alt-screen to codex when launching the agent.",
+)
 @click.option("--resume", is_flag=True, default=False, help="Resume last session")
 @click.argument("container_args", nargs=-1)
 def main(
@@ -303,6 +309,7 @@ def main(
     setup_script: str | None,
     snapshot_image_tag: str | None,
     prepare_snapshot_only: bool,
+    no_alt_screen: bool,
     resume: bool,
     container_args: tuple[str, ...],
 ) -> None:
@@ -415,12 +422,13 @@ def main(
     for entry in env_vars:
         parsed_env_vars.append(_parse_env_var(entry, "--env-var"))
 
+    command = [DEFAULT_AGENT_COMMAND]
+    if no_alt_screen:
+        command.append("--no-alt-screen")
     if container_args:
-        command = [DEFAULT_AGENT_COMMAND, *container_args]
+        command.extend(container_args)
     elif resume:
-        command = [DEFAULT_AGENT_COMMAND, "bash", "-lc", RESUME_COMMAND]
-    else:
-        command = [DEFAULT_AGENT_COMMAND]
+        command.extend(["bash", "-lc", RESUME_COMMAND])
 
     run_args = [
         "--init",

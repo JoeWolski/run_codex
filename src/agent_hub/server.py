@@ -5,6 +5,7 @@ import codecs
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -12,6 +13,7 @@ import signal
 import struct
 import subprocess
 import shutil
+import sys
 import termios
 import time
 import urllib.error
@@ -21,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, Thread, current_thread
-from typing import Any
+from typing import Any, Callable
 
 import click
 import uvicorn
@@ -36,8 +38,8 @@ OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
-TERMINAL_LOG_TAIL_BYTES = 200_000
 TERMINAL_QUEUE_MAX = 256
+HUB_EVENT_QUEUE_MAX = 512
 OPENAI_ACCOUNT_LOGIN_LOG_MAX_CHARS = 16_000
 OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT = 1455
 DEFAULT_AGENT_IMAGE = "agent-ubuntu2204:latest"
@@ -49,7 +51,15 @@ CHAT_SUBTITLE_MAX_CHARS = 120
 CHAT_TITLE_PROMPT_MAX_ITEMS = 16
 CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS = 64
 CHAT_TITLE_API_TIMEOUT_SECONDS = 8.0
+CHAT_TITLE_CODEX_TIMEOUT_SECONDS = 25.0
 CHAT_TITLE_OPENAI_MODEL = os.environ.get("AGENT_HUB_CHAT_TITLE_MODEL", "gpt-4.1-mini")
+CHAT_TITLE_ACCOUNT_MODEL = "chatgpt-account"
+CHAT_TITLE_AUTH_MODE_ACCOUNT = "chatgpt_account"
+CHAT_TITLE_AUTH_MODE_API_KEY = "api_key"
+CHAT_TITLE_AUTH_MODE_NONE = "none"
+CHAT_TITLE_NO_CREDENTIALS_ERROR = (
+    "No OpenAI credentials configured for chat title generation. Connect an OpenAI account or API key in Settings."
+)
 ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:"
     r"[@-Z\\-_]"
@@ -58,7 +68,21 @@ ANSI_ESCAPE_RE = re.compile(
     r"|P[^\x1B\x07]*(?:\x07|\x1B\\)"
     r")"
 )
+OSC_COLOR_RESPONSE_FRAGMENT_RE = re.compile(
+    r"(?:^|\s)\]?\d{1,3};(?:rgb|rgba):[0-9a-f]{2,4}/[0-9a-f]{2,4}/[0-9a-f]{2,4}",
+    re.IGNORECASE,
+)
 RESERVED_ENV_VAR_KEYS = {"OPENAI_API_KEY"}
+HUB_LOG_LEVEL_CHOICES = ("critical", "error", "warning", "info", "debug")
+
+EVENT_TYPE_SNAPSHOT = "snapshot"
+EVENT_TYPE_STATE_CHANGED = "state_changed"
+EVENT_TYPE_AUTH_CHANGED = "auth_changed"
+EVENT_TYPE_OPENAI_ACCOUNT_SESSION = "openai_account_session"
+EVENT_TYPE_PROJECT_BUILD_LOG = "project_build_log"
+
+LOGGER = logging.getLogger("agent_hub")
+LOGGER.addHandler(logging.NullHandler())
 
 
 @dataclass
@@ -116,6 +140,30 @@ def _frontend_dist_dir() -> Path:
 
 def _frontend_index_file() -> Path:
     return _frontend_dist_dir() / "index.html"
+
+
+def _normalize_log_level(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in HUB_LOG_LEVEL_CHOICES:
+        return normalized
+    return "info"
+
+
+def _configure_hub_logging(level: str) -> None:
+    normalized = _normalize_log_level(level)
+    handler = logging.StreamHandler(sys.__stderr__)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    LOGGER.handlers.clear()
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(getattr(logging, normalized.upper(), logging.INFO))
+    LOGGER.propagate = False
+
+
+def _uvicorn_log_level(hub_level: str) -> str:
+    normalized = _normalize_log_level(hub_level)
+    if normalized == "debug":
+        return "info"
+    return normalized
 
 
 def _run_cli_command(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -230,24 +278,47 @@ def _run(cmd: list[str], cwd: Path | None = None, capture: bool = False, check: 
     return result
 
 
-def _run_logged(cmd: list[str], log_path: Path, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def _run_logged(
+    cmd: list[str],
+    log_path: Path,
+    cwd: Path | None = None,
+    check: bool = True,
+    on_output: Callable[[str], None] | None = None,
+) -> subprocess.CompletedProcess:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8", errors="ignore") as log_file:
-        log_file.write(f"$ {' '.join(cmd)}\n")
+        start_line = f"$ {' '.join(cmd)}\n"
+        log_file.write(start_line)
         log_file.flush()
-        result = subprocess.run(
+        if on_output is not None:
+            on_output(start_line)
+        process = subprocess.Popen(
             cmd,
             cwd=str(cwd) if cwd else None,
-            check=False,
             text=True,
-            stdout=log_file,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            bufsize=1,
         )
+        stdout = process.stdout
+        if stdout is not None:
+            for line in iter(stdout.readline, ""):
+                if line == "":
+                    break
+                log_file.write(line)
+                log_file.flush()
+                if on_output is not None:
+                    on_output(line)
+            stdout.close()
+        result = process.wait()
         log_file.write("\n")
         log_file.flush()
-    if check and result.returncode != 0:
-        raise HTTPException(status_code=400, detail=f"Command failed ({cmd[0]}) with exit code {result.returncode}")
-    return result
+        if on_output is not None:
+            on_output("\n")
+    completed = subprocess.CompletedProcess(cmd, result, "", "")
+    if check and completed.returncode != 0:
+        raise HTTPException(status_code=400, detail=f"Command failed ({cmd[0]}) with exit code {completed.returncode}")
+    return completed
 
 
 def _run_for_repo(cmd: list[str], repo_dir: Path, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
@@ -507,6 +578,74 @@ def _compact_whitespace(text: str) -> str:
     return " ".join(str(text or "").split())
 
 
+def _strip_ansi_stream(carry: str, text: str) -> tuple[str, str]:
+    source = f"{carry}{text}"
+    if not source:
+        return "", ""
+
+    output: list[str] = []
+    idx = 0
+    length = len(source)
+    while idx < length:
+        char = source[idx]
+        if char != "\x1b":
+            output.append(char)
+            idx += 1
+            continue
+
+        seq_start = idx
+        idx += 1
+        if idx >= length:
+            return "".join(output), source[seq_start:]
+
+        marker = source[idx]
+        if marker == "[":
+            idx += 1
+            while idx < length:
+                final = source[idx]
+                if "@" <= final <= "~":
+                    idx += 1
+                    break
+                idx += 1
+            else:
+                return "".join(output), source[seq_start:]
+            continue
+
+        if marker in {"]", "P"}:
+            idx += 1
+            terminated = False
+            while idx < length:
+                current = source[idx]
+                if current == "\x07":
+                    idx += 1
+                    terminated = True
+                    break
+                if current == "\x1b":
+                    if idx + 1 >= length:
+                        return "".join(output), source[seq_start:]
+                    if source[idx + 1] == "\\":
+                        idx += 2
+                        terminated = True
+                        break
+                idx += 1
+            if not terminated:
+                return "".join(output), source[seq_start:]
+            continue
+
+        idx += 1
+
+    return "".join(output), ""
+
+
+def _sanitize_submitted_prompt(prompt: Any) -> str:
+    cleaned = _compact_whitespace(prompt).strip()
+    if not cleaned:
+        return ""
+    cleaned = OSC_COLOR_RESPONSE_FRAGMENT_RE.sub(" ", cleaned)
+    cleaned = _compact_whitespace(cleaned).strip(" ;")
+    return cleaned
+
+
 def _looks_like_terminal_control_payload(text: str) -> bool:
     value = _compact_whitespace(text).strip()
     if not value:
@@ -653,6 +792,109 @@ def _openai_generate_chat_title(
     title = _truncate_title(first_line, max_chars)
     if not title:
         raise RuntimeError("OpenAI returned an invalid chat title.")
+    return title
+
+
+def _resolve_codex_executable(host_codex_dir: Path) -> str:
+    bundled = host_codex_dir / "bin" / "codex"
+    if bundled.is_file():
+        return str(bundled)
+    resolved = shutil.which("codex")
+    if resolved:
+        return resolved
+    raise RuntimeError("Codex CLI is not installed. ChatGPT account title generation is unavailable.")
+
+
+def _codex_exec_error_message(output_text: str) -> str:
+    cleaned = ANSI_ESCAPE_RE.sub("", str(output_text or "")).replace("\r", "\n")
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return "Unknown error."
+
+    for line in reversed(lines):
+        if line.lower().startswith("error:"):
+            detail = line.split(":", 1)[1].strip()
+            if detail:
+                return _short_summary(detail, max_words=30, max_chars=220)
+    return _short_summary(lines[-1], max_words=30, max_chars=220)
+
+
+def _codex_generate_chat_title(
+    host_agent_home: Path,
+    host_codex_dir: Path,
+    user_prompts: list[str],
+    max_chars: int = CHAT_TITLE_MAX_CHARS,
+    timeout_seconds: float = CHAT_TITLE_CODEX_TIMEOUT_SECONDS,
+) -> str:
+    prompts = _normalize_chat_prompt_history(user_prompts)
+    if not prompts:
+        raise RuntimeError("No submitted user prompts are available for chat title generation.")
+
+    codex_exec = _resolve_codex_executable(host_codex_dir)
+    prompt_lines = "\n".join(f"{index + 1}. {value}" for index, value in enumerate(prompts))
+    request_prompt = (
+        "Return exactly one concise title for an engineering chat.\n"
+        "Prioritize newer prompts over older prompts.\n"
+        f"Maximum length: {max_chars} characters.\n"
+        "Return plain text only. No quotes. No markdown. No prefix.\n\n"
+        "User prompts listed oldest to newest:\n"
+        f"{prompt_lines}"
+    )
+    output_file = host_codex_dir / f"title-last-message-{uuid.uuid4().hex}.txt"
+
+    env = os.environ.copy()
+    env["HOME"] = str(host_agent_home)
+    env["CODEX_HOME"] = str(host_codex_dir)
+
+    cmd = [
+        codex_exec,
+        "exec",
+        "--skip-git-repo-check",
+        "--cd",
+        str(_repo_root()),
+        "--sandbox",
+        "read-only",
+        "--output-last-message",
+        str(output_file),
+        request_prompt,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("ChatGPT account title request timed out.") from exc
+
+    output_text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    if result.returncode != 0:
+        try:
+            output_file.unlink()
+        except OSError:
+            pass
+        detail = _codex_exec_error_message(output_text)
+        raise RuntimeError(f"ChatGPT account title request failed: {detail}")
+
+    try:
+        raw_title = output_file.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError as exc:
+        raise RuntimeError("ChatGPT account title request returned no title output.") from exc
+    finally:
+        try:
+            output_file.unlink()
+        except OSError:
+            pass
+
+    if not raw_title:
+        raise RuntimeError("ChatGPT account title request returned an empty title.")
+    first_line = raw_title.splitlines()[0].strip().strip("\"'`")
+    title = _truncate_title(first_line, max_chars)
+    if not title:
+        raise RuntimeError("ChatGPT account title request returned an invalid title.")
     return title
 
 
@@ -1025,13 +1267,16 @@ class HubState:
         self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
         self._lock = Lock()
         self._runtime_lock = Lock()
+        self._events_lock = Lock()
         self._project_build_lock = Lock()
         self._project_build_threads: dict[str, Thread] = {}
         self._chat_runtimes: dict[str, ChatRuntime] = {}
+        self._event_listeners: set[queue.Queue[dict[str, Any] | None]] = set()
         self._openai_login_lock = Lock()
         self._openai_login_session: OpenAIAccountLoginSession | None = None
         self._chat_input_lock = Lock()
         self._chat_input_buffers: dict[str, str] = {}
+        self._chat_input_ansi_carry: dict[str, str] = {}
         self._chat_title_job_lock = Lock()
         self._chat_title_jobs_inflight: set[str] = set()
         self._chat_title_jobs_pending: set[str] = set()
@@ -1087,10 +1332,89 @@ class HubState:
             chat["title_error"] = str(chat.get("title_error") or "")
         return state
 
-    def save(self, state: dict[str, Any]) -> None:
+    @staticmethod
+    def _event_queue_put(listener: queue.Queue[dict[str, Any] | None], value: dict[str, Any] | None) -> None:
+        try:
+            listener.put_nowait(value)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            listener.get_nowait()
+        except queue.Empty:
+            return
+
+        try:
+            listener.put_nowait(value)
+        except queue.Full:
+            return
+
+    def _emit_event(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        event = {"type": str(event_type), "payload": payload or {}, "sent_at": _iso_now()}
+        with self._events_lock:
+            listeners = list(self._event_listeners)
+        LOGGER.debug("Emitting hub event type=%s listeners=%d", event_type, len(listeners))
+        for listener in listeners:
+            self._event_queue_put(listener, event)
+
+    def _emit_state_changed(self, reason: str = "") -> None:
+        self._emit_event(EVENT_TYPE_STATE_CHANGED, {"reason": str(reason or "")})
+
+    def _emit_auth_changed(self, reason: str = "") -> None:
+        self._emit_event(EVENT_TYPE_AUTH_CHANGED, {"reason": str(reason or "")})
+
+    def _emit_project_build_log(self, project_id: str, text: str, replace: bool = False) -> None:
+        self._emit_event(
+            EVENT_TYPE_PROJECT_BUILD_LOG,
+            {
+                "project_id": str(project_id),
+                "text": str(text or ""),
+                "replace": bool(replace),
+            },
+        )
+
+    def _emit_openai_account_session_changed(self, reason: str = "") -> None:
+        payload = self.openai_account_session_payload()
+        payload["reason"] = str(reason or "")
+        self._emit_event(EVENT_TYPE_OPENAI_ACCOUNT_SESSION, payload)
+
+    def attach_events(self) -> queue.Queue[dict[str, Any] | None]:
+        listener: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=HUB_EVENT_QUEUE_MAX)
+        with self._events_lock:
+            self._event_listeners.add(listener)
+        return listener
+
+    def detach_events(self, listener: queue.Queue[dict[str, Any] | None]) -> None:
+        with self._events_lock:
+            self._event_listeners.discard(listener)
+
+    def events_snapshot(self) -> dict[str, Any]:
+        state_payload = self.state_payload()
+        build_logs: dict[str, str] = {}
+        for project in state_payload.get("projects") or []:
+            project_id = str(project.get("id") or "")
+            if not project_id:
+                continue
+            if str(project.get("build_status") or "") != "building":
+                continue
+            log_path = self.project_build_log(project_id)
+            if not log_path.exists():
+                build_logs[project_id] = ""
+                continue
+            build_logs[project_id] = log_path.read_text(encoding="utf-8", errors="ignore")
+        return {
+            "state": state_payload,
+            "auth": self.auth_settings_payload(),
+            "openai_account_session": self.openai_account_session_payload(),
+            "project_build_logs": build_logs,
+        }
+
+    def save(self, state: dict[str, Any], reason: str = "") -> None:
         with self._lock:
             with self.state_file.open("w", encoding="utf-8") as fp:
                 json.dump(state, fp, indent=2)
+        self._emit_state_changed(reason=reason)
 
     def _openai_credentials_arg(self) -> list[str]:
         return ["--credentials-file", str(self.openai_credentials_file)]
@@ -1128,8 +1452,108 @@ class HubState:
             "account_updated_at": account_payload["account_updated_at"],
         }
 
+    def _chat_title_generation_auth(self) -> tuple[str, str]:
+        account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
+        if account_connected:
+            return CHAT_TITLE_AUTH_MODE_ACCOUNT, ""
+        api_key = _read_openai_api_key(self.openai_credentials_file) or ""
+        if api_key:
+            return CHAT_TITLE_AUTH_MODE_API_KEY, api_key
+        return CHAT_TITLE_AUTH_MODE_NONE, ""
+
+    def _generate_chat_title_with_resolved_auth(
+        self,
+        auth_mode: str,
+        api_key: str,
+        user_prompts: list[str],
+    ) -> tuple[str, str]:
+        if auth_mode == CHAT_TITLE_AUTH_MODE_ACCOUNT:
+            title = _codex_generate_chat_title(
+                host_agent_home=self.host_agent_home,
+                host_codex_dir=self.host_codex_dir,
+                user_prompts=user_prompts,
+                max_chars=CHAT_TITLE_MAX_CHARS,
+            )
+            return title, CHAT_TITLE_ACCOUNT_MODEL
+        if auth_mode == CHAT_TITLE_AUTH_MODE_API_KEY:
+            title = _openai_generate_chat_title(
+                api_key=api_key,
+                user_prompts=user_prompts,
+                max_chars=CHAT_TITLE_MAX_CHARS,
+            )
+            return title, CHAT_TITLE_OPENAI_MODEL
+        raise RuntimeError(CHAT_TITLE_NO_CREDENTIALS_ERROR)
+
     def auth_settings_payload(self) -> dict[str, Any]:
         return {"providers": {"openai": self.openai_auth_status()}}
+
+    def test_openai_chat_title_generation(self, prompt: Any) -> dict[str, Any]:
+        submitted = _compact_whitespace(str(prompt or "")).strip()
+        if not submitted:
+            raise HTTPException(status_code=400, detail="prompt is required.")
+
+        auth_status = self.openai_auth_status()
+        auth_mode, api_key = self._chat_title_generation_auth()
+        connectivity = {
+            "api_key_connected": bool(auth_status.get("connected")),
+            "api_key_hint": str(auth_status.get("key_hint") or ""),
+            "api_key_updated_at": str(auth_status.get("updated_at") or ""),
+            "account_connected": bool(auth_status.get("account_connected")),
+            "account_auth_mode": str(auth_status.get("account_auth_mode") or ""),
+            "account_updated_at": str(auth_status.get("account_updated_at") or ""),
+            "title_generation_auth_mode": auth_mode,
+        }
+
+        issues: list[str] = []
+        model = (
+            CHAT_TITLE_OPENAI_MODEL
+            if auth_mode == CHAT_TITLE_AUTH_MODE_API_KEY
+            else CHAT_TITLE_ACCOUNT_MODEL
+            if auth_mode == CHAT_TITLE_AUTH_MODE_ACCOUNT
+            else ""
+        )
+        if auth_mode == CHAT_TITLE_AUTH_MODE_NONE:
+            error = CHAT_TITLE_NO_CREDENTIALS_ERROR
+            issues.append(error)
+            return {
+                "ok": False,
+                "title": "",
+                "model": model,
+                "prompt": submitted,
+                "error": error,
+                "issues": issues,
+                "connectivity": connectivity,
+            }
+
+        try:
+            resolved_title, model = self._generate_chat_title_with_resolved_auth(
+                auth_mode=auth_mode,
+                api_key=api_key,
+                user_prompts=[submitted],
+            )
+        except Exception as exc:
+            error = str(exc)
+            if error:
+                issues.append(error)
+            return {
+                "ok": False,
+                "title": "",
+                "model": model,
+                "prompt": submitted,
+                "error": error,
+                "issues": issues,
+                "connectivity": connectivity,
+            }
+
+        return {
+            "ok": True,
+            "title": resolved_title,
+            "model": model,
+            "prompt": submitted,
+            "error": "",
+            "issues": issues,
+            "connectivity": connectivity,
+        }
 
     def connect_openai(self, api_key: Any, verify: bool = True) -> dict[str, Any]:
         normalized = _normalize_openai_api_key(api_key)
@@ -1139,7 +1563,10 @@ class HubState:
             self.openai_credentials_file,
             f"OPENAI_API_KEY={json.dumps(normalized)}\n",
         )
-        return self.openai_auth_status()
+        status = self.openai_auth_status()
+        self._emit_auth_changed(reason="openai_api_key_connected")
+        LOGGER.debug("OpenAI API key connected.")
+        return status
 
     def disconnect_openai(self) -> dict[str, Any]:
         if self.openai_credentials_file.exists():
@@ -1147,7 +1574,10 @@ class HubState:
                 self.openai_credentials_file.unlink()
             except OSError as exc:
                 raise HTTPException(status_code=500, detail="Failed to remove stored OpenAI credentials.") from exc
-        return self.openai_auth_status()
+        status = self.openai_auth_status()
+        self._emit_auth_changed(reason="openai_api_key_disconnected")
+        LOGGER.debug("OpenAI API key disconnected.")
+        return status
 
     def disconnect_openai_account(self) -> dict[str, Any]:
         self.cancel_openai_account_login()
@@ -1156,7 +1586,11 @@ class HubState:
                 self.openai_codex_auth_file.unlink()
             except OSError as exc:
                 raise HTTPException(status_code=500, detail="Failed to remove stored OpenAI account credentials.") from exc
-        return self.openai_auth_status()
+        status = self.openai_auth_status()
+        self._emit_auth_changed(reason="openai_account_disconnected")
+        self._emit_openai_account_session_changed(reason="openai_account_disconnected")
+        LOGGER.debug("OpenAI account disconnected.")
+        return status
 
     def _openai_login_session_payload(self, session: OpenAIAccountLoginSession | None) -> dict[str, Any] | None:
         if session is None:
@@ -1254,6 +1688,7 @@ class HubState:
                 if raw_line == "":
                     break
                 clean_line = ANSI_ESCAPE_RE.sub("", raw_line).replace("\r", "")
+                should_emit_session = False
                 with self._openai_login_lock:
                     current = self._openai_login_session
                     if current is None or current.id != session_id:
@@ -1292,8 +1727,12 @@ class HubState:
                         current.device_code = device_code_match.group(0)
                         if current.method == "device_auth" and current.status in {"starting", "running", "waiting_for_browser"}:
                             current.status = "waiting_for_device_code"
+                    should_emit_session = True
+                if should_emit_session:
+                    self._emit_openai_account_session_changed(reason="login_output")
 
         exit_code = process.wait()
+        should_emit_auth = False
         with self._openai_login_lock:
             current = self._openai_login_session
             if current is None or current.id != session_id:
@@ -1308,13 +1747,17 @@ class HubState:
             if exit_code == 0 and account_connected:
                 current.status = "connected"
                 current.error = ""
-                return
-            current.status = "failed"
-            if not current.error:
-                if exit_code == 0:
-                    current.error = "Login exited without saving ChatGPT account credentials."
-                else:
-                    current.error = f"Login process exited with code {exit_code}."
+                should_emit_auth = True
+            else:
+                current.status = "failed"
+                if not current.error:
+                    if exit_code == 0:
+                        current.error = "Login exited without saving ChatGPT account credentials."
+                    else:
+                        current.error = f"Login process exited with code {exit_code}."
+        self._emit_openai_account_session_changed(reason="login_process_exit")
+        if should_emit_auth:
+            self._emit_auth_changed(reason="openai_account_connected")
 
     def _stop_openai_login_process(self, session: OpenAIAccountLoginSession) -> None:
         if _is_process_running(session.process.pid):
@@ -1331,6 +1774,7 @@ class HubState:
 
     def start_openai_account_login(self, method: str = "browser_callback") -> dict[str, Any]:
         normalized_method = _normalize_openai_account_login_method(method)
+        LOGGER.debug("Starting OpenAI account login flow method=%s.", normalized_method)
         if shutil.which("docker") is None:
             raise HTTPException(status_code=400, detail="docker command not found in PATH.")
         if not _docker_image_exists(DEFAULT_AGENT_IMAGE):
@@ -1349,56 +1793,71 @@ class HubState:
         if should_cancel_existing:
             self.cancel_openai_account_login()
 
+        existing_payload: dict[str, Any] | None = None
         with self._openai_login_lock:
             existing = self._openai_login_session
             if existing is not None and _is_process_running(existing.process.pid):
-                return {"session": self._openai_login_session_payload(existing)}
+                existing_payload = self._openai_login_session_payload(existing)
+            else:
+                container_name = f"agent-hub-openai-login-{uuid.uuid4().hex[:12]}"
+                cmd = self._openai_login_container_cmd(container_name, normalized_method)
+                try:
+                    process = subprocess.Popen(
+                        cmd,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        bufsize=1,
+                        start_new_session=True,
+                    )
+                except OSError as exc:
+                    raise HTTPException(status_code=500, detail=f"Failed to start account login container: {exc}") from exc
 
-            container_name = f"agent-hub-openai-login-{uuid.uuid4().hex[:12]}"
-            cmd = self._openai_login_container_cmd(container_name, normalized_method)
-            try:
-                process = subprocess.Popen(
-                    cmd,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    bufsize=1,
-                    start_new_session=True,
+                session = OpenAIAccountLoginSession(
+                    id=uuid.uuid4().hex,
+                    process=process,
+                    container_name=container_name,
+                    started_at=_iso_now(),
+                    method=normalized_method,
+                    status="running",
                 )
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"Failed to start account login container: {exc}") from exc
+                self._openai_login_session = session
 
-            session = OpenAIAccountLoginSession(
-                id=uuid.uuid4().hex,
-                process=process,
-                container_name=container_name,
-                started_at=_iso_now(),
-                method=normalized_method,
-                status="running",
-            )
-            self._openai_login_session = session
+        if existing_payload is not None:
+            self._emit_openai_account_session_changed(reason="login_already_running")
+            return {"session": existing_payload}
 
         self._start_openai_login_reader(session.id)
+        self._emit_openai_account_session_changed(reason="login_started")
         return {"session": self._openai_login_session_payload(session)}
 
     def cancel_openai_account_login(self) -> dict[str, Any]:
+        not_running_payload: dict[str, Any] | None = None
         with self._openai_login_lock:
             session = self._openai_login_session
             if session is None:
                 return {"session": None}
             if not _is_process_running(session.process.pid):
-                return {"session": self._openai_login_session_payload(session)}
-            session.status = "cancelled"
-            session.error = "Cancelled by user."
-            session.completed_at = _iso_now()
+                not_running_payload = self._openai_login_session_payload(session)
+            else:
+                session.status = "cancelled"
+                session.error = "Cancelled by user."
+                session.completed_at = _iso_now()
+        if not_running_payload is not None:
+            self._emit_openai_account_session_changed(reason="login_not_running")
+            return {"session": not_running_payload}
 
         self._stop_openai_login_process(session)
 
+        cancelled_payload: dict[str, Any] | None = None
         with self._openai_login_lock:
             current = self._openai_login_session
             if current is not None and current.id == session.id:
                 current.exit_code = current.process.poll()
-                return {"session": self._openai_login_session_payload(current)}
+                cancelled_payload = self._openai_login_session_payload(current)
+        if cancelled_payload is not None:
+            self._emit_openai_account_session_changed(reason="login_cancelled")
+            return {"session": cancelled_payload}
         return {"session": None}
 
     def forward_openai_account_callback(self, query: str, path: str = "/auth/callback") -> dict[str, Any]:
@@ -1439,6 +1898,7 @@ class HubState:
                 )
                 if current.status in {"running", "waiting_for_browser"}:
                     current.status = "callback_received"
+        self._emit_openai_account_session_changed(reason="oauth_callback_forwarded")
 
         return {
             "forwarded": True,
@@ -1619,12 +2079,13 @@ class HubState:
         project["build_finished_at"] = ""
         project["updated_at"] = started_at
         state["projects"][project_id] = project
-        self.save(state)
+        self.save(state, reason="project_build_started")
 
         project_copy = dict(project)
         log_path = self.project_build_log(project_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("", encoding="utf-8")
+        self._emit_project_build_log(project_id, "", replace=True)
 
         try:
             snapshot_tag = self._prepare_project_snapshot_for_project(project_copy, log_path=log_path)
@@ -1639,7 +2100,8 @@ class HubState:
             current["build_finished_at"] = _iso_now()
             current["updated_at"] = _iso_now()
             state["projects"][project_id] = current
-            self.save(state)
+            self.save(state, reason="project_build_failed")
+            LOGGER.warning("Project build failed for project=%s: %s", project_id, detail)
             return current
 
         state = self.load()
@@ -1653,7 +2115,8 @@ class HubState:
         current["build_finished_at"] = _iso_now()
         current["updated_at"] = _iso_now()
         state["projects"][project_id] = current
-        self.save(state)
+        self.save(state, reason="project_build_ready")
+        LOGGER.debug("Project build completed for project=%s snapshot=%s", project_id, snapshot_tag)
         return current
 
     def delete_project(self, project_id: str) -> None:
@@ -1768,6 +2231,7 @@ class HubState:
 
         with self._chat_input_lock:
             self._chat_input_buffers.pop(chat_id, None)
+            self._chat_input_ansi_carry.pop(chat_id, None)
         with self._chat_title_job_lock:
             self._chat_title_jobs_inflight.discard(chat_id)
             self._chat_title_jobs_pending.discard(chat_id)
@@ -1926,17 +2390,11 @@ class HubState:
         safe_rows = max(1, int(rows))
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", safe_rows, safe_cols, 0, 0))
 
-    def _chat_log_tail(self, chat_id: str, max_bytes: int = TERMINAL_LOG_TAIL_BYTES) -> str:
+    def _chat_log_history(self, chat_id: str) -> str:
         log_path = self.chat_log(chat_id)
         if not log_path.exists():
             return ""
-        with log_path.open("rb") as log_file:
-            log_file.seek(0, os.SEEK_END)
-            size = log_file.tell()
-            start = size - max_bytes if size > max_bytes else 0
-            log_file.seek(start)
-            content = log_file.read()
-        return content.decode("utf-8", errors="ignore")
+        return log_path.read_text(encoding="utf-8", errors="ignore")
 
     def attach_terminal(self, chat_id: str) -> tuple[queue.Queue[str | None], str]:
         runtime = self._runtime_for_chat(chat_id)
@@ -1948,7 +2406,7 @@ class HubState:
             if active_runtime is None:
                 raise HTTPException(status_code=409, detail="Chat is not running.")
             active_runtime.listeners.add(listener)
-        return listener, self._chat_log_tail(chat_id)
+        return listener, self._chat_log_history(chat_id)
 
     def detach_terminal(self, chat_id: str, listener: queue.Queue[str | None]) -> None:
         with self._runtime_lock:
@@ -1965,13 +2423,15 @@ class HubState:
             .replace("\x1bOM", "\r")
             .replace("\x1b[13~", "\r")
         )
-        sanitized = ANSI_ESCAPE_RE.sub("", normalized).replace("\x1b", "")
-        if not sanitized:
+        if not normalized:
             return []
 
         submissions: list[str] = []
         with self._chat_input_lock:
             current = str(self._chat_input_buffers.get(chat_id) or "")
+            ansi_carry = str(self._chat_input_ansi_carry.get(chat_id) or "")
+            sanitized, next_carry = _strip_ansi_stream(ansi_carry, normalized)
+            sanitized = sanitized.replace("\x1b", "")
             for char in sanitized:
                 if char in {"\r", "\n"}:
                     submitted = _compact_whitespace(current).strip()
@@ -1991,24 +2451,31 @@ class HubState:
                 if len(current) > 2000:
                     current = current[-2000:]
             self._chat_input_buffers[chat_id] = current
+            self._chat_input_ansi_carry[chat_id] = next_carry
         return submissions
 
-    def _record_submitted_prompt(self, chat_id: str, prompt: str) -> None:
-        submitted = _compact_whitespace(prompt).strip()
+    def _record_submitted_prompt(self, chat_id: str, prompt: Any) -> bool:
+        submitted = _sanitize_submitted_prompt(prompt)
         if not submitted:
-            return
+            LOGGER.debug("Title prompt ignored for chat=%s: empty submission.", chat_id)
+            return False
         if _looks_like_terminal_control_payload(submitted):
-            return
+            LOGGER.debug("Title prompt ignored for chat=%s: terminal control payload.", chat_id)
+            return False
 
         state = self.load()
         chat = state["chats"].get(chat_id)
         if chat is None:
-            return
+            LOGGER.debug("Title prompt ignored for chat=%s: chat not found.", chat_id)
+            return False
 
         history_raw = chat.get("title_user_prompts")
         history: list[str] = []
         if isinstance(history_raw, list):
             history = [str(item) for item in history_raw if str(item).strip()]
+        if history and _compact_whitespace(str(history[-1])).strip() == submitted:
+            LOGGER.debug("Title prompt ignored for chat=%s: duplicate submission.", chat_id)
+            return False
         history.append(submitted)
         if len(history) > CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:
             history = history[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
@@ -2018,26 +2485,51 @@ class HubState:
         chat["title_status"] = "pending"
         chat["title_error"] = ""
         state["chats"][chat_id] = chat
-        self.save(state)
+        self.save(state, reason="title_prompt_recorded")
+        LOGGER.debug("Title prompt recorded for chat=%s prompts=%d", chat_id, len(history))
         self._schedule_chat_title_generation(chat_id)
+        return True
+
+    def submit_chat_input_buffer(self, chat_id: str) -> None:
+        with self._chat_input_lock:
+            buffered = _compact_whitespace(str(self._chat_input_buffers.get(chat_id) or "")).strip()
+            self._chat_input_buffers[chat_id] = ""
+            self._chat_input_ansi_carry[chat_id] = ""
+        if not buffered:
+            LOGGER.debug("Buffered terminal input submit ignored for chat=%s: buffer empty.", chat_id)
+            return
+        LOGGER.debug("Submitting buffered terminal input for chat=%s.", chat_id)
+        self._record_submitted_prompt(chat_id, buffered)
+
+    def record_chat_title_prompt(self, chat_id: str, prompt: Any) -> dict[str, Any]:
+        state = self.load()
+        if chat_id not in state["chats"]:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        LOGGER.debug("Direct title prompt submission for chat=%s.", chat_id)
+        recorded = self._record_submitted_prompt(chat_id, prompt)
+        return {"chat_id": chat_id, "recorded": recorded}
 
     def _schedule_chat_title_generation(self, chat_id: str) -> None:
         with self._chat_title_job_lock:
             if chat_id in self._chat_title_jobs_inflight:
                 self._chat_title_jobs_pending.add(chat_id)
+                LOGGER.debug("Title generation already inflight for chat=%s, queued follow-up run.", chat_id)
                 return
             self._chat_title_jobs_inflight.add(chat_id)
+        LOGGER.debug("Scheduling title generation for chat=%s.", chat_id)
 
         thread = Thread(target=self._chat_title_generation_loop, args=(chat_id,), daemon=True)
         thread.start()
 
     def _chat_title_generation_loop(self, chat_id: str) -> None:
+        LOGGER.debug("Title generation loop started for chat=%s.", chat_id)
         try:
             while True:
                 self._generate_and_store_chat_title(chat_id)
                 with self._chat_title_job_lock:
                     if chat_id in self._chat_title_jobs_pending:
                         self._chat_title_jobs_pending.discard(chat_id)
+                        LOGGER.debug("Title generation loop continuing for chat=%s (pending rerun).", chat_id)
                         continue
                     self._chat_title_jobs_inflight.discard(chat_id)
                     break
@@ -2045,43 +2537,60 @@ class HubState:
             with self._chat_title_job_lock:
                 self._chat_title_jobs_inflight.discard(chat_id)
                 self._chat_title_jobs_pending.discard(chat_id)
+        LOGGER.debug("Title generation loop finished for chat=%s.", chat_id)
 
     def _generate_and_store_chat_title(self, chat_id: str) -> None:
         state = self.load()
         chat = state["chats"].get(chat_id)
         if chat is None:
+            LOGGER.debug("Title generation skipped for chat=%s: chat missing.", chat_id)
             return
 
         history_raw = chat.get("title_user_prompts")
         if not isinstance(history_raw, list):
+            LOGGER.debug("Title generation skipped for chat=%s: title history missing.", chat_id)
             return
         history = [str(item) for item in history_raw if str(item).strip()]
         prompts = _normalize_chat_prompt_history(history)
         if not prompts:
+            LOGGER.debug("Title generation skipped for chat=%s: no normalized prompts.", chat_id)
             return
 
         prompt_fingerprint = _chat_title_prompt_fingerprint(prompts, max_chars=CHAT_TITLE_MAX_CHARS)
         cached_fingerprint = str(chat.get("title_prompt_fingerprint") or "")
         cached_title = _truncate_title(str(chat.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
         if cached_title and prompt_fingerprint and cached_fingerprint == prompt_fingerprint:
+            LOGGER.debug(
+                "Title generation skipped for chat=%s: fingerprint unchanged (%s).",
+                chat_id,
+                prompt_fingerprint[:12],
+            )
             return
 
-        api_key = _read_openai_api_key(self.openai_credentials_file) or ""
-        if not api_key:
+        auth_mode, api_key = self._chat_title_generation_auth()
+        LOGGER.debug(
+            "Title generation started for chat=%s prompts=%d auth_mode=%s fingerprint=%s",
+            chat_id,
+            len(prompts),
+            auth_mode,
+            prompt_fingerprint[:12],
+        )
+        if auth_mode == CHAT_TITLE_AUTH_MODE_NONE:
             chat["title_status"] = "error"
-            chat["title_error"] = "OpenAI API key is not configured. Connect OpenAI in Settings."
+            chat["title_error"] = CHAT_TITLE_NO_CREDENTIALS_ERROR
             chat["title_prompt_fingerprint"] = prompt_fingerprint
             chat["title_source"] = "openai"
             chat["title_updated_at"] = _iso_now()
             state["chats"][chat_id] = chat
-            self.save(state)
+            self.save(state, reason="title_generation_missing_credentials")
+            LOGGER.debug("Title generation failed for chat=%s: no credentials.", chat_id)
             return
 
         try:
-            resolved_title = _openai_generate_chat_title(
+            resolved_title, _ = self._generate_chat_title_with_resolved_auth(
+                auth_mode=auth_mode,
                 api_key=api_key,
                 user_prompts=prompts,
-                max_chars=CHAT_TITLE_MAX_CHARS,
             )
         except Exception as exc:
             chat["title_status"] = "error"
@@ -2090,7 +2599,8 @@ class HubState:
             chat["title_source"] = "openai"
             chat["title_updated_at"] = _iso_now()
             state["chats"][chat_id] = chat
-            self.save(state)
+            self.save(state, reason="title_generation_error")
+            LOGGER.warning("Title generation failed for chat=%s: %s", chat_id, exc)
             return
 
         chat["title_cached"] = resolved_title
@@ -2100,7 +2610,8 @@ class HubState:
         chat["title_error"] = ""
         chat["title_updated_at"] = _iso_now()
         state["chats"][chat_id] = chat
-        self.save(state)
+        self.save(state, reason="title_generation_ready")
+        LOGGER.debug("Title generation succeeded for chat=%s.", chat_id)
 
     def write_terminal_input(self, chat_id: str, data: str) -> None:
         runtime = self._runtime_for_chat(chat_id)
@@ -2314,13 +2825,18 @@ class HubState:
         workspace: Path,
         project: dict[str, Any],
         log_path: Path | None = None,
+        project_id: str | None = None,
     ) -> str:
         setup_script = str(project.get("setup_script") or "").strip()
         snapshot_tag = self._project_setup_snapshot_tag(project)
+        resolved_project_id = str(project_id or project.get("id") or "").strip()
         if _docker_image_exists(snapshot_tag):
             if log_path is not None:
+                line = f"Using cached setup snapshot image '{snapshot_tag}'\n"
                 with log_path.open("a", encoding="utf-8", errors="ignore") as log_file:
-                    log_file.write(f"Using cached setup snapshot image '{snapshot_tag}'\n")
+                    log_file.write(line)
+                if resolved_project_id:
+                    self._emit_project_build_log(resolved_project_id, line)
             return snapshot_tag
 
         cmd = [
@@ -2333,6 +2849,7 @@ class HubState:
             str(workspace),
             "--config-file",
             str(self.config_file),
+            "--no-alt-screen",
         ]
         cmd.extend(self._openai_credentials_arg())
         self._append_project_base_args(cmd, workspace, project)
@@ -2356,13 +2873,27 @@ class HubState:
         if log_path is None:
             _run(cmd, check=True)
         else:
-            _run_logged(cmd, log_path=log_path, check=True)
+            _run_logged(
+                cmd,
+                log_path=log_path,
+                check=True,
+                on_output=(
+                    (lambda chunk: self._emit_project_build_log(resolved_project_id, chunk))
+                    if resolved_project_id
+                    else None
+                ),
+            )
         return snapshot_tag
 
     def _prepare_project_snapshot_for_project(self, project: dict[str, Any], log_path: Path | None = None) -> str:
         workspace = self._ensure_project_clone(project)
         self._sync_checkout_to_remote(workspace, project)
-        return self._ensure_project_setup_snapshot(workspace, project, log_path=log_path)
+        return self._ensure_project_setup_snapshot(
+            workspace,
+            project,
+            log_path=log_path,
+            project_id=str(project.get("id") or ""),
+        )
 
     def state_payload(self) -> dict[str, Any]:
         state = self.load()
@@ -2429,6 +2960,13 @@ class HubState:
                 if chat_id in state["chats"] and cleaned_history != list(history_raw):
                     state["chats"][chat_id]["title_user_prompts"] = cleaned_history[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
                     should_save = True
+            title_status = str(chat_copy.get("title_status") or "idle").lower()
+            if title_status == "pending":
+                pending_history = chat_copy.get("title_user_prompts")
+                if isinstance(pending_history, list):
+                    normalized_prompts = _normalize_chat_prompt_history([str(item) for item in pending_history if str(item).strip()])
+                    if normalized_prompts:
+                        self._schedule_chat_title_generation(chat_id)
             chat_copy["display_name"] = cached_title or chat_copy["name"]
             title_error = _compact_whitespace(str(chat_copy.get("title_error") or ""))
             if not subtitle and title_error:
@@ -2475,6 +3013,7 @@ class HubState:
         self._sync_checkout_to_remote(workspace, project)
         with self._chat_input_lock:
             self._chat_input_buffers[chat_id] = ""
+            self._chat_input_ansi_carry[chat_id] = ""
 
         cmd = [
             "uv",
@@ -2486,6 +3025,7 @@ class HubState:
             str(workspace),
             "--config-file",
             str(self.config_file),
+            "--no-alt-screen",
         ]
         cmd.extend(self._openai_credentials_arg())
         self._append_project_base_args(cmd, workspace, project)
@@ -2526,6 +3066,7 @@ class HubState:
         self._close_runtime(chat_id)
         with self._chat_input_lock:
             self._chat_input_buffers.pop(chat_id, None)
+            self._chat_input_ansi_carry.pop(chat_id, None)
 
         chat["status"] = "stopped"
         chat["pid"] = None
@@ -3217,7 +3758,6 @@ def _html_page() -> str:
     seedVolumeRows('project-default-volumes', [], []);
     seedEnvRows('project-default-env', []);
     refresh();
-    setInterval(refresh, 4000);
   </script>
 </body>
 </html>
@@ -3231,6 +3771,13 @@ def _html_page() -> str:
 @click.option("--port", default=DEFAULT_PORT, show_default=True, type=int)
 @click.option("--frontend-build/--no-frontend-build", default=True, show_default=True, help="Automatically build the React frontend before starting the server.")
 @click.option("--clean-start", is_flag=True, default=False, help="Clear hub chat artifacts and cached setup images before serving.")
+@click.option(
+    "--log-level",
+    default=os.environ.get("AGENT_HUB_LOG_LEVEL", "info"),
+    show_default=True,
+    type=click.Choice(HUB_LOG_LEVEL_CHOICES, case_sensitive=False),
+    help="Hub logging verbosity (applies to Agent Hub logs and Uvicorn).",
+)
 @click.option("--reload", is_flag=True, default=False)
 def main(
     data_dir: Path,
@@ -3239,8 +3786,12 @@ def main(
     port: int,
     frontend_build: bool,
     clean_start: bool,
+    log_level: str,
     reload: bool,
 ) -> None:
+    normalized_log_level = _normalize_log_level(log_level)
+    _configure_hub_logging(normalized_log_level)
+    LOGGER.info("Starting Agent Hub host=%s port=%s log_level=%s reload=%s", host, port, normalized_log_level, reload)
     if _default_config_file() and not Path(config_file).exists():
         raise click.ClickException(f"Missing config file: {config_file}")
     if frontend_build:
@@ -3267,6 +3818,68 @@ def main(
             return FileResponse(frontend_index)
         return HTMLResponse(_frontend_not_built_page(), status_code=503)
 
+    @app.websocket("/api/events")
+    async def ws_events(websocket: WebSocket) -> None:
+        listener = state.attach_events()
+        await websocket.accept()
+        LOGGER.debug("Hub events websocket connected.")
+        snapshot_event = {
+            "type": EVENT_TYPE_SNAPSHOT,
+            "payload": state.events_snapshot(),
+            "sent_at": _iso_now(),
+        }
+        await websocket.send_text(json.dumps(snapshot_event))
+
+        async def stream_events() -> None:
+            while True:
+                try:
+                    event = await asyncio.to_thread(listener.get, True, 0.5)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    break
+                await websocket.send_text(json.dumps(event))
+
+        async def consume_input() -> None:
+            while True:
+                try:
+                    message = await websocket.receive_text()
+                except WebSocketDisconnect:
+                    return
+                if not message:
+                    continue
+                payload: Any = None
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict) and str(payload.get("type") or "") == "ping":
+                    await websocket.send_text(
+                        json.dumps({"type": "pong", "payload": {"at": _iso_now()}, "sent_at": _iso_now()})
+                    )
+
+        sender = asyncio.create_task(stream_events())
+        receiver = asyncio.create_task(consume_input())
+        try:
+            done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                exc = task.exception()
+                if exc and not isinstance(exc, WebSocketDisconnect):
+                    raise exc
+        except WebSocketDisconnect:
+            pass
+        finally:
+            state._event_queue_put(listener, None)
+            state.detach_events(listener)
+            if not sender.done():
+                sender.cancel()
+            if not receiver.done():
+                receiver.cancel()
+            LOGGER.debug("Hub events websocket disconnected.")
+
     @app.get("/api/state")
     def api_state() -> dict[str, Any]:
         return state.state_payload()
@@ -3286,6 +3899,13 @@ def main(
     @app.post("/api/settings/auth/openai/disconnect")
     def api_disconnect_openai() -> dict[str, Any]:
         return {"provider": state.disconnect_openai()}
+
+    @app.post("/api/settings/auth/openai/title-test")
+    async def api_test_openai_chat_title_generation(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.test_openai_chat_title_generation(payload.get("prompt"))
 
     @app.post("/api/settings/auth/openai/account/disconnect")
     def api_disconnect_openai_account() -> dict[str, Any]:
@@ -3494,6 +4114,13 @@ def main(
     def api_delete_chat(chat_id: str) -> None:
         state.delete_chat(chat_id)
 
+    @app.post("/api/chats/{chat_id}/title-prompt")
+    async def api_chat_title_prompt(chat_id: str, request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return state.record_chat_title_prompt(chat_id, payload.get("prompt"))
+
     @app.get("/api/chats/{chat_id}/logs", response_class=PlainTextResponse)
     def api_chat_logs(chat_id: str) -> str:
         chat = state.chat(chat_id)
@@ -3545,6 +4172,9 @@ def main(
                     message_type = str(payload.get("type") or "")
                     if message_type == "resize":
                         state.resize_terminal(chat_id, int(payload.get("cols") or 0), int(payload.get("rows") or 0))
+                        continue
+                    if message_type == "submit":
+                        state.submit_chat_input_buffer(chat_id)
                         continue
                     if message_type == "input":
                         state.write_terminal_input(chat_id, str(payload.get("data") or ""))
@@ -3601,7 +4231,7 @@ def main(
             return FileResponse(frontend_index)
         return HTMLResponse(_frontend_not_built_page(), status_code=503)
 
-    uvicorn.run(app, host=host, port=port, reload=reload)
+    uvicorn.run(app, host=host, port=port, reload=reload, log_level=_uvicorn_log_level(normalized_log_level))
 
 
 if __name__ == "__main__":
