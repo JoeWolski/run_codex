@@ -302,7 +302,7 @@ class HubStateTests(unittest.TestCase):
             ro_mounts=[f"{self.host_ro}:/ro_data"],
             rw_mounts=[f"{self.host_rw}:/rw_data"],
             env_vars=["FOO=bar", "EMPTY="],
-            agent_args=["--model", "gpt-5"],
+            agent_args=["--model", "gpt-5", "-c", 'model_reasoning_effort="high"'],
         )
 
         captured: dict[str, list[str]] = {}
@@ -346,6 +346,10 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("EMPTY=", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn(self.state._project_setup_snapshot_tag(project), cmd)
+        self.assertIn("--", cmd)
+        self.assertIn("--model", cmd)
+        self.assertIn("gpt-5", cmd)
+        self.assertIn('model_reasoning_effort="high"', cmd)
 
     def test_start_chat_rejects_base_path_outside_workspace(self) -> None:
         project = self.state.add_project(
@@ -387,6 +391,49 @@ class HubStateTests(unittest.TestCase):
 
         with self.assertRaises(HTTPException):
             self.state.create_and_start_chat(project["id"])
+
+    def test_create_and_start_chat_passes_agent_args(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        captured: dict[str, object] = {}
+
+        def fake_create(
+            _: hub_server.HubState,
+            project_id: str,
+            profile: str | None,
+            ro_mounts: list[str],
+            rw_mounts: list[str],
+            env_vars: list[str],
+            agent_args: list[str] | None = None,
+        ) -> dict[str, str]:
+            captured["project_id"] = project_id
+            captured["profile"] = profile
+            captured["ro_mounts"] = list(ro_mounts)
+            captured["rw_mounts"] = list(rw_mounts)
+            captured["env_vars"] = list(env_vars)
+            captured["agent_args"] = list(agent_args or [])
+            return {"id": "chat-created"}
+
+        def fake_start(_: hub_server.HubState, chat_id: str) -> dict[str, str]:
+            captured["started_chat_id"] = chat_id
+            return {"id": chat_id, "status": "running"}
+
+        with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
+            hub_server.HubState, "start_chat", fake_start
+        ):
+            result = self.state.create_and_start_chat(
+                project["id"],
+                agent_args=["--model", "gpt-5.3-codex", "-c", 'model_reasoning_effort="high"'],
+            )
+
+        self.assertEqual(captured["project_id"], project["id"])
+        self.assertEqual(captured["profile"], "")
+        self.assertEqual(captured["agent_args"], ["--model", "gpt-5.3-codex", "-c", 'model_reasoning_effort="high"'])
+        self.assertEqual(captured["started_chat_id"], "chat-created")
+        self.assertEqual(result["id"], "chat-created")
 
     def test_start_chat_rejects_when_stored_snapshot_tag_is_stale(self) -> None:
         project = self.state.add_project(
@@ -533,7 +580,7 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(workspace.name, f"Demo_Project_{chat['id']}")
         self.assertEqual(self.state.chat_workdir(chat["id"]), workspace)
 
-    def test_close_chat_deletes_workspace_and_chat_record(self) -> None:
+    def test_close_chat_stops_runtime_and_keeps_workspace_and_chat_record(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -549,11 +596,23 @@ class HubStateTests(unittest.TestCase):
         workspace = self.state.chat_workdir(chat["id"])
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / "sentinel.txt").write_text("data", encoding="utf-8")
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 9876
+        self.state.save(state_data)
 
-        result = self.state.close_chat(chat["id"])
-        self.assertEqual(result["status"], "deleted")
-        self.assertFalse(workspace.exists())
-        self.assertNotIn(chat["id"], self.state.load()["chats"])
+        with patch("agent_hub.server._stop_process") as stop_process, patch.object(
+            hub_server.HubState, "_close_runtime"
+        ) as close_runtime:
+            result = self.state.close_chat(chat["id"])
+
+        stop_process.assert_called_once_with(9876)
+        close_runtime.assert_called_once_with(chat["id"])
+        self.assertEqual(result["status"], "stopped")
+        self.assertIsNone(result["pid"])
+        self.assertTrue(workspace.exists())
+        self.assertTrue((workspace / "sentinel.txt").exists())
+        self.assertIn(chat["id"], self.state.load()["chats"])
 
     def test_state_payload_prunes_finished_chats(self) -> None:
         project = self.state.add_project(
@@ -619,6 +678,8 @@ class HubStateTests(unittest.TestCase):
             encoding="utf-8",
         )
         state_data = self.state.load()
+        state_data["chats"][chat["id"]]["title_cached"] = "Run python unit tests"
+        state_data["chats"][chat["id"]]["title_status"] = "ready"
         state_data["chats"][chat["id"]]["status"] = "running"
         state_data["chats"][chat["id"]]["pid"] = 1111
         self.state.save(state_data)
@@ -627,8 +688,223 @@ class HubStateTests(unittest.TestCase):
             payload = self.state.state_payload()
 
         chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
-        self.assertEqual(chat_payload["display_name"], "how do i run tests?")
+        self.assertEqual(chat_payload["display_name"], "Run python unit tests")
         self.assertTrue(chat_payload["display_subtitle"].startswith("Use uv run python -m unittest"))
+
+    def test_write_terminal_input_records_prompt_only_on_submit(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1234), master_fd=42)
+
+        with patch.object(hub_server.HubState, "_runtime_for_chat", return_value=runtime), patch(
+            "agent_hub.server.os.write", return_value=1
+        ), patch.object(
+            hub_server.HubState, "_schedule_chat_title_generation"
+        ) as schedule_title:
+            self.state.write_terminal_input(chat["id"], "fix flaky login tests")
+            schedule_title.assert_not_called()
+            self.state.write_terminal_input(chat["id"], "\r")
+            schedule_title.assert_called_once_with(chat["id"])
+
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated["title_user_prompts"][-1], "fix flaky login tests")
+
+    def test_write_terminal_input_treats_application_keypad_enter_as_submit(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1234), master_fd=42)
+
+        with patch.object(hub_server.HubState, "_runtime_for_chat", return_value=runtime), patch(
+            "agent_hub.server.os.write", return_value=1
+        ), patch.object(
+            hub_server.HubState, "_schedule_chat_title_generation"
+        ) as schedule_title:
+            self.state.write_terminal_input(chat["id"], "summarize deploy failures")
+            schedule_title.assert_not_called()
+            self.state.write_terminal_input(chat["id"], "\x1bOM")
+            schedule_title.assert_called_once_with(chat["id"])
+
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated["title_user_prompts"][-1], "summarize deploy failures")
+
+    def test_write_terminal_input_ignores_terminal_control_payload(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1234), master_fd=42)
+        control_payload = "\x1b]10;rgb:e7e7/eded/f7f7\x1b\\\x1b]11;rgb:0b0b/1010/1818\x1b\\\r"
+
+        with patch.object(hub_server.HubState, "_runtime_for_chat", return_value=runtime), patch(
+            "agent_hub.server.os.write", return_value=1
+        ), patch.object(
+            hub_server.HubState, "_schedule_chat_title_generation"
+        ) as schedule_title:
+            self.state.write_terminal_input(chat["id"], control_payload)
+            schedule_title.assert_not_called()
+
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated.get("title_user_prompts"), [])
+
+    def test_generate_and_store_chat_title_uses_openai_once_per_prompt_fingerprint(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["title_user_prompts"] = ["first prompt", "second prompt"]
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._read_openai_api_key", return_value="sk-test"), patch(
+            "agent_hub.server._openai_generate_chat_title",
+            return_value="Fix flaky login tests in auth flow",
+        ) as generate_title:
+            self.state._generate_and_store_chat_title(chat["id"])
+            self.state._generate_and_store_chat_title(chat["id"])
+
+        self.assertEqual(generate_title.call_count, 1)
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated["title_cached"], "Fix flaky login tests in auth flow")
+        self.assertEqual(updated["title_source"], "openai")
+        self.assertEqual(updated["title_status"], "ready")
+        self.assertEqual(updated["title_error"], "")
+        self.assertTrue(updated["title_prompt_fingerprint"])
+
+    def test_generate_and_store_chat_title_records_openai_error(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["title_user_prompts"] = ["debug websocket reconnect issue"]
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._read_openai_api_key", return_value="sk-test"), patch(
+            "agent_hub.server._openai_generate_chat_title",
+            side_effect=RuntimeError("OpenAI title generation failed"),
+        ):
+            self.state._generate_and_store_chat_title(chat["id"])
+
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated["title_status"], "error")
+        self.assertEqual(updated["title_source"], "openai")
+        self.assertIn("OpenAI title generation failed", updated["title_error"])
+
+    def test_generate_and_store_chat_title_records_missing_api_key_error(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["title_user_prompts"] = ["build a release checklist"]
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._read_openai_api_key", return_value=""):
+            self.state._generate_and_store_chat_title(chat["id"])
+
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated["title_status"], "error")
+        self.assertEqual(updated["title_source"], "openai")
+        self.assertIn("OpenAI API key is not configured", updated["title_error"])
+
+    def test_state_payload_does_not_call_openai_title_generation_from_log_changes(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        self.state.chat_log(chat["id"]).write_text(
+            "> refine the Dockerfile caching strategy\nassistant output keeps changing...\n",
+            encoding="utf-8",
+        )
+
+        with patch("agent_hub.server._openai_generate_chat_title") as generate_title:
+            payload = self.state.state_payload()
+
+        self.assertEqual(generate_title.call_count, 0)
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_name"], chat["name"])
+
+    def test_state_payload_discards_cached_terminal_control_title(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["title_cached"] = "]10;rgb:e7e7/eded/f7f7\\"
+        state_data["chats"][chat["id"]]["title_user_prompts"] = ["implement auth retry logic"]
+        self.state.save(state_data)
+
+        payload = self.state.state_payload()
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertEqual(chat_payload["display_name"], chat["name"])
 
     def test_shutdown_stops_running_chats_and_persists_state(self) -> None:
         project = self.state.add_project(

@@ -3,6 +3,70 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 
 const POLL_MS = 4000;
+const THEME_STORAGE_KEY = "agent_hub_theme";
+const START_MODEL_OPTIONS = ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"];
+const REASONING_MODE_OPTIONS = ["default", "minimal", "low", "medium", "high", "xhigh"];
+
+function normalizeStartModel(value) {
+  const normalized = String(value || "").trim();
+  if (START_MODEL_OPTIONS.includes(normalized)) {
+    return normalized;
+  }
+  return "default";
+}
+
+function normalizeReasoningMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (REASONING_MODE_OPTIONS.includes(normalized)) {
+    return normalized;
+  }
+  return "default";
+}
+
+function buildChatStartArgs(model, reasoningMode) {
+  const args = [];
+  const resolvedModel = normalizeStartModel(model);
+  const resolvedReasoningMode = normalizeReasoningMode(reasoningMode);
+  if (resolvedModel !== "default") {
+    args.push("--model", resolvedModel);
+  }
+  if (resolvedReasoningMode !== "default") {
+    args.push("-c", `model_reasoning_effort="${resolvedReasoningMode}"`);
+  }
+  return args;
+}
+
+function normalizeThemePreference(value) {
+  const normalized = String(value || "").toLowerCase();
+  if (normalized === "light" || normalized === "dark" || normalized === "system") {
+    return normalized;
+  }
+  return "system";
+}
+
+function loadThemePreference() {
+  if (typeof window === "undefined") {
+    return "system";
+  }
+  try {
+    return normalizeThemePreference(window.localStorage.getItem(THEME_STORAGE_KEY));
+  } catch {
+    return "system";
+  }
+}
+
+function applyThemePreference(preference) {
+  if (typeof document === "undefined") {
+    return;
+  }
+  const normalized = normalizeThemePreference(preference);
+  const root = document.documentElement;
+  if (normalized === "system") {
+    root.removeAttribute("data-theme");
+    return;
+  }
+  root.setAttribute("data-theme", normalized);
+}
 
 function emptyVolume() {
   return { host: "", container: "", mode: "rw" };
@@ -182,7 +246,61 @@ function terminalSocketUrl(chatId) {
   return `${protocol}://${window.location.host}/api/chats/${chatId}/terminal`;
 }
 
-function ChatTerminal({ chatId, running }) {
+function ExpandIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path
+        d="M7.5 3.75H3.75V7.5M12.5 3.75h3.75V7.5M7.5 16.25H3.75V12.5M12.5 16.25h3.75V12.5M7.5 3.75 3.75 7.5M12.5 3.75 16.25 7.5M7.5 16.25 3.75 12.5M12.5 16.25 16.25 12.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function MinimizeIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path
+        d="M7.5 3.75H3.75V7.5M12.5 3.75h3.75V7.5M7.5 16.25H3.75V12.5M12.5 16.25h3.75V12.5M3.75 3.75 8 8M16.25 3.75 12 8M3.75 16.25 8 12M16.25 16.25 12 12"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function EllipsisIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <circle cx="5.5" cy="10" r="1.25" fill="currentColor" />
+      <circle cx="10" cy="10" r="1.25" fill="currentColor" />
+      <circle cx="14.5" cy="10" r="1.25" fill="currentColor" />
+    </svg>
+  );
+}
+
+function CloseIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path
+        d="M5.5 5.5 14.5 14.5M14.5 5.5 5.5 14.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function ChatTerminal({ chatId, running, onSubmitInput }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
   const [status, setStatus] = useState(running ? "connecting" : "offline");
@@ -217,6 +335,62 @@ function ChatTerminal({ chatId, running }) {
     const ws = new WebSocket(terminalSocketUrl(chatId));
     setStatus("connecting");
 
+    const sendInput = (text) => {
+      const payload = String(text || "");
+      if (!payload) {
+        return false;
+      }
+      if (ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      ws.send(JSON.stringify({ type: "input", data: payload }));
+      return true;
+    };
+
+    const containsSubmitSignal = (text) => {
+      const payload = String(text || "");
+      if (!payload) {
+        return false;
+      }
+      if (payload.includes("\r") || payload.includes("\n")) {
+        return true;
+      }
+      // Some terminal modes emit Enter as escape sequences.
+      return payload.includes("\x1bOM") || payload.includes("\x1b[13~");
+    };
+
+    let lastSubmitSignalAt = 0;
+    const triggerSubmitRefresh = () => {
+      if (typeof onSubmitInput !== "function") {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastSubmitSignalAt < 100) {
+        return;
+      }
+      lastSubmitSignalAt = now;
+      onSubmitInput(chatId);
+    };
+
+    const notifySubmit = (text) => {
+      if (!containsSubmitSignal(text)) {
+        return;
+      }
+      triggerSubmitRefresh();
+    };
+
+    const sendPasteText = (text) => {
+      const normalized = String(text || "").replace(/\r\n/g, "\n");
+      if (!normalized) {
+        return false;
+      }
+      const sent = sendInput(normalized);
+      if (sent) {
+        notifySubmit(normalized);
+      }
+      return sent;
+    };
+
     const sendResize = () => {
       if (ws.readyState !== WebSocket.OPEN) {
         return;
@@ -227,8 +401,13 @@ function ChatTerminal({ chatId, running }) {
     };
 
     const inputDisposable = terminal.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "input", data }));
+      if (sendInput(data)) {
+        notifySubmit(data);
+      }
+    });
+    const keyDisposable = terminal.onKey(({ domEvent }) => {
+      if (domEvent.key === "Enter") {
+        triggerSubmitRefresh();
       }
     });
 
@@ -254,13 +433,32 @@ function ChatTerminal({ chatId, running }) {
       sendResize();
     };
 
+    const onShellPointerDown = () => {
+      terminal.focus();
+    };
+    const onShellPaste = (event) => {
+      const clipboardText = event.clipboardData?.getData("text");
+      if (!clipboardText) {
+        return;
+      }
+      if (sendPasteText(clipboardText)) {
+        event.preventDefault();
+      }
+    };
+
+    const shellElement = shellRef.current;
+    if (shellElement) {
+      shellElement.addEventListener("pointerdown", onShellPointerDown);
+      shellElement.addEventListener("paste", onShellPaste);
+    }
+
     let resizeObserver;
-    if (typeof ResizeObserver !== "undefined" && shellRef.current) {
+    if (typeof ResizeObserver !== "undefined" && shellElement) {
       resizeObserver = new ResizeObserver(() => {
         fitAddon.fit();
         sendResize();
       });
-      resizeObserver.observe(shellRef.current);
+      resizeObserver.observe(shellElement);
     }
 
     ws.addEventListener("open", onOpen);
@@ -273,18 +471,23 @@ function ChatTerminal({ chatId, running }) {
       if (resizeObserver) {
         resizeObserver.disconnect();
       }
+      if (shellElement) {
+        shellElement.removeEventListener("pointerdown", onShellPointerDown);
+        shellElement.removeEventListener("paste", onShellPaste);
+      }
       window.removeEventListener("resize", onResize);
       ws.removeEventListener("open", onOpen);
       ws.removeEventListener("message", onMessage);
       ws.removeEventListener("close", onClose);
       ws.removeEventListener("error", onError);
       inputDisposable.dispose();
+      keyDisposable.dispose();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
       }
       terminal.dispose();
     };
-  }, [chatId, running]);
+  }, [chatId, running, onSubmitInput]);
 
   return (
     <div className="terminal-shell chat-terminal-shell" ref={shellRef}>
@@ -608,12 +811,19 @@ function HubApp() {
   const [projectBuildLogs, setProjectBuildLogs] = useState({});
   const [projectStaticLogs, setProjectStaticLogs] = useState({});
   const [openBuildLogs, setOpenBuildLogs] = useState({});
-  const [activeTerminalChatId, setActiveTerminalChatId] = useState("");
   const [activeTab, setActiveTab] = useState("projects");
-  const [collapsedChats, setCollapsedChats] = useState({});
+  const [openChats, setOpenChats] = useState({});
+  const [openChatDetails, setOpenChatDetails] = useState({});
+  const [collapsedProjectChats, setCollapsedProjectChats] = useState({});
+  const [chatStartSettingsByProject, setChatStartSettingsByProject] = useState({});
+  const [fullscreenChatId, setFullscreenChatId] = useState("");
+  const titleRefreshTimersRef = useRef(new Map());
+  const createChatQueueRef = useRef(new Map());
+  const createChatActiveProjectsRef = useRef(new Set());
   const [pendingSessions, setPendingSessions] = useState([]);
   const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
   const [pendingChatStarts, setPendingChatStarts] = useState({});
+  const [themePreference, setThemePreference] = useState(() => loadThemePreference());
   const [openAiProviderStatus, setOpenAiProviderStatus] = useState(() =>
     normalizeOpenAiProviderStatus(null)
   );
@@ -745,6 +955,11 @@ function HubApp() {
     return merged;
   }, [hubState.chats, pendingSessions]);
 
+  const hasPendingTitleGeneration = useMemo(
+    () => visibleChats.some((chat) => String(chat.title_status || "").toLowerCase() === "pending"),
+    [visibleChats]
+  );
+
   useEffect(() => {
     let mounted = true;
 
@@ -770,6 +985,34 @@ function HubApp() {
     };
   }, [refreshState, refreshAuthSettings]);
 
+  useEffect(() => () => {
+    for (const timeouts of titleRefreshTimersRef.current.values()) {
+      for (const timeoutId of timeouts) {
+        window.clearTimeout(timeoutId);
+      }
+    }
+    titleRefreshTimersRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    if (!hasPendingTitleGeneration) {
+      return undefined;
+    }
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) {
+        return;
+      }
+      refreshState().catch(() => {});
+    };
+    tick();
+    const interval = window.setInterval(tick, 1200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [hasPendingTitleGeneration, refreshState]);
+
   useEffect(() => {
     setProjectDrafts((prev) => {
       const next = {};
@@ -791,28 +1034,7 @@ function HubApp() {
   }, [hubState.projects]);
 
   useEffect(() => {
-    setActiveTerminalChatId((current) => {
-      if (!current) {
-        return current;
-      }
-      const selected = visibleChats.find((chat) => chat.id === current);
-      if (!selected) {
-        return "";
-      }
-      const resolvedChatId = String(selected.server_chat_id || selected.id);
-      const isRunning = Boolean(selected.is_running);
-      const isStarting = Boolean(
-        pendingChatStarts[resolvedChatId] || selected.is_pending_start || String(selected.status || "") === "starting"
-      );
-      if (!isRunning && !isStarting) {
-        return "";
-      }
-      return current;
-    });
-  }, [visibleChats, pendingChatStarts]);
-
-  useEffect(() => {
-    setCollapsedChats((prev) => {
+    setOpenChats((prev) => {
       const next = {};
       for (const chat of visibleChats) {
         next[chat.id] = prev[chat.id] ?? true;
@@ -820,6 +1042,41 @@ function HubApp() {
       return next;
     });
   }, [visibleChats]);
+
+  useEffect(() => {
+    setOpenChatDetails((prev) => {
+      const next = {};
+      for (const chat of visibleChats) {
+        next[chat.id] = prev[chat.id] ?? false;
+      }
+      return next;
+    });
+  }, [visibleChats]);
+
+  useEffect(() => {
+    setCollapsedProjectChats((prev) => {
+      const next = {};
+      for (const project of hubState.projects) {
+        next[project.id] = prev[project.id] ?? false;
+      }
+      next.__orphan__ = prev.__orphan__ ?? false;
+      return next;
+    });
+  }, [hubState.projects]);
+
+  useEffect(() => {
+    setChatStartSettingsByProject((prev) => {
+      const next = {};
+      for (const project of hubState.projects) {
+        const current = prev[project.id] || {};
+        next[project.id] = {
+          model: normalizeStartModel(current.model),
+          reasoning: normalizeReasoningMode(current.reasoning)
+        };
+      }
+      return next;
+    });
+  }, [hubState.projects]);
 
   useEffect(() => {
     let stopped = false;
@@ -920,6 +1177,21 @@ function HubApp() {
     }));
   }
 
+  function updateProjectChatStartSettings(projectId, patch) {
+    setChatStartSettingsByProject((prev) => {
+      const current = prev[projectId] || { model: "default", reasoning: "default" };
+      const nextModel = patch.model === undefined ? current.model : normalizeStartModel(patch.model);
+      const nextReasoning = patch.reasoning === undefined ? current.reasoning : normalizeReasoningMode(patch.reasoning);
+      return {
+        ...prev,
+        [projectId]: {
+          model: nextModel,
+          reasoning: nextReasoning
+        }
+      };
+    });
+  }
+
   function markProjectBuilding(projectId) {
     setHubState((prev) => ({
       ...prev,
@@ -936,6 +1208,72 @@ function HubApp() {
       [projectId]: prev[projectId] || "Preparing project image...\r\n"
     }));
   }
+
+  const removeOptimisticChatRow = useCallback((uiId) => {
+    setPendingSessions((prev) => prev.filter((session) => session.ui_id !== uiId));
+    setOpenChats((prev) => {
+      const next = { ...prev };
+      delete next[uiId];
+      return next;
+    });
+    setOpenChatDetails((prev) => {
+      const next = { ...prev };
+      delete next[uiId];
+      return next;
+    });
+  }, []);
+
+  const processCreateChatQueue = useCallback(async (projectId) => {
+    if (createChatActiveProjectsRef.current.has(projectId)) {
+      return;
+    }
+    createChatActiveProjectsRef.current.add(projectId);
+
+    try {
+      while (true) {
+        const queue = createChatQueueRef.current.get(projectId) || [];
+        const nextJob = queue.shift();
+        if (!nextJob) {
+          createChatQueueRef.current.delete(projectId);
+          break;
+        }
+        createChatQueueRef.current.set(projectId, queue);
+
+        const uiId = nextJob.uiId;
+        const agentArgs = Array.isArray(nextJob.agentArgs)
+          ? nextJob.agentArgs.map((arg) => String(arg)).filter((arg) => arg.trim())
+          : [];
+        try {
+          const response = await fetchJson(`/api/projects/${projectId}/chats/start`, {
+            method: "POST",
+            body: JSON.stringify({ agent_args: agentArgs })
+          });
+          const chatId = response?.chat?.id;
+          if (!chatId) {
+            removeOptimisticChatRow(uiId);
+            continue;
+          }
+          setPendingSessions((prev) =>
+            prev.map((session) =>
+              session.ui_id === uiId ? { ...session, server_chat_id: chatId } : session
+            )
+          );
+          setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
+          setError("");
+          refreshState().catch(() => {});
+        } catch (err) {
+          removeOptimisticChatRow(uiId);
+          setError(err.message || String(err));
+          refreshState().catch(() => {});
+        }
+      }
+    } finally {
+      createChatActiveProjectsRef.current.delete(projectId);
+      if ((createChatQueueRef.current.get(projectId) || []).length > 0) {
+        processCreateChatQueue(projectId).catch(() => {});
+      }
+    }
+  }, [refreshState, removeOptimisticChatRow]);
 
   async function handleCreateProject(event) {
     event.preventDefault();
@@ -1026,9 +1364,14 @@ function HubApp() {
     setEditingProjects((prev) => ({ ...prev, [project.id]: false }));
   }
 
-  async function handleCreateChat(projectId) {
+  async function handleCreateChat(projectId, startSettings = null) {
     const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const project = projectsById.get(projectId);
+    const selectedStartSettings = startSettings || chatStartSettingsByProject[projectId] || {
+      model: "default",
+      reasoning: "default"
+    };
+    const agentArgs = buildChatStartArgs(selectedStartSettings.model, selectedStartSettings.reasoning);
     const knownServerChatIds = (hubState.chats || [])
       .filter((chat) => String(chat.project_id || "") === String(projectId))
       .map((chat) => chat.id);
@@ -1041,32 +1384,14 @@ function HubApp() {
       seen_on_server: false
     }, ...prev]);
     setActiveTab("chats");
-    setCollapsedChats((prev) => ({ ...prev, [uiId]: false }));
-    setActiveTerminalChatId(uiId);
+    setOpenChats((prev) => ({ ...prev, [uiId]: true }));
+    setOpenChatDetails((prev) => ({ ...prev, [uiId]: false }));
+    setCollapsedProjectChats((prev) => ({ ...prev, [projectId]: false }));
 
-    try {
-      const response = await fetchJson(`/api/projects/${projectId}/chats/start`, {
-        method: "POST"
-      });
-      const chatId = response?.chat?.id;
-      if (chatId) {
-        setPendingSessions((prev) =>
-          prev.map((session) =>
-            session.ui_id === uiId ? { ...session, server_chat_id: chatId } : session
-          )
-        );
-        setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
-      } else {
-        setPendingSessions((prev) => prev.filter((session) => session.ui_id !== uiId));
-        setActiveTerminalChatId((current) => (current === uiId ? "" : current));
-      }
-      setError("");
-      refreshState().catch(() => {});
-    } catch (err) {
-      setPendingSessions((prev) => prev.filter((session) => session.ui_id !== uiId));
-      setActiveTerminalChatId((current) => (current === uiId ? "" : current));
-      setError(err.message || String(err));
-    }
+    const queue = createChatQueueRef.current.get(projectId) || [];
+    queue.push({ uiId, agentArgs });
+    createChatQueueRef.current.set(projectId, queue);
+    processCreateChatQueue(projectId).catch(() => {});
   }
 
   async function handleDeleteProject(projectId) {
@@ -1081,6 +1406,8 @@ function HubApp() {
       chats: (prev.chats || []).filter((chat) => chat.project_id !== projectId)
     }));
     setPendingSessions((prev) => prev.filter((session) => session.project_id !== projectId));
+    createChatQueueRef.current.delete(projectId);
+    createChatActiveProjectsRef.current.delete(projectId);
     try {
       await fetchJson(`/api/projects/${projectId}`, { method: "DELETE" });
       setError("");
@@ -1093,8 +1420,7 @@ function HubApp() {
 
   async function handleStartChat(chatId) {
     setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
-    setCollapsedChats((prev) => ({ ...prev, [chatId]: false }));
-    setActiveTerminalChatId(chatId);
+    setOpenChats((prev) => ({ ...prev, [chatId]: true }));
     try {
       await fetchJson(`/api/chats/${chatId}/start`, { method: "POST" });
       setError("");
@@ -1123,9 +1449,21 @@ function HubApp() {
       delete next[chatId];
       return next;
     });
+    setOpenChats((prev) => {
+      const next = { ...prev };
+      delete next[uiId];
+      delete next[chatId];
+      return next;
+    });
+    setOpenChatDetails((prev) => {
+      const next = { ...prev };
+      delete next[uiId];
+      delete next[chatId];
+      return next;
+    });
+    setFullscreenChatId((current) => (current === uiId || current === chatId ? "" : current));
     try {
       await fetchJson(`/api/chats/${chatId}`, { method: "DELETE" });
-      setActiveTerminalChatId((current) => (current === uiId || current === chatId ? "" : current));
       setError("");
       refreshState().catch(() => {});
     } catch (err) {
@@ -1337,15 +1675,274 @@ function HubApp() {
     }
   }, [openAiAccountLoginInFlight]);
 
+  useEffect(() => {
+    const normalized = normalizeThemePreference(themePreference);
+    applyThemePreference(normalized);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, normalized);
+    } catch {
+      // Ignore storage failures and keep in-memory preference.
+    }
+  }, [themePreference]);
+
+  useEffect(() => {
+    if (!fullscreenChatId) {
+      return;
+    }
+    const exists = visibleChats.some((chat) => chat.id === fullscreenChatId);
+    if (!exists) {
+      setFullscreenChatId("");
+    }
+  }, [visibleChats, fullscreenChatId]);
+
+  useEffect(() => {
+    if (activeTab !== "chats" && fullscreenChatId) {
+      setFullscreenChatId("");
+    }
+  }, [activeTab, fullscreenChatId]);
+
+  useEffect(() => {
+    if (!fullscreenChatId) {
+      return undefined;
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setFullscreenChatId("");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [fullscreenChatId]);
+
+  function resolveServerChatId(chat) {
+    return String(chat?.server_chat_id || chat?.id || "");
+  }
+
+  function hasServerChat(chat) {
+    return Boolean(chat?.server_chat_id || !String(chat?.id || "").startsWith("pending-"));
+  }
+
+  function toggleProjectChatRows(groupKey, chats, currentlyCollapsed) {
+    const nextCollapsed = !currentlyCollapsed;
+    setCollapsedProjectChats((prev) => ({ ...prev, [groupKey]: nextCollapsed }));
+    setOpenChats((prev) => {
+      const next = { ...prev };
+      for (const chat of chats) {
+        next[chat.id] = !nextCollapsed;
+      }
+      return next;
+    });
+    if (nextCollapsed) {
+      setOpenChatDetails((prev) => {
+        const next = { ...prev };
+        for (const chat of chats) {
+          next[chat.id] = false;
+        }
+        return next;
+      });
+      setFullscreenChatId((current) => (chats.some((chat) => chat.id === current) ? "" : current));
+    }
+  }
+
+  function toggleChatRow(chat) {
+    const chatId = String(chat?.id || "");
+    const currentOpen = openChats[chatId] ?? true;
+    const nextOpen = !currentOpen;
+    setOpenChats((prev) => ({ ...prev, [chatId]: nextOpen }));
+    if (!nextOpen) {
+      setOpenChatDetails((detailsPrev) => ({ ...detailsPrev, [chatId]: false }));
+      setFullscreenChatId((current) => (current === chatId ? "" : current));
+    }
+  }
+
+  const scheduleChatTitleRefresh = useCallback((chatId) => {
+    const key = String(chatId || "");
+    if (!key) {
+      return;
+    }
+    const existing = titleRefreshTimersRef.current.get(key) || [];
+    for (const timeoutId of existing) {
+      window.clearTimeout(timeoutId);
+    }
+    const requestRefresh = () => {
+      refreshState().catch(() => {});
+    };
+    const timeoutIds = [
+      window.setTimeout(requestRefresh, 250),
+      window.setTimeout(requestRefresh, 1200),
+      window.setTimeout(requestRefresh, 2800),
+    ];
+    titleRefreshTimersRef.current.set(key, timeoutIds);
+  }, [refreshState]);
+
+  function renderChatCard(chat) {
+    const resolvedChatId = resolveServerChatId(chat);
+    const chatHasServer = hasServerChat(chat);
+    const isRunning = Boolean(chat.is_running);
+    const isStarting = Boolean(
+      pendingChatStarts[resolvedChatId] || chat.is_pending_start || String(chat.status || "") === "starting"
+    );
+    const titleStatus = String(chat.title_status || "idle").toLowerCase();
+    const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
+    const envCount = (chat.env_vars || []).length;
+    const rowOpen = fullscreenChatId === chat.id ? true : (openChats[chat.id] ?? true);
+    const detailsOpen = openChatDetails[chat.id] ?? false;
+    const isFullscreenChat = fullscreenChatId === chat.id;
+    const containerClassName = ["card", isFullscreenChat ? "chat-card-popped" : ""].filter(Boolean).join(" ");
+    const titleText = chat.display_name || chat.name;
+    const titleStateLabel = titleStatus === "pending" ? "Updating title" : titleStatus === "error" ? "Title error" : "";
+    const rowSubtitle = isStarting
+      ? "Starting chat and preparing terminal..."
+      : chat.display_subtitle || "No recent assistant summary yet.";
+
+    return (
+      <article className={containerClassName} key={chat.id}>
+        <div
+          className="chat-card-header"
+          role="button"
+          tabIndex={0}
+          onClick={() => toggleChatRow(chat)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              toggleChatRow(chat);
+            }
+          }}
+        >
+          <div className="chat-card-header-main">
+            <div className="chat-card-title-row">
+              <h3 className="chat-card-title">{titleText}</h3>
+              {titleStateLabel ? (
+                <span className={`chat-title-state ${titleStatus}`}>{titleStateLabel}</span>
+              ) : null}
+            </div>
+            {!rowOpen ? (
+              <div className="meta chat-summary">{rowSubtitle}</div>
+            ) : null}
+          </div>
+          <div className="chat-card-header-actions">
+            <button
+              type="button"
+              className="icon-button chat-header-icon chat-header-popout"
+              title={isFullscreenChat ? "Minimize" : "Pop out"}
+              aria-label={isFullscreenChat ? `Minimize ${chat.display_name || chat.name}` : `Pop out ${chat.display_name || chat.name}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (isFullscreenChat) {
+                  setFullscreenChatId("");
+                  return;
+                }
+                setOpenChats((prev) => ({ ...prev, [chat.id]: true }));
+                setFullscreenChatId(chat.id);
+              }}
+            >
+              {isFullscreenChat ? <MinimizeIcon /> : <ExpandIcon />}
+            </button>
+            <button
+              type="button"
+              className="icon-button chat-header-icon"
+              title={detailsOpen ? "Hide details" : "Show details"}
+              aria-label={detailsOpen ? `Hide details for ${chat.display_name || chat.name}` : `Show details for ${chat.display_name || chat.name}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                setOpenChatDetails((prev) => ({ ...prev, [chat.id]: !(prev[chat.id] ?? false) }));
+              }}
+            >
+              <EllipsisIcon />
+            </button>
+            <button
+              type="button"
+              className="icon-button chat-header-icon chat-header-delete"
+              title={`Delete ${titleText}`}
+              aria-label={`Delete ${titleText}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                if (!chatHasServer) {
+                  setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
+                  setOpenChats((prev) => {
+                    const next = { ...prev };
+                    delete next[chat.id];
+                    return next;
+                  });
+                  setOpenChatDetails((prev) => {
+                    const next = { ...prev };
+                    delete next[chat.id];
+                    return next;
+                  });
+                  setFullscreenChatId((current) => (current === chat.id ? "" : current));
+                  return;
+                }
+                handleDeleteChat(resolvedChatId, chat.id);
+              }}
+            >
+              <CloseIcon />
+            </button>
+          </div>
+        </div>
+
+        {rowOpen ? (
+          <div className="stack compact chat-card-body">
+            {detailsOpen ? (
+              <section className="chat-details">
+                <div className="meta">
+                  Status:{" "}
+                  <span className={`status ${isRunning ? "running" : isStarting ? "starting" : "stopped"}`}>
+                    {isRunning ? chat.status : isStarting ? "starting" : chat.status}
+                  </span>
+                </div>
+                <div className="meta">Title status: {titleStatus || "idle"}</div>
+                {chat.title_error ? <div className="meta build-error">Title generation error: {chat.title_error}</div> : null}
+                <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
+                <div className="meta">Workspace: {chat.workspace}</div>
+                <div className="meta">Container folder: {chat.container_workspace || "not started yet"}</div>
+                {chat.setup_snapshot_image ? (
+                  <div className="meta">Setup snapshot image: {chat.setup_snapshot_image}</div>
+                ) : null}
+                <div className="meta">Volumes: {volumeCount} | Env vars: {envCount}</div>
+              </section>
+            ) : null}
+
+            {isStarting && !isRunning ? (
+              <div className="terminal-shell chat-terminal-shell chat-terminal-placeholder">
+                <div className="terminal-overlay">
+                  <span className="inline-spinner" aria-hidden="true" />
+                </div>
+              </div>
+            ) : isRunning ? (
+              <ChatTerminal chatId={resolvedChatId} running={isRunning} onSubmitInput={scheduleChatTitleRefresh} />
+            ) : chatHasServer ? (
+              <div className="stack compact">
+                <div className="meta chat-terminal-stopped">Chat is stopped. Start it to reconnect the terminal.</div>
+                <div className="actions chat-actions">
+                  <button
+                    type="button"
+                    className="btn-primary chat-primary-action"
+                    onClick={() => handleStartChat(resolvedChatId)}
+                  >
+                    Start chat
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </article>
+    );
+  }
+
   return (
     <div className="app-root">
       <header className="app-header">
         <div className="header-row">
-          <div>
+          <div className="brand-block">
             <h1>Agent Hub</h1>
-            <p>Project-level workspaces, one cloned directory per chat.</p>
           </div>
-          <div className="tab-row">
+          <nav className="tab-row" aria-label="Primary sections">
             <button
               type="button"
               className={`tab-button ${activeTab === "projects" ? "active" : ""}`}
@@ -1367,72 +1964,77 @@ function HubApp() {
             >
               Settings
             </button>
-          </div>
+          </nav>
         </div>
       </header>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      <div className="content-shell">
+        {error ? <div className="error-banner">{error}</div> : null}
 
-      <main className="layout">
+        <main className="layout">
         {activeTab === "projects" ? (
-          <section className="panel">
-            <h2>Add Project</h2>
-            <form className="stack" onSubmit={handleCreateProject}>
-              <input
-                required
-                value={createForm.repoUrl}
-                onChange={(event) => updateCreateForm({ repoUrl: event.target.value })}
-                placeholder="git@github.com:org/repo.git or https://..."
-              />
-              <div className="row two">
-                <input
-                  value={createForm.name}
-                  onChange={(event) => updateCreateForm({ name: event.target.value })}
-                  placeholder="Optional project name"
-                />
-                <input
-                  value={createForm.defaultBranch}
-                  onChange={(event) => updateCreateForm({ defaultBranch: event.target.value })}
-                  placeholder="Default branch (optional)"
-                />
-              </div>
-              <div className="row two">
-                <select
-                  value={createForm.baseImageMode}
-                  onChange={(event) => updateCreateForm({ baseImageMode: event.target.value })}
-                >
-                  <option value="tag">Docker image tag</option>
-                  <option value="repo_path">Repo Dockerfile/path</option>
-                </select>
-                <input
-                  value={createForm.baseImageValue}
-                  onChange={(event) => updateCreateForm({ baseImageValue: event.target.value })}
-                  placeholder={baseInputPlaceholder(createForm.baseImageMode)}
-                />
-              </div>
-              <textarea
-                className="script-input"
-                value={createForm.setupScript}
-                onChange={(event) => updateCreateForm({ setupScript: event.target.value })}
-                placeholder={
-                  "Setup script (one command per line; runs in container with checked-out project as working directory)\n" +
-                  "example:\nuv sync\nuv run python -m pip install -e ."
-                }
-              />
+          <section className="panel projects-panel">
+            <div className="projects-split">
+              <section className="projects-create">
+                <h3 className="section-title">Add project</h3>
+                <form className="stack" onSubmit={handleCreateProject}>
+                  <input
+                    required
+                    value={createForm.repoUrl}
+                    onChange={(event) => updateCreateForm({ repoUrl: event.target.value })}
+                    placeholder="git@github.com:org/repo.git or https://..."
+                  />
+                  <div className="row two">
+                    <input
+                      value={createForm.name}
+                      onChange={(event) => updateCreateForm({ name: event.target.value })}
+                      placeholder="Optional project name"
+                    />
+                    <input
+                      value={createForm.defaultBranch}
+                      onChange={(event) => updateCreateForm({ defaultBranch: event.target.value })}
+                      placeholder="Default branch (optional)"
+                    />
+                  </div>
+                  <div className="row two">
+                    <select
+                      value={createForm.baseImageMode}
+                      onChange={(event) => updateCreateForm({ baseImageMode: event.target.value })}
+                    >
+                      <option value="tag">Docker image tag</option>
+                      <option value="repo_path">Repo Dockerfile/path</option>
+                    </select>
+                    <input
+                      value={createForm.baseImageValue}
+                      onChange={(event) => updateCreateForm({ baseImageValue: event.target.value })}
+                      placeholder={baseInputPlaceholder(createForm.baseImageMode)}
+                    />
+                  </div>
+                  <textarea
+                    className="script-input"
+                    value={createForm.setupScript}
+                    onChange={(event) => updateCreateForm({ setupScript: event.target.value })}
+                    placeholder={
+                      "Setup script (one command per line; runs in container with checked-out project as working directory)\n" +
+                      "example:\nuv sync\nuv run python -m pip install -e ."
+                    }
+                  />
 
-              <div className="label">Default volumes for new chats</div>
-              <VolumeEditor rows={createForm.defaultVolumes} onChange={(rows) => updateCreateForm({ defaultVolumes: rows })} />
+                  <div className="label">Default volumes for new chats</div>
+                  <VolumeEditor rows={createForm.defaultVolumes} onChange={(rows) => updateCreateForm({ defaultVolumes: rows })} />
 
-              <div className="label">Default environment variables for new chats</div>
-              <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
+                  <div className="label">Default environment variables for new chats</div>
+                  <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
 
-              <button type="submit" className="btn-primary">
-                Add project
-              </button>
-            </form>
+                  <button type="submit" className="btn-primary">
+                    Add project
+                  </button>
+                </form>
+              </section>
 
-            <h2 className="section-title">Projects</h2>
-            <div className="stack">
+              <section className="projects-list">
+                <h3 className="section-title">Existing projects</h3>
+                <div className="stack">
               {hubState.projects.length === 0 ? <div className="empty">No projects yet.</div> : null}
               {hubState.projects.map((project) => {
                 const draft = projectDrafts[project.id] || projectDraftFromProject(project);
@@ -1622,266 +2224,154 @@ function HubApp() {
                   </article>
                 );
               })}
+                </div>
+              </section>
             </div>
           </section>
         ) : activeTab === "chats" ? (
-          <section className="panel">
-            <h2>Chats</h2>
-            <div className="stack">
+          <section className="panel chats-panel">
+            <div className="stack chat-groups">
               {hubState.projects.length === 0 ? <div className="empty">No projects yet.</div> : null}
               {hubState.projects.map((project) => {
                 const projectChats = chatsByProject.byProject.get(project.id) || [];
                 const buildStatus = String(project.build_status || "pending");
-                const statusInfo = projectStatusInfo(buildStatus);
                 const canStartChat = buildStatus === "ready";
                 const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+                const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
+                const projectStartSettings = chatStartSettingsByProject[project.id] || {
+                  model: "default",
+                  reasoning: "default"
+                };
                 return (
                   <article className="card project-chat-group" key={`group-${project.id}`}>
-                    <div className="project-head">
+                    <div
+                      className="project-head project-chat-head project-chat-row"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => toggleProjectChatRows(project.id, projectChats, projectRowsCollapsed)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          toggleProjectChatRows(project.id, projectChats, projectRowsCollapsed);
+                        }
+                      }}
+                    >
                       <h3>{project.name}</h3>
-                    </div>
-                    <div className="meta">Status: <span className={`project-build-state ${statusInfo.key}`}>{statusInfo.label}</span></div>
-                    <div className="actions">
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        disabled={!canStartChat && isBuilding}
-                        onClick={() => (canStartChat ? handleCreateChat(project.id) : handleBuildProject(project.id))}
-                      >
-                        {canStartChat
-                          ? "New chat"
-                          : isBuilding
-                            ? <SpinnerLabel text="Building image..." />
-                            : "Build"}
-                      </button>
-                    </div>
-
-                    <div className="stack compact">
-                      {projectChats.length === 0 ? <div className="empty">No chats yet for this project.</div> : null}
-                      {projectChats.map((chat) => {
-                        const resolvedChatId = String(chat.server_chat_id || chat.id || "");
-                        const hasServerChat = Boolean(chat.server_chat_id || !String(chat.id || "").startsWith("pending-"));
-                        const isRunning = Boolean(chat.is_running);
-                        const isStarting = Boolean(
-                          pendingChatStarts[resolvedChatId] || chat.is_pending_start || String(chat.status || "") === "starting"
-                        );
-                        const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
-                        const envCount = (chat.env_vars || []).length;
-                        const isActiveTerminal = activeTerminalChatId === chat.id;
-                        const collapsed = collapsedChats[chat.id] ?? true;
-                        return (
-                          <article className="card" key={chat.id}>
-                            <div
-                              className="chat-card-header"
-                              role="button"
-                              tabIndex={0}
-                              onClick={() => setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }))}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter" || event.key === " ") {
-                                  event.preventDefault();
-                                  setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }));
-                                }
+                      <div className="actions project-head-actions">
+                        {canStartChat ? (
+                          <>
+                            <select
+                              className="project-start-select"
+                              aria-label={`Start model for ${project.name}`}
+                              value={projectStartSettings.model}
+                              onClick={(event) => event.stopPropagation()}
+                              onKeyDown={(event) => event.stopPropagation()}
+                              onChange={(event) => {
+                                event.stopPropagation();
+                                updateProjectChatStartSettings(project.id, { model: event.target.value });
                               }}
                             >
-                              <h3>{chat.display_name || chat.name}</h3>
-                              <div className="meta">
-                                <span className={`status ${isRunning ? "running" : isStarting ? "starting" : "stopped"}`}>
-                                  {isRunning ? chat.status : isStarting ? "starting" : chat.status}
-                                </span>{" "}
-                                {chat.project_name}
-                              </div>
-                              {collapsed ? (
-                                <div className="meta">
-                                  {isStarting
-                                    ? "Starting chat and preparing terminal..."
-                                    : chat.display_subtitle || "No recent assistant summary yet."}
-                                </div>
-                              ) : null}
-                            </div>
-                            {!collapsed ? (
-                              <>
-                                <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
-                                <div className="meta">Workspace: {chat.workspace}</div>
-                                <div className="meta">Container folder: {chat.container_workspace || "not started yet"}</div>
-                                {chat.setup_snapshot_image ? (
-                                  <div className="meta">Setup snapshot image: {chat.setup_snapshot_image}</div>
-                                ) : null}
-                                <div className="meta">Volumes: {volumeCount} | Env vars: {envCount}</div>
-                              </>
-                            ) : null}
-
-                            <div className="stack compact">
-                              <div className="actions chat-actions">
-                                {!isRunning && !isStarting && hasServerChat ? (
-                                  <button
-                                    type="button"
-                                    className="btn-primary chat-primary-action"
-                                    onClick={() => handleStartChat(resolvedChatId)}
-                                  >
-                                    Start
-                                  </button>
-                                ) : null}
-                                {isStarting ? (
-                                  <button type="button" className="btn-primary chat-primary-action" disabled>
-                                    Starting...
-                                  </button>
-                                ) : null}
-                                {isRunning ? (
-                                  <button
-                                    type="button"
-                                    className="btn-primary chat-primary-action"
-                                    onClick={() => {
-                                      setActiveTerminalChatId(chat.id);
-                                      setCollapsedChats((prev) => ({ ...prev, [chat.id]: false }));
-                                    }}
-                                  >
-                                    {isActiveTerminal ? "Connected" : "Connect"}
-                                  </button>
-                                ) : null}
-                                <button
-                                  type="button"
-                                  className="btn-danger"
-                                  onClick={() => {
-                                    if (!hasServerChat) {
-                                      setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
-                                      setActiveTerminalChatId((current) => (current === chat.id ? "" : current));
-                                      return;
-                                    }
-                                    handleDeleteChat(resolvedChatId, chat.id);
-                                  }}
-                                >
-                                  Delete
-                                </button>
-                              </div>
-
-                              {!collapsed && isActiveTerminal ? (
-                                isStarting && !isRunning ? (
-                                  <div className="terminal-shell chat-terminal-shell chat-terminal-placeholder">
-                                    <div className="terminal-overlay">
-                                      <span className="inline-spinner" aria-hidden="true" />
-                                    </div>
-                                  </div>
-                                ) : (
-                                  <ChatTerminal chatId={resolvedChatId} running={isRunning} />
-                                )
-                              ) : null}
-                            </div>
-                          </article>
-                        );
-                      })}
+                              <option value="default">default</option>
+                              <option value="gpt-5.3-codex">gpt-5.3-codex</option>
+                              <option value="gpt-5.3-codex-spark">gpt-5.3-codex-spark</option>
+                            </select>
+                            <select
+                              className="project-start-select"
+                              aria-label={`Reasoning mode for ${project.name}`}
+                              value={projectStartSettings.reasoning}
+                              onClick={(event) => event.stopPropagation()}
+                              onKeyDown={(event) => event.stopPropagation()}
+                              onChange={(event) => {
+                                event.stopPropagation();
+                                updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
+                              }}
+                            >
+                              {REASONING_MODE_OPTIONS.map((reasoningMode) => (
+                                <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
+                                  {reasoningMode}
+                                </option>
+                              ))}
+                            </select>
+                          </>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="btn-primary project-group-action"
+                          disabled={!canStartChat && isBuilding}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (canStartChat) {
+                              handleCreateChat(project.id, projectStartSettings);
+                            } else {
+                              handleBuildProject(project.id);
+                            }
+                          }}
+                        >
+                          {canStartChat
+                            ? "New chat"
+                            : isBuilding
+                              ? <SpinnerLabel text="Building image..." />
+                              : "Build image"}
+                        </button>
+                      </div>
                     </div>
+
+                    {projectRowsCollapsed ? (
+                      <div className="meta">Chats hidden ({projectChats.length})</div>
+                    ) : (
+                      <div className="stack compact">
+                        {projectChats.length === 0 ? <div className="empty">No chats yet for this project.</div> : null}
+                        {projectChats.map((chat) => renderChatCard(chat))}
+                      </div>
+                    )}
                   </article>
                 );
               })}
               {chatsByProject.orphanChats.length > 0 ? (
                 <article className="card project-chat-group" key="group-orphan">
-                  <div className="project-head">
+                  <div
+                    className="project-head project-chat-row"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() =>
+                      toggleProjectChatRows("__orphan__", chatsByProject.orphanChats, Boolean(collapsedProjectChats.__orphan__))
+                    }
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        toggleProjectChatRows("__orphan__", chatsByProject.orphanChats, Boolean(collapsedProjectChats.__orphan__));
+                      }
+                    }}
+                  >
                     <h3>Unknown project</h3>
                   </div>
-                  <div className="stack compact">
-                    {chatsByProject.orphanChats.map((chat) => {
-                      const resolvedChatId = String(chat.server_chat_id || chat.id || "");
-                      const hasServerChat = Boolean(chat.server_chat_id || !String(chat.id || "").startsWith("pending-"));
-                      const isRunning = Boolean(chat.is_running);
-                      const isStarting = Boolean(
-                        pendingChatStarts[resolvedChatId] || chat.is_pending_start || String(chat.status || "") === "starting"
-                      );
-                      const isActiveTerminal = activeTerminalChatId === chat.id;
-                      const collapsed = collapsedChats[chat.id] ?? true;
-                      return (
-                        <article className="card" key={chat.id}>
-                          <div
-                            className="chat-card-header"
-                            role="button"
-                            tabIndex={0}
-                            onClick={() => setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }))}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                event.preventDefault();
-                                setCollapsedChats((prev) => ({ ...prev, [chat.id]: !collapsed }));
-                              }
-                            }}
-                          >
-                            <h3>{chat.display_name || chat.name}</h3>
-                            <div className="meta">
-                              <span className={`status ${isRunning ? "running" : isStarting ? "starting" : "stopped"}`}>
-                                {isRunning ? chat.status : isStarting ? "starting" : chat.status}
-                              </span>
-                            </div>
-                            {collapsed ? (
-                              <div className="meta">
-                                {isStarting
-                                  ? "Starting chat and preparing terminal..."
-                                  : chat.display_subtitle || "No recent assistant summary yet."}
-                              </div>
-                            ) : null}
-                          </div>
-                          <div className="stack compact">
-                            <div className="actions chat-actions">
-                              {!isRunning && !isStarting && hasServerChat ? (
-                                <button
-                                  type="button"
-                                  className="btn-primary chat-primary-action"
-                                  onClick={() => handleStartChat(resolvedChatId)}
-                                >
-                                  Start
-                                </button>
-                              ) : null}
-                              {isStarting ? (
-                                <button type="button" className="btn-primary chat-primary-action" disabled>
-                                  Starting...
-                                </button>
-                              ) : null}
-                              {isRunning ? (
-                                <button
-                                  type="button"
-                                  className="btn-primary chat-primary-action"
-                                  onClick={() => {
-                                    setActiveTerminalChatId(chat.id);
-                                    setCollapsedChats((prev) => ({ ...prev, [chat.id]: false }));
-                                  }}
-                                >
-                                  {isActiveTerminal ? "Connected" : "Connect"}
-                                </button>
-                              ) : null}
-                              <button
-                                type="button"
-                                className="btn-danger"
-                                onClick={() => {
-                                  if (!hasServerChat) {
-                                    setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
-                                    setActiveTerminalChatId((current) => (current === chat.id ? "" : current));
-                                    return;
-                                  }
-                                  handleDeleteChat(resolvedChatId, chat.id);
-                                }}
-                              >
-                                Delete
-                              </button>
-                            </div>
-                            {!collapsed && isActiveTerminal ? (
-                              isStarting && !isRunning ? (
-                                <div className="terminal-shell chat-terminal-shell chat-terminal-placeholder">
-                                  <div className="terminal-overlay">
-                                    <span className="inline-spinner" aria-hidden="true" />
-                                  </div>
-                                </div>
-                              ) : (
-                                <ChatTerminal chatId={resolvedChatId} running={isRunning} />
-                              )
-                            ) : null}
-                          </div>
-                        </article>
-                      );
-                    })}
-                  </div>
+                  {collapsedProjectChats.__orphan__ ? (
+                    <div className="meta">Chats hidden ({chatsByProject.orphanChats.length})</div>
+                  ) : (
+                    <div className="stack compact">
+                      {chatsByProject.orphanChats.map((chat) => renderChatCard(chat))}
+                    </div>
+                  )}
                 </article>
               ) : null}
             </div>
           </section>
         ) : (
-          <section className="panel">
-            <h2>Settings</h2>
+          <section className="panel settings-panel">
+            <div className="settings-heading">
+              <label className="theme-control" htmlFor="theme-preference-select">
+                <span>Theme</span>
+                <select
+                  id="theme-preference-select"
+                  value={themePreference}
+                  onChange={(event) => setThemePreference(normalizeThemePreference(event.target.value))}
+                >
+                  <option value="system">System default</option>
+                  <option value="light">Light</option>
+                  <option value="dark">Dark</option>
+                </select>
+              </label>
+            </div>
             <article className="card auth-provider-card">
               <div className="project-head">
                 <h3>OpenAI</h3>
@@ -2144,12 +2634,18 @@ function HubApp() {
             </article>
           </section>
         )}
-      </main>
+        </main>
+      </div>
+
     </div>
   );
 }
 
 export default function App() {
+  useEffect(() => {
+    applyThemePreference(loadThemePreference());
+  }, []);
+
   if (window.location.pathname === "/openai-auth/callback") {
     return <OpenAiAuthCallbackPage />;
   }

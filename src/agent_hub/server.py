@@ -43,7 +43,21 @@ OPENAI_ACCOUNT_LOGIN_DEFAULT_CALLBACK_PORT = 1455
 DEFAULT_AGENT_IMAGE = "agent-ubuntu2204:latest"
 DEFAULT_PTY_COLS = 160
 DEFAULT_PTY_ROWS = 48
-ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+CHAT_PREVIEW_LOG_MAX_BYTES = 150_000
+CHAT_TITLE_MAX_CHARS = 72
+CHAT_SUBTITLE_MAX_CHARS = 120
+CHAT_TITLE_PROMPT_MAX_ITEMS = 16
+CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS = 64
+CHAT_TITLE_API_TIMEOUT_SECONDS = 8.0
+CHAT_TITLE_OPENAI_MODEL = os.environ.get("AGENT_HUB_CHAT_TITLE_MODEL", "gpt-4.1-mini")
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:"
+    r"[@-Z\\-_]"
+    r"|\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x1B\x07]*(?:\x07|\x1B\\)"
+    r"|P[^\x1B\x07]*(?:\x07|\x1B\\)"
+    r")"
+)
 RESERVED_ENV_VAR_KEYS = {"OPENAI_API_KEY"}
 
 
@@ -489,6 +503,183 @@ def _short_summary(text: str, max_words: int = 10, max_chars: int = 80) -> str:
     return summary
 
 
+def _compact_whitespace(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _looks_like_terminal_control_payload(text: str) -> bool:
+    value = _compact_whitespace(text).strip()
+    if not value:
+        return False
+    lowered = value.lower()
+    if re.match(r"^\]?\d{1,3};(?:rgb|rgba):[0-9a-f]{2,4}/[0-9a-f]{2,4}/[0-9a-f]{2,4}", lowered):
+        return True
+    if re.match(r"^\]?\d{1,3};", lowered) and "rgb:" in lowered:
+        return True
+    return False
+
+
+def _truncate_title(text: str, max_chars: int) -> str:
+    cleaned = _compact_whitespace(text).strip()
+    if not cleaned or max_chars <= 0:
+        return ""
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    for delimiter in (" -- ", " - ", " | ", ": ", "; ", ". ", ", "):
+        head = cleaned.split(delimiter, 1)[0].strip()
+        if 12 <= len(head) <= max_chars:
+            cleaned = head
+            break
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    words = cleaned.split()
+    kept: list[str] = []
+    for word in words:
+        next_words = [*kept, word]
+        joined = " ".join(next_words).strip()
+        if len(joined) + 1 > max_chars:
+            break
+        kept.append(word)
+    if kept:
+        truncated = " ".join(kept).rstrip(" ,;:-")
+        return f"{truncated}…" if len(truncated) < len(cleaned) else truncated
+
+    if max_chars == 1:
+        return "…"
+    return cleaned[: max_chars - 1].rstrip() + "…"
+
+
+def _chat_preview_candidates_from_log(log_path: Path) -> tuple[list[str], list[str]]:
+    if not log_path.exists():
+        return [], []
+    with log_path.open("rb") as log_file:
+        log_file.seek(0, os.SEEK_END)
+        size = log_file.tell()
+        start = size - CHAT_PREVIEW_LOG_MAX_BYTES if size > CHAT_PREVIEW_LOG_MAX_BYTES else 0
+        log_file.seek(start)
+        raw = log_file.read().decode("utf-8", errors="ignore")
+
+    text = ANSI_ESCAPE_RE.sub("", raw).replace("\r", "\n")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return [], []
+
+    user_candidates: list[str] = []
+    assistant_candidates: list[str] = []
+    for line in lines:
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+        if line_clean.startswith(("›", ">", "You:")):
+            normalized = line_clean.lstrip("›>").strip()
+            if normalized.lower().startswith("you:"):
+                normalized = normalized[4:].strip()
+            if normalized:
+                user_candidates.append(normalized)
+            continue
+        if line_clean.startswith("Tip:"):
+            continue
+        assistant_candidates.append(line_clean)
+    return user_candidates, assistant_candidates
+
+
+def _openai_generate_chat_title(
+    api_key: str,
+    user_prompts: list[str],
+    max_chars: int = CHAT_TITLE_MAX_CHARS,
+    model: str = CHAT_TITLE_OPENAI_MODEL,
+    timeout_seconds: float = CHAT_TITLE_API_TIMEOUT_SECONDS,
+) -> str:
+    prompts = _normalize_chat_prompt_history(user_prompts)
+    if not api_key:
+        raise RuntimeError("OpenAI API key is not configured for chat title generation.")
+    if not prompts:
+        raise RuntimeError("No submitted user prompts are available for chat title generation.")
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("OpenAI Python SDK is not installed. Add dependency 'openai>=1.0'.") from exc
+
+    instructions = (
+        "You create a concise chat title for an engineering workstream.\n"
+        "Prioritize newer prompts over older prompts when choosing scope.\n"
+        "Return a single plain-text title only. No quotes, no markdown, no prefix.\n"
+        f"Maximum length: {max_chars} characters.\n"
+        "Aim for the most informative task-focused title possible."
+    )
+    prompt_lines = "\n".join(f"{index + 1}. {value}" for index, value in enumerate(prompts))
+    try:
+        client = OpenAI(api_key=api_key, timeout=timeout_seconds)
+        completion = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            max_tokens=64,
+            messages=[
+                {"role": "system", "content": instructions},
+                {
+                    "role": "user",
+                    "content": (
+                        "User prompts listed oldest to newest:\n"
+                        f"{prompt_lines}\n\n"
+                        f"Generate one title (<= {max_chars} chars)."
+                    ),
+                },
+            ],
+        )
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI chat title request failed: {exc}") from exc
+
+    choices = getattr(completion, "choices", None)
+    if not choices:
+        raise RuntimeError("OpenAI returned no title choices.")
+    first_choice = choices[0]
+    message = getattr(first_choice, "message", None)
+    content = getattr(message, "content", "") if message is not None else ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            text_value = getattr(item, "text", None)
+            if text_value:
+                parts.append(str(text_value))
+        normalized = "".join(parts).strip()
+    else:
+        normalized = str(content or "").strip()
+    if not normalized:
+        raise RuntimeError("OpenAI returned an empty title.")
+    first_line = normalized.splitlines()[0].strip().strip("\"'`")
+    title = _truncate_title(first_line, max_chars)
+    if not title:
+        raise RuntimeError("OpenAI returned an invalid chat title.")
+    return title
+
+
+def _normalize_chat_prompt_history(user_prompts: list[str]) -> list[str]:
+    normalized = [
+        _compact_whitespace(prompt).strip()
+        for prompt in user_prompts
+        if _compact_whitespace(prompt).strip() and not _looks_like_terminal_control_payload(_compact_whitespace(prompt).strip())
+    ]
+    if not normalized:
+        return []
+    return normalized[-CHAT_TITLE_PROMPT_MAX_ITEMS:]
+
+
+def _chat_title_prompt_fingerprint(user_prompts: list[str], max_chars: int = CHAT_TITLE_MAX_CHARS) -> str:
+    prompts = _normalize_chat_prompt_history(user_prompts)
+    if not prompts:
+        return ""
+    fingerprint_payload = {
+        "model": CHAT_TITLE_OPENAI_MODEL,
+        "max_chars": max_chars,
+        "prompts": prompts,
+    }
+    serialized = json.dumps(fingerprint_payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def _append_tail(existing: str, chunk: str, max_chars: int) -> str:
     merged = (existing or "") + (chunk or "")
     if len(merged) <= max_chars:
@@ -552,41 +743,11 @@ def _parse_local_callback(url_text: str) -> tuple[str, int, str]:
     return normalized_url, callback_port, callback_path
 
 
-def _chat_preview_from_log(log_path: Path) -> tuple[str, str]:
-    if not log_path.exists():
-        return "", ""
-    with log_path.open("rb") as log_file:
-        log_file.seek(0, os.SEEK_END)
-        size = log_file.tell()
-        start = size - 150_000 if size > 150_000 else 0
-        log_file.seek(start)
-        raw = log_file.read().decode("utf-8", errors="ignore")
-
-    text = ANSI_ESCAPE_RE.sub("", raw).replace("\r", "\n")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return "", ""
-
-    user_candidates: list[str] = []
-    assistant_candidates: list[str] = []
-    for line in lines:
-        line_clean = line.strip()
-        if not line_clean:
-            continue
-        if line_clean.startswith(("›", ">", "You:")):
-            normalized = line_clean.lstrip("›>").strip()
-            if normalized.lower().startswith("you:"):
-                normalized = normalized[4:].strip()
-            if normalized:
-                user_candidates.append(normalized)
-            continue
-        if line_clean.startswith("Tip:"):
-            continue
-        assistant_candidates.append(line_clean)
-
-    last_user = _short_summary(user_candidates[-1]) if user_candidates else ""
-    last_assistant = _short_summary(assistant_candidates[-1], max_words=14, max_chars=120) if assistant_candidates else ""
-    return last_user, last_assistant
+def _chat_subtitle_from_log(log_path: Path) -> str:
+    _, assistant_candidates = _chat_preview_candidates_from_log(log_path)
+    if not assistant_candidates:
+        return ""
+    return _short_summary(assistant_candidates[-1], max_words=14, max_chars=CHAT_SUBTITLE_MAX_CHARS)
 
 
 def _default_user() -> str:
@@ -869,6 +1030,11 @@ class HubState:
         self._chat_runtimes: dict[str, ChatRuntime] = {}
         self._openai_login_lock = Lock()
         self._openai_login_session: OpenAIAccountLoginSession | None = None
+        self._chat_input_lock = Lock()
+        self._chat_input_buffers: dict[str, str] = {}
+        self._chat_title_job_lock = Lock()
+        self._chat_title_jobs_inflight: set[str] = set()
+        self._chat_title_jobs_pending: set[str] = set()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
@@ -904,11 +1070,21 @@ class HubState:
             current_args = chat.get("agent_args")
             if isinstance(current_args, list):
                 chat["agent_args"] = [str(arg) for arg in current_args]
-                continue
-            if isinstance(legacy_args, list):
+            elif isinstance(legacy_args, list):
                 chat["agent_args"] = [str(arg) for arg in legacy_args]
             else:
                 chat["agent_args"] = []
+            prompts = chat.get("title_user_prompts")
+            if isinstance(prompts, list):
+                normalized_prompts = [str(item) for item in prompts if str(item).strip()]
+                chat["title_user_prompts"] = normalized_prompts[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
+            else:
+                chat["title_user_prompts"] = []
+            chat["title_cached"] = _truncate_title(str(chat.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
+            chat["title_prompt_fingerprint"] = str(chat.get("title_prompt_fingerprint") or "")
+            chat["title_source"] = str(chat.get("title_source") or "openai")
+            chat["title_status"] = str(chat.get("title_status") or "idle")
+            chat["title_error"] = str(chat.get("title_error") or "")
         return state
 
     def save(self, state: dict[str, Any]) -> None:
@@ -1528,6 +1704,12 @@ class HubState:
             "status": "stopped",
             "pid": None,
             "workspace": str(workspace_path),
+            "title_user_prompts": [],
+            "title_cached": "",
+            "title_prompt_fingerprint": "",
+            "title_source": "openai",
+            "title_status": "idle",
+            "title_error": "",
             "created_at": now,
             "updated_at": now,
         }
@@ -1535,7 +1717,7 @@ class HubState:
         self.save(state)
         return chat
 
-    def create_and_start_chat(self, project_id: str) -> dict[str, Any]:
+    def create_and_start_chat(self, project_id: str, agent_args: list[str] | None = None) -> dict[str, Any]:
         state = self.load()
         project = state["projects"].get(project_id)
         if project is None:
@@ -1543,13 +1725,14 @@ class HubState:
         build_status = str(project.get("build_status") or "")
         if build_status != "ready":
             raise HTTPException(status_code=409, detail="Project image is still being built. Save settings and wait.")
+        normalized_agent_args = [str(arg) for arg in (agent_args or []) if str(arg).strip()]
         chat = self.create_chat(
             project_id,
             profile="",
             ro_mounts=list(project.get("default_ro_mounts") or []),
             rw_mounts=list(project.get("default_rw_mounts") or []),
             env_vars=list(project.get("default_env_vars") or []),
-            agent_args=[],
+            agent_args=normalized_agent_args,
         )
         return self.start_chat(chat["id"])
 
@@ -1582,6 +1765,12 @@ class HubState:
         workspace = Path(str(chat.get("workspace") or self.chat_dir / chat_id))
         if workspace.exists():
             self._delete_path(workspace)
+
+        with self._chat_input_lock:
+            self._chat_input_buffers.pop(chat_id, None)
+        with self._chat_title_job_lock:
+            self._chat_title_jobs_inflight.discard(chat_id)
+            self._chat_title_jobs_pending.discard(chat_id)
 
         local_state["chats"].pop(chat_id, None)
         if state is None:
@@ -1768,6 +1957,151 @@ class HubState:
                 return
             runtime.listeners.discard(listener)
 
+    def _collect_submitted_prompts_from_input(self, chat_id: str, data: str) -> list[str]:
+        # Some terminal modes emit Enter as escape sequences (for example "\x1bOM").
+        # Normalize known submit controls before ANSI stripping so we keep submit intent.
+        normalized = (
+            str(data or "")
+            .replace("\x1bOM", "\r")
+            .replace("\x1b[13~", "\r")
+        )
+        sanitized = ANSI_ESCAPE_RE.sub("", normalized).replace("\x1b", "")
+        if not sanitized:
+            return []
+
+        submissions: list[str] = []
+        with self._chat_input_lock:
+            current = str(self._chat_input_buffers.get(chat_id) or "")
+            for char in sanitized:
+                if char in {"\r", "\n"}:
+                    submitted = _compact_whitespace(current).strip()
+                    if submitted:
+                        submissions.append(submitted)
+                    current = ""
+                    continue
+                if char in {"\b", "\x7f"}:
+                    current = current[:-1]
+                    continue
+                if char == "\x15":  # Ctrl+U clears the current line.
+                    current = ""
+                    continue
+                if ord(char) < 32:
+                    continue
+                current += char
+                if len(current) > 2000:
+                    current = current[-2000:]
+            self._chat_input_buffers[chat_id] = current
+        return submissions
+
+    def _record_submitted_prompt(self, chat_id: str, prompt: str) -> None:
+        submitted = _compact_whitespace(prompt).strip()
+        if not submitted:
+            return
+        if _looks_like_terminal_control_payload(submitted):
+            return
+
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            return
+
+        history_raw = chat.get("title_user_prompts")
+        history: list[str] = []
+        if isinstance(history_raw, list):
+            history = [str(item) for item in history_raw if str(item).strip()]
+        history.append(submitted)
+        if len(history) > CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:
+            history = history[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
+
+        chat["title_user_prompts"] = history
+        chat["title_user_prompts_updated_at"] = _iso_now()
+        chat["title_status"] = "pending"
+        chat["title_error"] = ""
+        state["chats"][chat_id] = chat
+        self.save(state)
+        self._schedule_chat_title_generation(chat_id)
+
+    def _schedule_chat_title_generation(self, chat_id: str) -> None:
+        with self._chat_title_job_lock:
+            if chat_id in self._chat_title_jobs_inflight:
+                self._chat_title_jobs_pending.add(chat_id)
+                return
+            self._chat_title_jobs_inflight.add(chat_id)
+
+        thread = Thread(target=self._chat_title_generation_loop, args=(chat_id,), daemon=True)
+        thread.start()
+
+    def _chat_title_generation_loop(self, chat_id: str) -> None:
+        try:
+            while True:
+                self._generate_and_store_chat_title(chat_id)
+                with self._chat_title_job_lock:
+                    if chat_id in self._chat_title_jobs_pending:
+                        self._chat_title_jobs_pending.discard(chat_id)
+                        continue
+                    self._chat_title_jobs_inflight.discard(chat_id)
+                    break
+        finally:
+            with self._chat_title_job_lock:
+                self._chat_title_jobs_inflight.discard(chat_id)
+                self._chat_title_jobs_pending.discard(chat_id)
+
+    def _generate_and_store_chat_title(self, chat_id: str) -> None:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            return
+
+        history_raw = chat.get("title_user_prompts")
+        if not isinstance(history_raw, list):
+            return
+        history = [str(item) for item in history_raw if str(item).strip()]
+        prompts = _normalize_chat_prompt_history(history)
+        if not prompts:
+            return
+
+        prompt_fingerprint = _chat_title_prompt_fingerprint(prompts, max_chars=CHAT_TITLE_MAX_CHARS)
+        cached_fingerprint = str(chat.get("title_prompt_fingerprint") or "")
+        cached_title = _truncate_title(str(chat.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
+        if cached_title and prompt_fingerprint and cached_fingerprint == prompt_fingerprint:
+            return
+
+        api_key = _read_openai_api_key(self.openai_credentials_file) or ""
+        if not api_key:
+            chat["title_status"] = "error"
+            chat["title_error"] = "OpenAI API key is not configured. Connect OpenAI in Settings."
+            chat["title_prompt_fingerprint"] = prompt_fingerprint
+            chat["title_source"] = "openai"
+            chat["title_updated_at"] = _iso_now()
+            state["chats"][chat_id] = chat
+            self.save(state)
+            return
+
+        try:
+            resolved_title = _openai_generate_chat_title(
+                api_key=api_key,
+                user_prompts=prompts,
+                max_chars=CHAT_TITLE_MAX_CHARS,
+            )
+        except Exception as exc:
+            chat["title_status"] = "error"
+            chat["title_error"] = str(exc)
+            chat["title_prompt_fingerprint"] = prompt_fingerprint
+            chat["title_source"] = "openai"
+            chat["title_updated_at"] = _iso_now()
+            state["chats"][chat_id] = chat
+            self.save(state)
+            return
+
+        chat["title_cached"] = resolved_title
+        chat["title_prompt_fingerprint"] = prompt_fingerprint
+        chat["title_source"] = "openai"
+        chat["title_status"] = "ready"
+        chat["title_error"] = ""
+        chat["title_updated_at"] = _iso_now()
+        state["chats"][chat_id] = chat
+        self.save(state)
+
     def write_terminal_input(self, chat_id: str, data: str) -> None:
         runtime = self._runtime_for_chat(chat_id)
         if runtime is None:
@@ -1778,6 +2112,9 @@ class HubState:
             os.write(runtime.master_fd, data.encode("utf-8", errors="ignore"))
         except OSError as exc:
             raise HTTPException(status_code=409, detail="Failed to write to chat terminal.") from exc
+        submissions = self._collect_submitted_prompts_from_input(chat_id, data)
+        for prompt in submissions:
+            self._record_submitted_prompt(chat_id, prompt)
 
     def resize_terminal(self, chat_id: str, cols: int, rows: int) -> None:
         runtime = self._runtime_for_chat(chat_id)
@@ -2073,8 +2410,29 @@ class HubState:
             chat_copy["is_running"] = running
             chat_copy["container_workspace"] = f"/home/{_default_user()}/projects/{Path(str(chat_copy['workspace'])).name}"
             chat_copy["project_name"] = project_map.get(chat_copy["project_id"], {}).get("name", "Unknown")
-            title, subtitle = _chat_preview_from_log(self.chat_log(chat_id))
-            chat_copy["display_name"] = title or chat_copy["name"]
+            subtitle = _chat_subtitle_from_log(self.chat_log(chat_id))
+            cached_title = _truncate_title(str(chat_copy.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
+            if cached_title and _looks_like_terminal_control_payload(cached_title):
+                cached_title = ""
+                if chat_id in state["chats"]:
+                    state["chats"][chat_id]["title_cached"] = ""
+                    state["chats"][chat_id]["title_source"] = ""
+                    state["chats"][chat_id]["title_prompt_fingerprint"] = ""
+                    should_save = True
+            history_raw = chat_copy.get("title_user_prompts")
+            if isinstance(history_raw, list):
+                cleaned_history = [
+                    str(item)
+                    for item in history_raw
+                    if str(item).strip() and not _looks_like_terminal_control_payload(str(item))
+                ]
+                if chat_id in state["chats"] and cleaned_history != list(history_raw):
+                    state["chats"][chat_id]["title_user_prompts"] = cleaned_history[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
+                    should_save = True
+            chat_copy["display_name"] = cached_title or chat_copy["name"]
+            title_error = _compact_whitespace(str(chat_copy.get("title_error") or ""))
+            if not subtitle and title_error:
+                subtitle = _short_summary(f"Title generation error: {title_error}", max_words=20, max_chars=CHAT_SUBTITLE_MAX_CHARS)
             chat_copy["display_subtitle"] = subtitle
             chats.append(chat_copy)
 
@@ -2115,6 +2473,8 @@ class HubState:
 
         workspace = self._ensure_chat_clone(chat, project)
         self._sync_checkout_to_remote(workspace, project)
+        with self._chat_input_lock:
+            self._chat_input_buffers[chat_id] = ""
 
         cmd = [
             "uv",
@@ -2138,6 +2498,10 @@ class HubState:
             if _is_reserved_env_entry(str(env_entry)):
                 continue
             cmd.extend(["--env-var", env_entry])
+        agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
+        if agent_args:
+            cmd.append("--")
+            cmd.extend(agent_args)
 
         proc = self._spawn_chat_process(chat_id, cmd)
         chat["status"] = "running"
@@ -2151,11 +2515,24 @@ class HubState:
         return chat
 
     def close_chat(self, chat_id: str) -> dict[str, Any]:
-        chat = self.chat(chat_id)
+        state = self.load()
+        chat = state["chats"].get(chat_id)
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
-        self.delete_chat(chat_id)
-        return {"id": chat_id, "status": "deleted"}
+
+        pid = chat.get("pid")
+        if isinstance(pid, int):
+            _stop_process(pid)
+        self._close_runtime(chat_id)
+        with self._chat_input_lock:
+            self._chat_input_buffers.pop(chat_id, None)
+
+        chat["status"] = "stopped"
+        chat["pid"] = None
+        chat["updated_at"] = _iso_now()
+        state["chats"][chat_id] = chat
+        self.save(state)
+        return chat
 
 
 def _html_page() -> str:
@@ -3030,8 +3407,26 @@ def main(
         return log_path.read_text(encoding="utf-8", errors="ignore")
 
     @app.post("/api/projects/{project_id}/chats/start")
-    def api_start_new_chat_for_project(project_id: str) -> dict[str, Any]:
-        return {"chat": state.create_and_start_chat(project_id)}
+    async def api_start_new_chat_for_project(project_id: str, request: Request) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        body = await request.body()
+        if body:
+            try:
+                parsed_payload = json.loads(body.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+            if not isinstance(parsed_payload, dict):
+                raise HTTPException(status_code=400, detail="Request body must be an object.")
+            payload = parsed_payload
+
+        agent_args = payload.get("agent_args")
+        if agent_args is None and "codex_args" in payload:
+            agent_args = payload.get("codex_args")
+        if agent_args is None:
+            agent_args = []
+        if not isinstance(agent_args, list):
+            raise HTTPException(status_code=400, detail="agent_args must be an array.")
+        return {"chat": state.create_and_start_chat(project_id, agent_args=[str(arg) for arg in agent_args])}
 
     @app.post("/api/chats")
     async def api_create_chat(request: Request) -> dict[str, Any]:
