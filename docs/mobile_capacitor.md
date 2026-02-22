@@ -25,6 +25,7 @@ For your use case ("wrap the existing web server"), use hosted mode with `--serv
 - `tools/mobile/deploy_android.sh`: Linux Android build + install.
 - `tools/mobile/deploy_ios_on_macos.sh`: iOS build + install on macOS.
 - `tools/mobile/deploy_ios_via_ssh.sh`: Linux orchestration script for remote macOS iOS deploy.
+- `tools/mobile/deploy_phone.sh`: single wrapper command that dispatches by target platform.
 
 ## Prerequisites
 
@@ -65,17 +66,17 @@ Start your hub server on Linux first (example):
 uv run agent_hub --host 0.0.0.0 --port 8765
 ```
 
-Then deploy:
+Then deploy with the wrapper:
 
 ```bash
-tools/mobile/deploy_android.sh \
+tools/mobile/deploy_phone.sh android \
   --server-url http://<linux-lan-ip>:8765
 ```
 
 Optional device targeting when multiple phones/emulators are connected:
 
 ```bash
-tools/mobile/deploy_android.sh \
+tools/mobile/deploy_phone.sh android \
   --server-url http://<linux-lan-ip>:8765 \
   --device-id <adb-serial>
 ```
@@ -99,10 +100,10 @@ First, identify your iPhone UDID on macOS:
 xcrun xctrace list devices
 ```
 
-Then run from Linux:
+Then run from Linux with the wrapper:
 
 ```bash
-tools/mobile/deploy_ios_via_ssh.sh \
+tools/mobile/deploy_phone.sh ios \
   --mac-host <user>@<mac-host> \
   --remote-dir ~/agent_hub_mobile \
   --server-url http://<linux-lan-ip>:8765 \
@@ -128,7 +129,16 @@ What this does:
 If you are already logged into macOS shell:
 
 ```bash
-tools/mobile/deploy_ios_on_macos.sh \
+tools/mobile/deploy_phone.sh ios \
+  --server-url http://<linux-lan-ip>:8765 \
+  --device-udid <iphone-udid> \
+  --apple-team-id <team-id>
+```
+
+Force local mode explicitly (macOS only):
+
+```bash
+tools/mobile/deploy_phone.sh ios-local \
   --server-url http://<linux-lan-ip>:8765 \
   --device-udid <iphone-udid> \
   --apple-team-id <team-id>

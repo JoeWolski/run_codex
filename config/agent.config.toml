@@ -33,6 +33,15 @@ Only publish archive files when the user explicitly requests an archive.
 Never push to the default branch unless the user explicitly asks in the current conversation.
 You may create, commit, and push feature branches as needed.
 When presenting a completed feature, open a pull request and provide the pull request link.
+Pull request bodies must be valid markdown with these non-empty sections in this exact order:
+## Summary
+## Changes
+## Validation
+## Risks
+Use flat bullets only (no nested bullets).
+In Validation, include exact commands executed and their pass/fail status.
+If validation was not run, state that explicitly with a brief reason.
+Prefer `gh pr create --body-file <path>` to avoid malformed summaries from shell escaping.
 """
 
 [profiles.fast]
