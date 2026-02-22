@@ -1,144 +1,209 @@
-# Agent Hub (Ubuntu 22.04)
+# Agent Hub
 
-This repository uses a Python `uv` tool (`agent_cli`) to launch a containerized agent runtime.
+## Why use this instead of the OpenAI Codex web UI?
 
-It also includes `agent_hub`, a local web control panel for project chat orchestration.
+If you want full control over runtime, performance, and data locality, this project is built for that.
 
-## What it does
+Compared with the hosted Codex web UI, Agent Hub lets you:
 
-- Builds and runs the `docker/Dockerfile` for the agent environment.
-- Supports an optional intermediate base image build from a provided Dockerfile/path.
-- Mounts your project under a stable container path:
-  `/home/<local_user>/projects/<project-name>`
-- Mounts persistent agent state on the host.
-- Supports read-only and read-write mount overrides.
-- Supports `--resume` to continue the latest session for the project.
+- Run agents on your own local hardware (including powerful multi-GPU workstations).
+- Use your own Docker images, setup scripts, and mount topology.
+- Keep code, secrets, datasets, and build caches on your machine.
+- Reuse deterministic per-project snapshot images so new chats start from a known-good environment.
+- Launch many chats quickly with isolated sandboxes (one workspace/runtime per chat) and optimistic UI creation.
+- Use first-class file workflows: publish files from a chat, preview/download them in the UI, and keep artifact history tied to prompts.
+
+In short: this is a local-first orchestration layer for Codex-style workflows, not just a chat window.
+
+## What this project provides
+
+This repo has two main tools:
+
+- `agent_cli`: launches a containerized Codex runtime for a project.
+- `agent_hub`: runs a local web control plane (FastAPI + React) for projects, chat sessions, auth, snapshots, and artifacts.
+
+Core capabilities include:
+
+- Project onboarding from Git URLs.
+- Project setup snapshots (`--setup-script` + `--snapshot-image-tag`) with cached reuse.
+- Base image selection by Docker tag or repo path to Dockerfile/directory.
+- Per-project default volumes/env vars and per-chat overrides.
+- Terminal streaming over WebSocket.
+- OpenAI auth (API key and ChatGPT account login flows).
+- GitHub App auth for in-container git credentials.
+- Artifact publishing with secure per-chat tokens, preview, and download links.
+
+## Architecture at a glance
+
+- Backend: `src/agent_hub/server.py` (FastAPI + state manager + process orchestration).
+- Runtime launcher: `src/agent_cli/cli.py` (Docker build/run + mount/env plumbing).
+- Frontend: `web/` (React + Vite + xterm.js).
+- Runtime image: `docker/Dockerfile` + `docker/docker-entrypoint.py`.
+- Artifact client command inside containers: `docker/hub_artifact`.
 
 ## Requirements
 
-- Docker and `nvidia-container-toolkit` for GPU mode.
-- Node.js and Yarn (for the React frontend in `web/`).
+- Linux/macOS with Docker CLI available.
+- Docker daemon reachable from where you run `agent_cli`/`agent_hub`.
+- Python 3.11+.
+- `uv` (recommended launcher in this repo).
+- Node.js + Corepack (only needed when frontend build is required).
+- Optional NVIDIA GPU + `nvidia-container-toolkit` if you want GPU passthrough.
 
 ## Quick start
 
-```bash
-uv run agent_cli --project /path/to/project
-```
-
-Defaults for `--project` is `.`.
-
-## Common options
-
-- `--project PATH`
-- `--resume`
-- `--config-file PATH` (default: repo `config/agent.config.toml`)
-- `--credentials-file PATH` and/or `--openai-api-key`
-- `--base PATH` (Dockerfile path or directory with Dockerfile)
-- `--base-image TAG` (default: `nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04`)
-- `--ro-mount /host/path:/container/path`
-- `--rw-mount /host/path:/container/path`
-- `--env-var KEY=VALUE` (repeatable; `OPENAI_API_KEY` is reserved for the authentication settings flow)
-- `--setup-script "cmd1\ncmd2"` and `--snapshot-image-tag TAG` (build/reuse a setup snapshot image)
-- `--prepare-snapshot-only` (build/reuse snapshot and exit)
-- `--local-user`, `--local-group`, `--local-uid`, `--local-gid`
-- `--local-supplementary-gids`, `--local-supplementary-groups`, `--local-umask`
-- `--agent-home-path PATH`
-
-## Examples
-
-Use a different project and pass through a command:
-
-```bash
-uv run agent_cli --project /path/to/project -- bash -lc 'id && pwd'
-```
-
-Build/run against a custom base Dockerfile:
-
-```bash
-uv run agent_cli --project /path/to/project --base /path/to/base/Dockerfile
-```
-
-Add mounts:
-
-```bash
-uv run agent_cli \
-  --project /path/to/project \
-  --ro-mount /mnt/datasets:/mnt/datasets \
-  --rw-mount /var/ccache_cache:/var/ccache_cache \
-  --env-var WANDB_MODE=offline
-```
-
-Resume last session:
-
-```bash
-uv run agent_cli --project /path/to/project --resume
-```
-
-## Usage model
-
-- Supported launcher: `uv run agent_cli`.
-- All behavior is controlled with CLI arguments.
-
-## Local web panel (`agent_hub`)
-
-Build the React frontend first:
-
-```bash
-cd web
-yarn install
-yarn build
-```
-
-`uv run agent_hub` now auto-builds the frontend when needed, so the manual build step above is optional.
+1. Start the hub:
 
 ```bash
 uv run agent_hub
 ```
 
-Optional:
+2. Open:
 
-```bash
-uv run agent_hub --data-dir /path/to/state --config-file /path/to/config.toml --host 127.0.0.1 --port 8765
-```
-
-Then open:
-
-```bash
+```text
 http://127.0.0.1:8765
 ```
 
-To access from another machine on the same network:
+3. Add a project in the UI:
+- repo URL
+- optional base image source
+- optional setup script
+- optional default mounts/env vars
+
+4. Wait for project image build to reach `Ready`, then create chats.
+
+Notes:
+
+- `agent_hub` auto-builds the frontend when needed.
+- Wrapper scripts are also available:
+  - `bin/agent_hub`
+  - `bin/agent_cli`
+
+## Parallel chats and sandboxing
+
+Agent Hub is designed for high-throughput chat workflows:
+
+- New chats can be created back-to-back with optimistic UI rows.
+- Chat start requests are queue-managed per project to avoid conflicting setup operations.
+- Different projects can start chats concurrently.
+- Every chat gets its own workspace directory and runtime process, so sessions are isolated.
+
+This gives fast multi-chat workflow without cross-chat state collisions.
+
+## First-class file support
+
+Inside a running chat container, publish generated files with:
 
 ```bash
-uv run agent_hub --host 0.0.0.0 --port 8765
+hub_artifact publish <path> [<path> ...]
 ```
 
-Then open:
+Optional:
 
 ```bash
-http://<hub-host-ip>:8765
+hub_artifact publish report.md --name "Final Report"
 ```
 
-Frontend development (React + Vite, with API proxy to `agent_hub`):
+Behavior:
+
+- Accepts individual files or a flat directory (no subdirectories).
+- Retries failed uploads with backoff.
+- Retries only failed files, not files already uploaded.
+- Registers artifacts in chat state with metadata.
+- UI provides download links and image/video preview where applicable.
+- Artifact history is preserved per prompt context.
+
+## Running `agent_cli` directly
+
+Minimal run:
+
+```bash
+uv run agent_cli --project /path/to/project
+```
+
+Common examples:
+
+```bash
+# Resume the last Codex session
+uv run agent_cli --project /path/to/project --resume
+
+# Use custom base Dockerfile
+uv run agent_cli --project /path/to/project --base /path/to/base/Dockerfile
+
+# Add mounts and env vars
+uv run agent_cli \
+  --project /path/to/project \
+  --ro-mount /mnt/datasets:/mnt/datasets \
+  --rw-mount /var/cache/build:/var/cache/build \
+  --env-var WANDB_MODE=offline
+```
+
+## Docker-in-Docker and networking notes
+
+This stack launches Docker containers from inside tools that may themselves run in a containerized/dev environment.
+
+Critical assumptions:
+
+- Docker socket access must be available (`/var/run/docker.sock`).
+- Host mount paths must be valid from the Docker daemon host perspective.
+- Artifact callback URL must be reachable from chat containers.
+
+By default, artifact publish URL resolves to:
+
+```text
+http://host.docker.internal:<hub-port>
+```
+
+Override when needed:
+
+```bash
+uv run agent_hub --artifact-publish-base-url http://<reachable-host>:8765
+```
+
+On Linux, chat runtime adds:
+
+```text
+host.docker.internal:host-gateway
+```
+
+to improve host reachability from containers.
+
+## Authentication
+
+In `Settings` tab:
+
+- OpenAI:
+  - API key connect/disconnect (optional verification against OpenAI API).
+  - ChatGPT account login (browser callback or device auth flow).
+- GitHub:
+  - GitHub App manifest setup.
+  - Installation connect/disconnect.
+  - Short-lived token-backed git credential injection for chat runtimes.
+
+Secrets are stored server-side in the hub data directory with restricted file permissions.
+
+## Validation commands
+
+Backend + CLI tests:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+Frontend build check:
 
 ```bash
 cd web
-yarn dev --host 0.0.0.0 --port 5173
+corepack yarn install
+corepack yarn build
 ```
 
-Capabilities:
+## Repo map
 
-- Add projects by Git repository URL.
-- Add/create a project-level setup snapshot container image at project creation time (and rebuild on project settings changes).
-- Start chats immediately with no chat-start configuration prompts; each new chat launches from the project snapshot image.
-- Set a per-project setup script in the UI (multiline; each non-empty line runs sequentially in the container with the checked-out project as working directory).
-- Setup snapshots are cached per project and reused for new chats (cache key changes when setup/base/default mount/default env settings change).
-- Set a per-project base image source as either a Docker image tag or a Dockerfile path/directory inside the checked-out repo.
-- Configure default/new-chat volumes with `Add volume` UI widgets (local path, container path, read-only/read-write mode).
-- Configure default/new-chat environment variables with `Add environment variable` UI widgets.
-- Configure OpenAI credentials in `Settings -> Authentication -> OpenAI`; credentials are stored server-side and passed to chat instances via `--credentials-file`.
-- OpenAI connect can optionally verify the key with a non-persistent server-side API check before saving.
-- Close chats (workspace is reset to the remote default branch and reused).
-- Delete chats explicitly from the UI (this removes that workspace).
-- Each chat shows both the host workspace path and the container working folder.
-- Agents can publish generated files into a chat artifact list with `hub_artifact publish <path> [<path> ...]`; this accepts individual files, or a directory of files (no subdirectories), and published artifacts appear in the chat card with download links.
+- `src/agent_hub/server.py`: hub backend and API routes.
+- `src/agent_cli/cli.py`: runtime launcher CLI.
+- `web/src/App.jsx`: UI behavior (projects/chats/settings/artifacts).
+- `docker/Dockerfile`: runtime image with Codex CLI and helper scripts.
+- `docker/hub_artifact`: artifact publish utility available in chat containers.
+- `tests/`: unit/integration coverage for hub, CLI, and artifact command behavior.
+
