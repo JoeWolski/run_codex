@@ -27,6 +27,16 @@ import agent_hub.server as hub_server
 import agent_cli.cli as image_cli
 
 
+TEST_GITHUB_PRIVATE_KEY = (
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAABAAACAQC7n7FQoZlFJdB4Y5Rmf+Pw\n"
+    "-----END OPENSSH PRIVATE KEY-----\n"
+)
+TEST_GITHUB_KNOWN_HOSTS = (
+    "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTestDataOnly0123456789AB\n"
+)
+
+
 class HubStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -108,6 +118,42 @@ class HubStateTests(unittest.TestCase):
             saved = self.state.connect_openai("sk-test-abcdefghijklmnopqrstuvwxyz1234", verify=False)
         verify_call.assert_not_called()
         self.assertTrue(saved["connected"])
+
+    def test_github_ssh_credentials_round_trip_status(self) -> None:
+        initial = self.state.github_auth_status()
+        self.assertFalse(initial["connected"])
+        self.assertEqual(initial["key_hint"], "")
+        self.assertEqual(initial["known_hosts_entries"], 0)
+
+        saved = self.state.connect_github_ssh(TEST_GITHUB_PRIVATE_KEY, known_hosts=TEST_GITHUB_KNOWN_HOSTS)
+        self.assertTrue(saved["connected"])
+        self.assertTrue(saved["key_hint"].startswith("sha256:"))
+        self.assertEqual(saved["known_hosts_entries"], 1)
+        self.assertTrue(saved["updated_at"])
+        self.assertTrue(saved["known_hosts_updated_at"])
+        self.assertTrue(self.state.github_ssh_private_key_file.exists())
+        self.assertTrue(self.state.github_ssh_known_hosts_file.exists())
+
+        key_mode = self.state.github_ssh_private_key_file.stat().st_mode & 0o777
+        known_hosts_mode = self.state.github_ssh_known_hosts_file.stat().st_mode & 0o777
+        self.assertEqual(key_mode, 0o600)
+        self.assertEqual(known_hosts_mode, 0o600)
+
+        payload = self.state.auth_settings_payload()
+        self.assertIn("providers", payload)
+        self.assertIn("github", payload["providers"])
+        self.assertTrue(payload["providers"]["github"]["connected"])
+
+        disconnected = self.state.disconnect_github_ssh()
+        self.assertFalse(disconnected["connected"])
+        self.assertFalse(self.state.github_ssh_private_key_file.exists())
+        self.assertFalse(self.state.github_ssh_known_hosts_file.exists())
+
+    def test_connect_github_ssh_rejects_invalid_private_key(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.connect_github_ssh("invalid-key")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("private_key", str(ctx.exception.detail))
 
     def test_connect_openai_verify_failure_does_not_persist_key(self) -> None:
         with patch(
@@ -428,6 +474,57 @@ class HubStateTests(unittest.TestCase):
             started_chat["artifact_publish_token_hash"],
             hub_server._hash_artifact_publish_token("artifact-token-test"),
         )
+
+    def test_start_chat_passes_github_ssh_credentials_when_configured(self) -> None:
+        self.state.connect_github_ssh(TEST_GITHUB_PRIVATE_KEY, known_hosts=TEST_GITHUB_KNOWN_HOSTS)
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertIn("--git-ssh-key-file", cmd)
+        self.assertIn(str(self.state.github_ssh_private_key_file), cmd)
+        self.assertIn("--git-ssh-known-hosts-file", cmd)
+        self.assertIn(str(self.state.github_ssh_known_hosts_file), cmd)
 
     def test_start_chat_rejects_base_path_outside_workspace(self) -> None:
         project = self.state.add_project(
@@ -786,6 +883,7 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("chat-snapshot", tags)
 
     def test_ensure_project_setup_snapshot_builds_once(self) -> None:
+        self.state.connect_github_ssh(TEST_GITHUB_PRIVATE_KEY, known_hosts=TEST_GITHUB_KNOWN_HOSTS)
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -825,6 +923,10 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--setup-script", cmd)
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
+        self.assertIn("--git-ssh-key-file", cmd)
+        self.assertIn(str(self.state.github_ssh_private_key_file), cmd)
+        self.assertIn("--git-ssh-known-hosts-file", cmd)
+        self.assertIn(str(self.state.github_ssh_known_hosts_file), cmd)
         self.assertIn("--no-alt-screen", cmd)
 
     def test_resize_terminal_sets_pty_size(self) -> None:
@@ -2413,6 +2515,69 @@ class CliEnvVarTests(unittest.TestCase):
             codex_mount = f"{(agent_home / '.codex').resolve()}:{container_home}/.codex"
             self.assertNotIn(full_home_mount, run_cmd)
             self.assertIn(codex_mount, run_cmd)
+
+    def test_cli_mounts_git_ssh_credentials_and_sets_git_ssh_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            key_file = tmp_path / "github_ssh_key"
+            known_hosts_file = tmp_path / "github_known_hosts"
+            key_file.write_text(TEST_GITHUB_PRIVATE_KEY, encoding="utf-8")
+            known_hosts_file.write_text(TEST_GITHUB_KNOWN_HOSTS, encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--git-ssh-key-file",
+                        str(key_file),
+                        "--git-ssh-known-hosts-file",
+                        str(known_hosts_file),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+
+            self.assertIn(f"{key_file.resolve()}:/tmp/agent_hub_git_ssh_key:ro", run_cmd)
+            self.assertIn(f"{known_hosts_file.resolve()}:/tmp/agent_hub_git_known_hosts", run_cmd)
+
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("GIT_TERMINAL_PROMPT=0", env_values)
+            git_ssh_command = next(
+                (entry for entry in env_values if entry.startswith("GIT_SSH_COMMAND=")),
+                "",
+            )
+            self.assertIn("-o IdentitiesOnly=yes", git_ssh_command)
+            self.assertIn("-o BatchMode=yes", git_ssh_command)
+            self.assertIn("-o StrictHostKeyChecking=yes", git_ssh_command)
+            self.assertIn("-o UserKnownHostsFile=/tmp/agent_hub_git_known_hosts", git_ssh_command)
 
     def test_cli_adds_host_gateway_alias_on_linux(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -373,6 +373,11 @@ code {
   margin: 0 auto;
 }
 
+.settings-provider-list {
+  display: grid;
+  gap: var(--space-3);
+}
+
 .auth-provider-card {
   border: 0;
   border-radius: 0;
@@ -1227,6 +1232,10 @@ button:focus-visible {
 
 .settings-auth-note {
   margin-top: 4px;
+}
+
+.settings-secret-textarea {
+  min-height: 164px;
 }
 
 .terminal-shell {

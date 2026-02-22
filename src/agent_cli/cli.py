@@ -170,6 +170,21 @@ def _read_openai_api_key(path: Path) -> str | None:
     return None
 
 
+def _known_hosts_has_entries(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return True
+    return False
+
+
 def _resolve_base_image(
     base_docker_path: str | None,
     base_docker_context: str | None,
@@ -248,6 +263,16 @@ def _resolve_base_image(
     help="Fallback credentials file to read OPENAI_API_KEY",
 )
 @click.option(
+    "--git-ssh-key-file",
+    default=None,
+    help="Host private SSH key file to mount for container git+ssh operations",
+)
+@click.option(
+    "--git-ssh-known-hosts-file",
+    default=None,
+    help="Host known_hosts file used with --git-ssh-key-file",
+)
+@click.option(
     "--base",
     "base_docker_path",
     default=None,
@@ -298,6 +323,8 @@ def main(
     config_file: str,
     openai_api_key: str | None,
     credentials_file: str,
+    git_ssh_key_file: str | None,
+    git_ssh_known_hosts_file: str | None,
     base_docker_path: str | None,
     base_docker_context: str | None,
     base_dockerfile: str | None,
@@ -337,6 +364,29 @@ def main(
             raise click.ClickException(f"Agent config file does not exist: {config_path}")
     if not config_path.is_file():
         raise click.ClickException(f"Agent config file does not exist: {config_path}")
+
+    git_ssh_key_path: Path | None = None
+    git_ssh_known_hosts_path: Path | None = None
+
+    if git_ssh_key_file:
+        git_ssh_key_path = _to_absolute(git_ssh_key_file, cwd)
+        if not git_ssh_key_path.is_file():
+            raise click.ClickException(f"Git SSH key file does not exist: {git_ssh_key_path}")
+    if git_ssh_known_hosts_file:
+        git_ssh_known_hosts_path = _to_absolute(git_ssh_known_hosts_file, cwd)
+        if git_ssh_known_hosts_path.exists() and not git_ssh_known_hosts_path.is_file():
+            raise click.ClickException(f"Git known_hosts path must be a file: {git_ssh_known_hosts_path}")
+        if not git_ssh_known_hosts_path.exists():
+            git_ssh_known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+            git_ssh_known_hosts_path.touch(mode=0o600, exist_ok=True)
+            try:
+                os.chmod(git_ssh_known_hosts_path, 0o600)
+            except OSError:
+                pass
+    if bool(git_ssh_key_path) != bool(git_ssh_known_hosts_path):
+        raise click.ClickException(
+            "--git-ssh-key-file and --git-ssh-known-hosts-file must be provided together"
+        )
 
     user = local_user or _default_user()
     group = local_group or _default_group_name()
@@ -485,6 +535,22 @@ def main(
 
     if api_key:
         run_args.extend(["--env", f"OPENAI_API_KEY={api_key}"])
+
+    if git_ssh_key_path is not None and git_ssh_known_hosts_path is not None:
+        container_git_ssh_key_path = "/tmp/agent_hub_git_ssh_key"
+        container_git_known_hosts_path = "/tmp/agent_hub_git_known_hosts"
+        run_args.extend(["--volume", f"{git_ssh_key_path}:{container_git_ssh_key_path}:ro"])
+        run_args.extend(["--volume", f"{git_ssh_known_hosts_path}:{container_git_known_hosts_path}"])
+        strict_host_key_checking = "yes" if _known_hosts_has_entries(git_ssh_known_hosts_path) else "accept-new"
+        git_ssh_command = (
+            f"ssh -i {container_git_ssh_key_path} "
+            "-o IdentitiesOnly=yes "
+            "-o BatchMode=yes "
+            f"-o StrictHostKeyChecking={strict_host_key_checking} "
+            f"-o UserKnownHostsFile={container_git_known_hosts_path}"
+        )
+        run_args.extend(["--env", "GIT_TERMINAL_PROMPT=0"])
+        run_args.extend(["--env", f"GIT_SSH_COMMAND={git_ssh_command}"])
 
     for env_entry in parsed_env_vars:
         run_args.extend(["--env", env_entry])

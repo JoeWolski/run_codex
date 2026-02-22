@@ -880,6 +880,17 @@ function normalizeOpenAiProviderStatus(rawProvider) {
   };
 }
 
+function normalizeGithubProviderStatus(rawProvider) {
+  return {
+    provider: "github",
+    connected: Boolean(rawProvider?.connected),
+    keyHint: String(rawProvider?.key_hint || ""),
+    updatedAt: String(rawProvider?.updated_at || ""),
+    knownHostsEntries: Number(rawProvider?.known_hosts_entries || 0) || 0,
+    knownHostsUpdatedAt: String(rawProvider?.known_hosts_updated_at || "")
+  };
+}
+
 function normalizeOpenAiAccountSession(rawSession) {
   if (!rawSession || typeof rawSession !== "object") {
     return null;
@@ -1092,6 +1103,14 @@ function HubApp() {
   const [openAiTitleTestPrompt, setOpenAiTitleTestPrompt] = useState("");
   const [openAiTitleTestRunning, setOpenAiTitleTestRunning] = useState(false);
   const [openAiTitleTestResult, setOpenAiTitleTestResult] = useState(null);
+  const [githubProviderStatus, setGithubProviderStatus] = useState(() =>
+    normalizeGithubProviderStatus(null)
+  );
+  const [githubCardExpanded, setGithubCardExpanded] = useState(true);
+  const [githubDraftPrivateKey, setGithubDraftPrivateKey] = useState("");
+  const [githubDraftKnownHosts, setGithubDraftKnownHosts] = useState("");
+  const [githubSaving, setGithubSaving] = useState(false);
+  const [githubDisconnecting, setGithubDisconnecting] = useState(false);
   const stateRefreshInFlightRef = useRef(false);
   const stateRefreshQueuedRef = useRef(false);
   const authRefreshInFlightRef = useRef(false);
@@ -1150,8 +1169,10 @@ function HubApp() {
       fetchJson("/api/settings/auth"),
       fetchJson("/api/settings/auth/openai/account/session")
     ]);
-    const provider = authPayload?.providers?.openai;
-    setOpenAiProviderStatus(normalizeOpenAiProviderStatus(provider));
+    const openAiProvider = authPayload?.providers?.openai;
+    const githubProvider = authPayload?.providers?.github;
+    setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
+    setGithubProviderStatus(normalizeGithubProviderStatus(githubProvider));
     setOpenAiAccountSession(normalizeOpenAiAccountSession(sessionPayload?.session));
     setOpenAiAuthLoaded(true);
   }, []);
@@ -1283,8 +1304,10 @@ function HubApp() {
     let ws = null;
 
     const applyAuthPayload = (authPayload) => {
-      const provider = authPayload?.providers?.openai;
-      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(provider));
+      const openAiProvider = authPayload?.providers?.openai;
+      const githubProvider = authPayload?.providers?.github;
+      setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
+      setGithubProviderStatus(normalizeGithubProviderStatus(githubProvider));
       setOpenAiAuthLoaded(true);
     };
 
@@ -1865,6 +1888,52 @@ function HubApp() {
     }
   }
 
+  async function handleConnectGithubSsh(event) {
+    event.preventDefault();
+    const privateKey = String(githubDraftPrivateKey || "").trim();
+    if (!privateKey) {
+      setError("GitHub SSH private key is required.");
+      return;
+    }
+
+    setGithubSaving(true);
+    try {
+      const knownHosts = String(githubDraftKnownHosts || "").trim();
+      const payload = await fetchJson("/api/settings/auth/github/connect", {
+        method: "POST",
+        body: JSON.stringify({
+          private_key: privateKey,
+          ...(knownHosts ? { known_hosts: knownHosts } : {})
+        })
+      });
+      setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
+      setGithubDraftPrivateKey("");
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setGithubSaving(false);
+    }
+  }
+
+  async function handleDisconnectGithubSsh() {
+    setGithubDisconnecting(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/github/disconnect", {
+        method: "POST"
+      });
+      setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
+      setGithubDraftPrivateKey("");
+      setGithubDraftKnownHosts("");
+      setGithubCardExpanded(true);
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setGithubDisconnecting(false);
+    }
+  }
+
   async function handleStartOpenAiAccountLogin(method) {
     setOpenAiAccountStarting(true);
     try {
@@ -2026,6 +2095,10 @@ function HubApp() {
       : openAiProviderStatus.connected
         ? "Connected with API key."
         : "Not connected yet. Expand this section and choose one login method.";
+  const githubConnected = githubProviderStatus.connected;
+  const githubConnectionSummary = githubConnected
+    ? "SSH credentials are configured and will be mounted into chat containers."
+    : "Not connected yet. Add a GitHub SSH private key to enable git+ssh inside containers.";
 
   useEffect(() => {
     if (!openAiAuthLoaded || openAiCardExpansionInitialized) {
@@ -2849,6 +2922,7 @@ function HubApp() {
                 </select>
               </label>
             </div>
+            <div className="settings-provider-list">
             <article className="card auth-provider-card">
               <div className="project-head">
                 <h3>OpenAI</h3>
@@ -3178,6 +3252,87 @@ function HubApp() {
                 </>
               ) : null}
             </article>
+            <article className="card auth-provider-card">
+              <div className="project-head">
+                <h3>GitHub</h3>
+                <div className="connection-summary">
+                  <span className={`connection-pill ${githubConnected ? "connected" : "disconnected"}`}>
+                    {githubConnected ? "connected" : "not connected"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-small"
+                    onClick={() => setGithubCardExpanded((expanded) => !expanded)}
+                  >
+                    {githubCardExpanded ? "Hide details" : "Show details"}
+                  </button>
+                </div>
+              </div>
+              <p className="meta">{githubConnectionSummary}</p>
+              {githubCardExpanded ? (
+                <>
+                  <p className="meta">
+                    Configure a dedicated GitHub SSH key for in-container git operations. These credentials are mounted only
+                    into chat and project setup containers.
+                  </p>
+                  <div className="settings-auth-block">
+                    <h4>Connect with SSH key</h4>
+                    <ol className="settings-auth-help-list">
+                      <li>Create a dedicated GitHub deploy key or machine-user SSH key.</li>
+                      <li>Paste the private key below.</li>
+                      <li>
+                        Optional: paste known-host entries for strict host pinning. Leave blank to allow first-use host key
+                        trust with persistence.
+                      </li>
+                    </ol>
+                    <div className="meta">Saved key fingerprint: {githubProviderStatus.keyHint || "none"}</div>
+                    <div className="meta">Last updated: {formatTimestamp(githubProviderStatus.updatedAt)}</div>
+                    <div className="meta">
+                      Known hosts: {githubProviderStatus.knownHostsEntries} entr{githubProviderStatus.knownHostsEntries === 1 ? "y" : "ies"}
+                    </div>
+                    <div className="meta">Known hosts updated: {formatTimestamp(githubProviderStatus.knownHostsUpdatedAt)}</div>
+                    <form className="stack compact" onSubmit={handleConnectGithubSsh}>
+                      <textarea
+                        className="script-input settings-secret-textarea"
+                        value={githubDraftPrivateKey}
+                        onChange={(event) => setGithubDraftPrivateKey(event.target.value)}
+                        placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"}
+                        spellCheck={false}
+                      />
+                      <textarea
+                        className="script-input settings-secret-textarea"
+                        value={githubDraftKnownHosts}
+                        onChange={(event) => setGithubDraftKnownHosts(event.target.value)}
+                        placeholder={"Optional known_hosts lines (example)\ngithub.com ssh-ed25519 AAAA..."}
+                        spellCheck={false}
+                      />
+                      <div className="actions">
+                        <button
+                          type="submit"
+                          className="btn-primary"
+                          disabled={githubSaving || githubDisconnecting}
+                        >
+                          {githubSaving ? <SpinnerLabel text="Saving..." /> : "Connect SSH key"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          disabled={!githubProviderStatus.connected || githubSaving || githubDisconnecting}
+                          onClick={handleDisconnectGithubSsh}
+                        >
+                          {githubDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect SSH key"}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                  <p className="meta settings-auth-note">
+                    SSH private keys are stored only on this machine with restricted permissions and are never returned by the
+                    API after save.
+                  </p>
+                </>
+              ) : null}
+            </article>
+            </div>
           </section>
         )}
         </main>

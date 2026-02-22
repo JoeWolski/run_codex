@@ -39,6 +39,10 @@ STATE_FILE_NAME = "state.json"
 SECRETS_DIR_NAME = "secrets"
 OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
+GITHUB_SSH_PRIVATE_KEY_FILE_NAME = "github_ssh_key"
+GITHUB_SSH_KNOWN_HOSTS_FILE_NAME = "github_known_hosts"
+GITHUB_SSH_PRIVATE_KEY_MAX_CHARS = 256_000
+GITHUB_SSH_KNOWN_HOSTS_MAX_CHARS = 256_000
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 TERMINAL_QUEUE_MAX = 256
@@ -87,6 +91,18 @@ OSC_COLOR_RESPONSE_FRAGMENT_RE = re.compile(
 )
 RESERVED_ENV_VAR_KEYS = {"OPENAI_API_KEY"}
 HUB_LOG_LEVEL_CHOICES = ("critical", "error", "warning", "info", "debug")
+GITHUB_SSH_PRIVATE_KEY_BEGIN_MARKERS = {
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN EC PRIVATE KEY-----",
+    "-----BEGIN DSA PRIVATE KEY-----",
+}
+GITHUB_SSH_PRIVATE_KEY_END_MARKERS = {
+    "-----END OPENSSH PRIVATE KEY-----",
+    "-----END RSA PRIVATE KEY-----",
+    "-----END EC PRIVATE KEY-----",
+    "-----END DSA PRIVATE KEY-----",
+}
 
 EVENT_TYPE_SNAPSHOT = "snapshot"
 EVENT_TYPE_STATE_CHANGED = "state_changed"
@@ -386,6 +402,86 @@ def _normalize_openai_api_key(raw_value: Any) -> str:
     if len(value) < 20:
         raise HTTPException(status_code=400, detail="OpenAI API key appears too short.")
     return value
+
+
+def _normalize_github_ssh_private_key(raw_value: Any) -> str:
+    value = str(raw_value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="private_key is required.")
+    if "\x00" in value:
+        raise HTTPException(status_code=400, detail="private_key contains invalid binary data.")
+    if len(value) > GITHUB_SSH_PRIVATE_KEY_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="private_key is too large.")
+
+    lines = [line.rstrip() for line in value.split("\n")]
+    if not lines:
+        raise HTTPException(status_code=400, detail="private_key is required.")
+    begin_marker = lines[0].strip()
+    end_marker = lines[-1].strip()
+    if begin_marker not in GITHUB_SSH_PRIVATE_KEY_BEGIN_MARKERS or end_marker not in GITHUB_SSH_PRIVATE_KEY_END_MARKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "private_key must be a PEM-style SSH private key "
+                "(for example, BEGIN/END OPENSSH PRIVATE KEY)."
+            ),
+        )
+    if begin_marker.replace("BEGIN", "END") != end_marker:
+        raise HTTPException(status_code=400, detail="private_key BEGIN/END markers do not match.")
+    if len(lines) < 3:
+        raise HTTPException(status_code=400, detail="private_key appears incomplete.")
+
+    return "\n".join(lines) + "\n"
+
+
+def _normalize_github_known_hosts(raw_value: Any) -> str:
+    if raw_value is None:
+        return ""
+    value = str(raw_value).replace("\r\n", "\n").replace("\r", "\n")
+    if "\x00" in value:
+        raise HTTPException(status_code=400, detail="known_hosts contains invalid binary data.")
+    if len(value) > GITHUB_SSH_KNOWN_HOSTS_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="known_hosts is too large.")
+
+    lines = [line.rstrip() for line in value.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def _known_hosts_entry_count(text: str) -> int:
+    count = 0
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        count += 1
+    return count
+
+
+def _read_text_if_exists(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _private_file_fingerprint(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+    if not digest:
+        return ""
+    return f"sha256:{digest[:16]}"
 
 
 def _openai_error_message(body_text: str) -> str:
@@ -1531,6 +1627,8 @@ class HubState:
         self.log_dir = self.data_dir / "logs"
         self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
         self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
+        self.github_ssh_private_key_file = self.secrets_dir / GITHUB_SSH_PRIVATE_KEY_FILE_NAME
+        self.github_ssh_known_hosts_file = self.secrets_dir / GITHUB_SSH_KNOWN_HOSTS_FILE_NAME
         self._lock = Lock()
         self._runtime_lock = Lock()
         self._events_lock = Lock()
@@ -1695,6 +1793,18 @@ class HubState:
     def _openai_credentials_arg(self) -> list[str]:
         return ["--credentials-file", str(self.openai_credentials_file)]
 
+    def _github_ssh_args(self) -> list[str]:
+        if not self.github_ssh_private_key_file.exists():
+            return []
+        if not self.github_ssh_known_hosts_file.exists():
+            _write_private_env_file(self.github_ssh_known_hosts_file, "")
+        return [
+            "--git-ssh-key-file",
+            str(self.github_ssh_private_key_file),
+            "--git-ssh-known-hosts-file",
+            str(self.github_ssh_known_hosts_file),
+        ]
+
     def _openai_account_payload(self) -> dict[str, Any]:
         account_connected, auth_mode = _read_codex_auth(self.openai_codex_auth_file)
         updated_at = ""
@@ -1726,6 +1836,34 @@ class HubState:
             "account_connected": account_payload["account_connected"],
             "account_auth_mode": account_payload["account_auth_mode"],
             "account_updated_at": account_payload["account_updated_at"],
+        }
+
+    def github_auth_status(self) -> dict[str, Any]:
+        connected = self.github_ssh_private_key_file.exists()
+        key_updated_at = ""
+        key_hint = ""
+        if connected:
+            try:
+                key_updated_at = _iso_from_timestamp(self.github_ssh_private_key_file.stat().st_mtime)
+            except OSError:
+                key_updated_at = ""
+            key_hint = _private_file_fingerprint(self.github_ssh_private_key_file)
+
+        known_hosts_text = _read_text_if_exists(self.github_ssh_known_hosts_file)
+        known_hosts_updated_at = ""
+        if self.github_ssh_known_hosts_file.exists():
+            try:
+                known_hosts_updated_at = _iso_from_timestamp(self.github_ssh_known_hosts_file.stat().st_mtime)
+            except OSError:
+                known_hosts_updated_at = ""
+
+        return {
+            "provider": "github",
+            "connected": connected,
+            "key_hint": key_hint,
+            "updated_at": key_updated_at,
+            "known_hosts_entries": _known_hosts_entry_count(known_hosts_text),
+            "known_hosts_updated_at": known_hosts_updated_at,
         }
 
     def _chat_title_generation_auth(self) -> tuple[str, str]:
@@ -1761,7 +1899,12 @@ class HubState:
         raise RuntimeError(CHAT_TITLE_NO_CREDENTIALS_ERROR)
 
     def auth_settings_payload(self) -> dict[str, Any]:
-        return {"providers": {"openai": self.openai_auth_status()}}
+        return {
+            "providers": {
+                "openai": self.openai_auth_status(),
+                "github": self.github_auth_status(),
+            }
+        }
 
     def test_openai_chat_title_generation(self, prompt: Any) -> dict[str, Any]:
         submitted = _compact_whitespace(str(prompt or "")).strip()
@@ -1853,6 +1996,35 @@ class HubState:
         status = self.openai_auth_status()
         self._emit_auth_changed(reason="openai_api_key_disconnected")
         LOGGER.debug("OpenAI API key disconnected.")
+        return status
+
+    def connect_github_ssh(self, private_key: Any, known_hosts: Any = None) -> dict[str, Any]:
+        normalized_key = _normalize_github_ssh_private_key(private_key)
+
+        if known_hosts is None:
+            known_hosts_text = _read_text_if_exists(self.github_ssh_known_hosts_file)
+        else:
+            known_hosts_text = _normalize_github_known_hosts(known_hosts)
+
+        _write_private_env_file(self.github_ssh_private_key_file, normalized_key)
+        _write_private_env_file(self.github_ssh_known_hosts_file, known_hosts_text)
+
+        status = self.github_auth_status()
+        self._emit_auth_changed(reason="github_ssh_connected")
+        LOGGER.debug("GitHub SSH credentials connected.")
+        return status
+
+    def disconnect_github_ssh(self) -> dict[str, Any]:
+        for path in [self.github_ssh_private_key_file, self.github_ssh_known_hosts_file]:
+            if not path.exists():
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="Failed to remove stored GitHub SSH credentials.") from exc
+        status = self.github_auth_status()
+        self._emit_auth_changed(reason="github_ssh_disconnected")
+        LOGGER.debug("GitHub SSH credentials disconnected.")
         return status
 
     def disconnect_openai_account(self) -> dict[str, Any]:
@@ -3331,6 +3503,7 @@ class HubState:
             "--no-alt-screen",
         ]
         cmd.extend(self._openai_credentials_arg())
+        cmd.extend(self._github_ssh_args())
         self._append_project_base_args(cmd, workspace, project)
         for mount in project.get("default_ro_mounts") or []:
             cmd.extend(["--ro-mount", mount])
@@ -3548,6 +3721,7 @@ class HubState:
             "--no-alt-screen",
         ]
         cmd.extend(self._openai_credentials_arg())
+        cmd.extend(self._github_ssh_args())
         self._append_project_base_args(cmd, workspace, project)
         cmd.extend(["--snapshot-image-tag", snapshot_tag])
         for mount in chat.get("ro_mounts") or []:
@@ -4425,6 +4599,22 @@ def main(
     @app.post("/api/settings/auth/openai/disconnect")
     def api_disconnect_openai() -> dict[str, Any]:
         return {"provider": state.disconnect_openai()}
+
+    @app.post("/api/settings/auth/github/connect")
+    async def api_connect_github(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return {
+            "provider": state.connect_github_ssh(
+                payload.get("private_key"),
+                known_hosts=payload.get("known_hosts"),
+            )
+        }
+
+    @app.post("/api/settings/auth/github/disconnect")
+    def api_disconnect_github() -> dict[str, Any]:
+        return {"provider": state.disconnect_github_ssh()}
 
     @app.post("/api/settings/auth/openai/title-test")
     async def api_test_openai_chat_title_generation(request: Request) -> dict[str, Any]:
