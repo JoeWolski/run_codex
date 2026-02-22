@@ -463,6 +463,11 @@ class HubStateTests(unittest.TestCase):
             max_chars=hub_server.CHAT_TITLE_MAX_CHARS,
         )
 
+    def test_normalize_chat_prompt_history_keeps_all_prompts_without_limit(self) -> None:
+        prompts = [f"prompt {index}" for index in range(1, 200)]
+        normalized = hub_server._normalize_chat_prompt_history(prompts)
+        self.assertEqual(normalized, prompts)
+
     def test_first_url_in_text_trims_trailing_punctuation(self) -> None:
         value = hub_server._first_url_in_text(
             "Starting local login server on http://localhost:1455.",
@@ -2108,6 +2113,29 @@ class HubStateTests(unittest.TestCase):
         updated = self.state.load()["chats"][chat["id"]]
         self.assertEqual(updated["title_user_prompts"], ["check reconnect timeout handling"])
 
+    def test_record_chat_title_prompt_keeps_unbounded_history(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        prompts = [f"prompt {index}" for index in range(1, 90)]
+        with patch.object(hub_server.HubState, "_schedule_chat_title_generation"):
+            for prompt in prompts:
+                result = self.state.record_chat_title_prompt(chat["id"], prompt)
+                self.assertTrue(result["recorded"])
+
+        updated = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(updated["title_user_prompts"], prompts)
+
     def test_write_terminal_input_ignores_terminal_control_payload(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -2162,12 +2190,49 @@ class HubStateTests(unittest.TestCase):
             self.state._generate_and_store_chat_title(chat["id"])
 
         self.assertEqual(generate_title.call_count, 1)
+        generate_title.assert_called_once_with(
+            api_key="sk-test",
+            user_prompts=["first prompt", "second prompt"],
+            max_chars=hub_server.CHAT_TITLE_MAX_CHARS,
+        )
         updated = self.state.load()["chats"][chat["id"]]
         self.assertEqual(updated["title_cached"], "Fix flaky login tests in auth flow")
         self.assertEqual(updated["title_source"], "openai")
         self.assertEqual(updated["title_status"], "ready")
         self.assertEqual(updated["title_error"], "")
         self.assertTrue(updated["title_prompt_fingerprint"])
+
+    def test_generate_and_store_chat_title_passes_full_prompt_history_to_generator(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        prompts = [f"prompt {index}" for index in range(1, 90)]
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["title_user_prompts"] = prompts
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._read_codex_auth", return_value=(False, "")), patch(
+            "agent_hub.server._read_openai_api_key", return_value="sk-test"
+        ), patch(
+            "agent_hub.server._openai_generate_chat_title",
+            return_value="Investigate websocket reconnect stability and retry behavior",
+        ) as generate_title:
+            self.state._generate_and_store_chat_title(chat["id"])
+
+        generate_title.assert_called_once_with(
+            api_key="sk-test",
+            user_prompts=prompts,
+            max_chars=hub_server.CHAT_TITLE_MAX_CHARS,
+        )
 
     def test_generate_and_store_chat_title_records_openai_error(self) -> None:
         project = self.state.add_project(

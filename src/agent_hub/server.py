@@ -78,8 +78,6 @@ CHAT_PREVIEW_LOG_MAX_BYTES = 150_000
 CHAT_TITLE_MAX_CHARS = 72
 CHAT_SUBTITLE_MAX_CHARS = 240
 CHAT_SUBTITLE_MARKERS = (".", "•", "◦", "∙", "·", "●", "○", "▪", "▫", "‣", "⁃")
-CHAT_TITLE_PROMPT_MAX_ITEMS = 16
-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS = 64
 CHAT_TITLE_API_TIMEOUT_SECONDS = 8.0
 CHAT_TITLE_CODEX_TIMEOUT_SECONDS = 25.0
 CHAT_TITLE_OPENAI_MODEL = os.environ.get("AGENT_HUB_CHAT_TITLE_MODEL", "gpt-4.1-mini")
@@ -1384,7 +1382,8 @@ def _openai_generate_chat_title(
 
     instructions = (
         "You create a concise chat title for an engineering workstream.\n"
-        "Prioritize newer prompts over older prompts when choosing scope.\n"
+        "Use the full user prompt history to infer the overarching purpose and goal of the chat.\n"
+        "Synthesize recurring objectives and refinements across prompts instead of parroting only the latest prompt.\n"
         "Return a single plain-text title only. No quotes, no markdown, no prefix.\n"
         f"Maximum length: {max_chars} characters.\n"
         "Aim for the most informative task-focused title possible."
@@ -1474,13 +1473,14 @@ def _codex_generate_chat_title(
     prompt_lines = "\n".join(f"{index + 1}. {value}" for index, value in enumerate(prompts))
     request_prompt = (
         "Return exactly one concise title for an engineering chat.\n"
-        "Prioritize newer prompts over older prompts.\n"
+        "Use the full user prompt history to summarize the overall purpose and goal of the chat.\n"
+        "Synthesize repeated objectives and refinements across prompts instead of echoing only the latest prompt.\n"
         f"Maximum length: {max_chars} characters.\n"
         "Return plain text only. No quotes. No markdown. No prefix.\n\n"
         "User prompts listed oldest to newest:\n"
         f"{prompt_lines}"
     )
-    output_file = host_codex_dir / f"title-last-message-{uuid.uuid4().hex}.txt"
+    output_file = host_codex_dir / f"title-summary-{uuid.uuid4().hex}.txt"
 
     env = os.environ.copy()
     env["HOME"] = str(host_agent_home)
@@ -1546,7 +1546,7 @@ def _normalize_chat_prompt_history(user_prompts: list[str]) -> list[str]:
     ]
     if not normalized:
         return []
-    return normalized[-CHAT_TITLE_PROMPT_MAX_ITEMS:]
+    return normalized
 
 
 def _chat_title_prompt_fingerprint(user_prompts: list[str], max_chars: int = CHAT_TITLE_MAX_CHARS) -> str:
@@ -2097,7 +2097,7 @@ class HubState:
             prompts = chat.get("title_user_prompts")
             if isinstance(prompts, list):
                 normalized_prompts = [str(item) for item in prompts if str(item).strip()]
-                chat["title_user_prompts"] = normalized_prompts[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
+                chat["title_user_prompts"] = normalized_prompts
             else:
                 chat["title_user_prompts"] = []
             chat["title_cached"] = _truncate_title(str(chat.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
@@ -4417,8 +4417,6 @@ class HubState:
             return False
 
         history.append(submitted)
-        if len(history) > CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:
-            history = history[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
 
         now = _iso_now()
         chat["title_user_prompts"] = history
@@ -4948,7 +4946,7 @@ class HubState:
                     if str(item).strip() and not _looks_like_terminal_control_payload(str(item))
                 ]
                 if chat_id in state["chats"] and cleaned_history != list(history_raw):
-                    state["chats"][chat_id]["title_user_prompts"] = cleaned_history[-CHAT_TITLE_PROMPT_HISTORY_MAX_ITEMS:]
+                    state["chats"][chat_id]["title_user_prompts"] = cleaned_history
                     should_save = True
             title_status = str(chat_copy.get("title_status") or "idle").lower()
             if title_status == "pending":
