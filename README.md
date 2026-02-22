@@ -86,6 +86,42 @@ No manual artifact wiring is required for `agent_hub` chats:
 - The default `config/agent.config.toml` already includes developer instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
 - Those config-driven developer instructions are applied automatically in hub-launched chats, so you do not need to manually paste extra prompt boilerplate.
 
+## Chat Agent Prompt Context (All Mutation Points)
+
+This section is specifically about the coding-agent runtime prompt/context for chats (not chat title generation metadata).
+
+Prompt/context can be changed in these places:
+
+1. Config file selection at launch:
+   - `agent_hub --config-file <path>` selects the config forwarded into every hub-launched chat.
+   - `agent_cli --config-file <path>` selects the config for direct CLI-launched chats.
+   - Default path is `config/agent.config.toml` (`src/agent_hub/server.py`, `src/agent_cli/cli.py`).
+2. Prompt-relevant keys inside the selected config file:
+   - `developer_instructions`
+   - `project_doc_auto_load`
+   - `project_doc_fallback_filenames`
+   - `project_doc_auto_load_extra_filenames`
+   - Profile/model settings (for example `[profiles.*]`) when selected via agent arguments.
+3. Auto-loaded project documents (when `project_doc_auto_load = true`):
+   - Fallback files from the chat workspace repo: `AGENTS.md`, `README.md`
+   - Extra files from config: `docs/repo-map.md`, `docs/agent-mcp.md`, `docs/agent-setup.md`
+4. Per-chat start arguments passed to the agent process:
+   - Web UI start controls build `agent_args` in `web/src/App.jsx` (for example `--model ...` and `-c model_reasoning_effort="..."`).
+   - API callers can also pass `agent_args` directly.
+   - Direct `agent_cli` launches can pass prompt-affecting args using trailing `-- <agent args>`.
+   - `agent_hub` appends those args when starting the chat (`src/agent_hub/server.py`), and `agent_cli` forwards them to the in-container agent command (`src/agent_cli/cli.py`).
+5. Chat workspace sync source (hub mode):
+   - Before starting a chat, `agent_hub` runs `fetch`, checks out the selected remote branch, then hard-resets/cleans (`src/agent_hub/server.py`).
+   - Result: auto-loaded prompt docs are sourced from the synced remote branch state at chat start.
+
+What does not change coding-agent runtime prompt/context:
+
+1. Chat title prompt endpoints (for example `/api/chats/{chat_id}/title-prompt`) only affect title generation, not coding-agent runtime instructions.
+
+Operational guidance:
+
+1. If you change any prompt/context input above (config file, auto-loaded docs, or agent args), restart the chat so a fresh agent process picks up the new settings deterministically.
+
 ## Requirements
 
 - Linux or macOS with Docker CLI available.
