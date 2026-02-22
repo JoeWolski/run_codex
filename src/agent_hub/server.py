@@ -3383,6 +3383,151 @@ class HubState:
             "notes": notes,
         }
 
+    @staticmethod
+    def _dockerfile_path_score(relative_path: str) -> tuple[int, int, str]:
+        normalized = str(relative_path or "").strip().replace("\\", "/")
+        lowered = normalized.lower()
+        parts = [part for part in lowered.split("/") if part]
+        score = 0
+        filename = parts[-1] if parts else lowered
+        if filename == "dockerfile":
+            score += 40
+        elif "dockerfile" in filename:
+            score += 20
+        if "ci" in parts:
+            score += 80
+        if "docker" in lowered:
+            score += 40
+        if "devcontainer" in parts:
+            score += 60
+        if any(part in {"x86", "amd64"} for part in parts):
+            score += 15
+        if any(part in {"test", "tests", "example", "examples"} for part in parts):
+            score -= 20
+        return score, -len(parts), normalized
+
+    def _infer_repo_dockerfile_path(self, workspace: Path) -> str:
+        candidates: list[tuple[int, int, str]] = []
+        ignored_dirs = {
+            ".git",
+            ".hg",
+            ".svn",
+            ".venv",
+            "venv",
+            "node_modules",
+            "build",
+            "dist",
+            "out",
+            "target",
+        }
+        for root, dirs, files in os.walk(workspace):
+            dirs[:] = [name for name in dirs if name not in ignored_dirs]
+            for filename in files:
+                lowered = filename.lower()
+                if lowered != "dockerfile" and "dockerfile" not in lowered:
+                    continue
+                absolute_path = Path(root) / filename
+                try:
+                    relative_path = absolute_path.resolve().relative_to(workspace.resolve()).as_posix()
+                except ValueError:
+                    continue
+                candidates.append(self._dockerfile_path_score(relative_path))
+        if not candidates:
+            return ""
+        candidates.sort(reverse=True)
+        return candidates[0][2]
+
+    @staticmethod
+    def _iter_text_files_for_make_targets(workspace: Path) -> list[Path]:
+        preferred_roots = [
+            workspace / ".github" / "workflows",
+            workspace / "ci",
+            workspace / "docker",
+            workspace / "scripts",
+        ]
+        output: list[Path] = []
+        seen: set[Path] = set()
+        for root in preferred_roots:
+            if not root.exists():
+                continue
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path in seen:
+                    continue
+                seen.add(path)
+                output.append(path)
+        return output
+
+    def _infer_make_sh_target(self, workspace: Path) -> str:
+        make_script = workspace / "make.sh"
+        if not make_script.is_file():
+            return ""
+
+        pattern = re.compile(r"(?:^|[\s\"'`])(?:\./)?make\.sh\s+([A-Za-z0-9_.:-]+)")
+        counts: dict[str, int] = {}
+        for path in self._iter_text_files_for_make_targets(workspace):
+            try:
+                if path.stat().st_size > 1_000_000:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for match in pattern.finditer(text):
+                target = str(match.group(1) or "").strip()
+                if not target or target.startswith("-"):
+                    continue
+                counts[target] = counts.get(target, 0) + 1
+
+        if counts:
+            ranked = sorted(counts.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
+            return ranked[0][0]
+        return ""
+
+    def _suggest_make_sh_command(self, workspace: Path) -> str:
+        make_script = workspace / "make.sh"
+        if not make_script.is_file():
+            return ""
+        prefix = "./make.sh" if os.access(make_script, os.X_OK) else "bash make.sh"
+        target = self._infer_make_sh_target(workspace)
+        if target:
+            return f"{prefix} {target}"
+        return prefix
+
+    def _apply_auto_config_repository_hints(
+        self,
+        recommendation: dict[str, Any],
+        workspace: Path,
+    ) -> dict[str, Any]:
+        next_recommendation = dict(recommendation)
+        dockerfile_path = self._infer_repo_dockerfile_path(workspace)
+        current_value = str(next_recommendation.get("base_image_value") or "").strip()
+
+        if dockerfile_path:
+            normalized = f"/{dockerfile_path.lower()}"
+            strong_ci_container_hint = "/ci/" in normalized and "docker" in normalized
+            if strong_ci_container_hint or not current_value:
+                next_recommendation["base_image_mode"] = "repo_path"
+                next_recommendation["base_image_value"] = dockerfile_path
+
+        make_command = self._suggest_make_sh_command(workspace)
+        if make_command:
+            setup_script = str(next_recommendation.get("setup_script") or "").strip()
+            inferred_mode = _normalize_base_image_mode(next_recommendation.get("base_image_mode"))
+            if not setup_script:
+                next_recommendation["setup_script"] = make_command
+            elif inferred_mode == "repo_path" and " " in make_command:
+                next_recommendation["setup_script"] = make_command
+            elif "make.sh" not in setup_script:
+                next_recommendation["setup_script"] = f"{setup_script}\n{make_command}"
+
+        notes = _compact_whitespace(str(next_recommendation.get("notes") or "")).strip()
+        if dockerfile_path:
+            note_addition = f"selected repository Dockerfile: {dockerfile_path}"
+            notes = f"{notes}; {note_addition}" if notes else note_addition
+        next_recommendation["notes"] = notes
+        return next_recommendation
+
     def _run_temporary_auto_config_chat(self, workspace: Path, repo_url: str, branch: str) -> dict[str, Any]:
         account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
         if not account_connected:
@@ -3451,11 +3596,41 @@ class HubState:
 
         requested_branch = str(default_branch or "").strip()
         git_env = self._github_git_env_for_repo(normalized_repo_url)
-        resolved_branch = requested_branch or _detect_default_branch(normalized_repo_url, env=git_env)
+        sanitized_git_env = {
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        authenticated_git_env = dict(sanitized_git_env)
+        authenticated_git_env.update(git_env)
+        resolved_branch = requested_branch or _detect_default_branch(
+            normalized_repo_url,
+            env=authenticated_git_env,
+        )
+        if not requested_branch and git_env and resolved_branch == "master":
+            public_branch = _detect_default_branch(normalized_repo_url, env=sanitized_git_env)
+            if public_branch:
+                resolved_branch = public_branch
 
         with tempfile.TemporaryDirectory(prefix="agent-hub-auto-config-", dir=str(self.data_dir)) as temp_dir:
             workspace = Path(temp_dir) / "repo"
-            clone_cmd = [
+            env_candidates: list[dict[str, str]] = [authenticated_git_env]
+            if git_env:
+                env_candidates.append(sanitized_git_env)
+
+            def run_clone(cmd: list[str]) -> subprocess.CompletedProcess:
+                last_result = subprocess.CompletedProcess(cmd, 1, "", "")
+                for env_candidate in env_candidates:
+                    if workspace.exists():
+                        self._delete_path(workspace)
+                    result = _run(cmd, capture=True, check=False, env=env_candidate)
+                    if result.returncode == 0:
+                        return result
+                    last_result = result
+                return last_result
+
+            clone_cmd_with_branch = [
                 "git",
                 "clone",
                 "--depth",
@@ -3465,7 +3640,7 @@ class HubState:
                 normalized_repo_url,
                 str(workspace),
             ]
-            clone_result = _run(clone_cmd, capture=True, check=False, env=git_env)
+            clone_result = run_clone(clone_cmd_with_branch)
             if clone_result.returncode != 0:
                 if requested_branch:
                     detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
@@ -3476,24 +3651,30 @@ class HubState:
                             f"{detail or 'git clone failed.'}"
                         ),
                     )
-                if workspace.exists():
-                    self._delete_path(workspace)
-                _run(
-                    ["git", "clone", "--depth", "1", normalized_repo_url, str(workspace)],
-                    check=True,
-                    env=git_env,
-                )
+
+                clone_cmd_default = ["git", "clone", "--depth", "1", normalized_repo_url, str(workspace)]
+                clone_result = run_clone(clone_cmd_default)
+                if clone_result.returncode != 0:
+                    detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unable to clone repository for auto-configure. {detail or 'git clone failed.'}",
+                    )
+
                 head_result = _run_for_repo(
                     ["rev-parse", "--abbrev-ref", "HEAD"],
                     workspace,
                     capture=True,
                     check=False,
+                    env=sanitized_git_env,
                 )
                 if head_result.returncode == 0 and head_result.stdout.strip():
                     resolved_branch = head_result.stdout.strip()
 
             chat_result = self._run_temporary_auto_config_chat(workspace, normalized_repo_url, resolved_branch)
             recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
+            recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
+            recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
 
         recommendation["default_branch"] = resolved_branch
         recommendation["analysis_model"] = str(chat_result.get("model") or "")

@@ -2483,6 +2483,105 @@ class HubStateTests(unittest.TestCase):
                 )
         self.assertEqual(ctx.exception.status_code, 409)
 
+    def test_auto_configure_project_retries_clone_without_auth_env(self) -> None:
+        attempted_clone_envs: list[dict[str, str] | None] = []
+
+        def fake_run(
+            cmd: list[str],
+            cwd: Path | None = None,
+            capture: bool = False,
+            check: bool = True,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess:
+            del cwd, capture, check
+            if cmd[:2] == ["git", "clone"]:
+                attempted_clone_envs.append(env)
+                if env and env.get("BAD_AUTH"):
+                    return subprocess.CompletedProcess(cmd, 1, "", "fatal: HTTP 403")
+                return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(
+            hub_server.HubState,
+            "_github_git_env_for_repo",
+            return_value={"BAD_AUTH": "1"},
+        ), patch(
+            "agent_hub.server._detect_default_branch",
+            return_value="main",
+        ), patch(
+            "agent_hub.server._run",
+            side_effect=fake_run,
+        ), patch.object(
+            hub_server.HubState,
+            "_run_temporary_auto_config_chat",
+            return_value={
+                "payload": {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                "model": "chatgpt-account-codex",
+            },
+        ):
+            recommendation = self.state.auto_configure_project(
+                repo_url="https://github.com/scptr-ai/av.git",
+                default_branch="",
+            )
+
+        self.assertGreaterEqual(len(attempted_clone_envs), 2)
+        self.assertIsNotNone(attempted_clone_envs[0])
+        assert attempted_clone_envs[0] is not None
+        assert attempted_clone_envs[1] is not None
+        self.assertEqual(attempted_clone_envs[0].get("BAD_AUTH"), "1")
+        self.assertEqual(attempted_clone_envs[1].get("GIT_CONFIG_COUNT"), "0")
+        self.assertNotIn("BAD_AUTH", attempted_clone_envs[1])
+        self.assertEqual(recommendation["base_image_mode"], "tag")
+        self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
+
+    def test_apply_auto_config_repository_hints_prefers_ci_dockerfile_and_make_target(self) -> None:
+        workspace = self.tmp_path / "workspace-hints"
+        (workspace / "ci" / "x86_docker").mkdir(parents=True, exist_ok=True)
+        (workspace / "docker").mkdir(parents=True, exist_ok=True)
+        (workspace / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+        (workspace / "ci" / "x86_docker" / "Dockerfile").write_text(
+            "FROM ubuntu:22.04\n",
+            encoding="utf-8",
+        )
+        (workspace / "docker" / "Dockerfile").write_text(
+            "FROM ubuntu:20.04\n",
+            encoding="utf-8",
+        )
+        (workspace / "make.sh").write_text(
+            "#!/usr/bin/env bash\nset -e\n",
+            encoding="utf-8",
+        )
+        (workspace / ".github" / "workflows" / "build.yml").write_text(
+            "steps:\\n  - run: bash make.sh rbufc\\n",
+            encoding="utf-8",
+        )
+
+        recommendation = self.state._apply_auto_config_repository_hints(
+            {
+                "base_image_mode": "tag",
+                "base_image_value": "ubuntu:22.04",
+                "setup_script": "echo bootstrap",
+                "default_ro_mounts": [],
+                "default_rw_mounts": [],
+                "default_env_vars": [],
+                "notes": "",
+            },
+            workspace,
+        )
+
+        self.assertEqual(recommendation["base_image_mode"], "repo_path")
+        self.assertEqual(recommendation["base_image_value"], "ci/x86_docker/Dockerfile")
+        self.assertEqual(recommendation["setup_script"], "bash make.sh rbufc")
+        self.assertIn("selected repository Dockerfile: ci/x86_docker/Dockerfile", recommendation["notes"])
+
     def test_state_payload_does_not_call_openai_title_generation_from_log_changes(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
