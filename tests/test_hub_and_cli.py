@@ -3584,6 +3584,117 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--permission-mode", run_cmd[image_index + 2 :])
             self.assertIn("bypassPermissions", run_cmd[image_index + 2 :])
 
+    def test_claude_runtime_appends_shared_prompt_context_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "model = 'test'\n"
+                "project_doc_auto_load = true\n"
+                "project_doc_fallback_filenames = ['AGENTS.md', 'README.md']\n"
+                "project_doc_auto_load_extra_filenames = ['docs/agent-setup.md']\n"
+                "project_doc_max_bytes = 4096\n"
+                "developer_instructions = '''Always run deterministic integration tests before final output.'''\n",
+                encoding="utf-8",
+            )
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
+            claude_args = run_cmd[image_index + 2 :]
+            self.assertIn("--append-system-prompt", claude_args)
+            prompt_index = claude_args.index("--append-system-prompt")
+            self.assertGreater(len(claude_args), prompt_index + 1)
+            shared_prompt = claude_args[prompt_index + 1]
+            self.assertIn("Always run deterministic integration tests before final output.", shared_prompt)
+            self.assertIn("AGENTS.md", shared_prompt)
+            self.assertIn("README.md", shared_prompt)
+            self.assertIn("docs/agent-setup.md", shared_prompt)
+            self.assertIn("4096 bytes", shared_prompt)
+
+    def test_claude_runtime_does_not_duplicate_explicit_system_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text(
+                "model = 'test'\n"
+                "project_doc_auto_load = true\n"
+                "project_doc_fallback_filenames = ['AGENTS.md']\n"
+                "developer_instructions = '''Shared instructions from config.'''\n",
+                encoding="utf-8",
+            )
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                        "--",
+                        "--append-system-prompt",
+                        "manual system prompt",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
+            claude_args = run_cmd[image_index + 2 :]
+            self.assertEqual(claude_args.count("--append-system-prompt"), 1)
+            prompt_index = claude_args.index("--append-system-prompt")
+            self.assertEqual(claude_args[prompt_index + 1], "manual system prompt")
+
     def test_codex_runtime_flags_respect_explicit_cli_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

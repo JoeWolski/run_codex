@@ -82,7 +82,8 @@ Important flags for quickstart:
 No manual artifact wiring is required for `agent_hub` chats:
 
 - `agent_hub` injects `AGENT_HUB_ARTIFACTS_URL` and `AGENT_HUB_ARTIFACT_TOKEN` into each chat runtime.
-- `agent_hub` passes its config file into each runtime as `~/.codex/config.toml`.
+- `agent_hub` passes its config file into each runtime as `~/.codex/config.toml` for Codex.
+- `agent_cli` derives shared prompt/context instructions from that same config and passes them to Claude via `--append-system-prompt`.
 - The default `config/agent.config.toml` already includes developer instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
 - Those config-driven developer instructions are applied automatically in hub-launched chats, so you do not need to manually paste extra prompt boilerplate.
 
@@ -92,7 +93,9 @@ For day-to-day prompt/setup changes, these are the main files that assemble most
 These paths are resolved from each chat's checked-out target project workspace, not from the Agent Hub repository itself (unless Agent Hub is the target project).
 
 1. `config/agent.config.toml`
-   - Primary config passed into chats as `~/.codex/config.toml`.
+   - Single source for shared chat prompt/context settings across Codex and Claude.
+   - Passed into Codex chats as `~/.codex/config.toml`.
+   - Used to derive Claude `--append-system-prompt` defaults (`developer_instructions` and project-doc bootstrap hints).
    - Main place for `developer_instructions` and project-doc auto-load settings.
 2. `AGENTS.md` (in the checked-out project repo)
    - Primary repo-specific instruction file loaded by the agent.
@@ -129,7 +132,8 @@ Behavior highlights:
 
 - Mounts your project into `/home/<user>/projects/<project-name>`.
 - Mounts Docker socket (`/var/run/docker.sock`) so runtime tools can access Docker when available.
-- Mounts config file to `~/.codex/config.toml` in the container.
+- Mounts config file to `~/.codex/config.toml` in the container (Codex runtime).
+- Derives shared prompt/context instructions from the same config and appends them to Claude sessions (`--append-system-prompt`).
 - Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, and `~/.config/claude`.
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
