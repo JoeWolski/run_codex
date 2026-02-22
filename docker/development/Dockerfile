@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    PATH=/opt/agent_hub/.venv/bin:/root/.local/bin:${PATH}
+    PATH=/opt/agent_hub/.venv/bin:/usr/local/bin:${PATH}
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -32,7 +32,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && npm cache clean --force \
  && rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-installer.sh \
+ && UV_INSTALL_DIR=/usr/local/bin sh /tmp/uv-installer.sh \
+ && rm -f /tmp/uv-installer.sh \
+ && command -v uv \
+ && uv --version
 
 RUN if ! command -v corepack >/dev/null 2>&1; then npm install -g corepack@0.31.0; fi \
  && corepack enable

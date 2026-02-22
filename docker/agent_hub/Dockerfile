@@ -16,7 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv \
-    PATH=/opt/agent_hub/.venv/bin:/root/.local/bin:${PATH}
+    PATH=/opt/agent_hub/.venv/bin:/usr/local/bin:${PATH}
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -29,7 +29,11 @@ RUN apt-get update \
     tini \
  && rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-installer.sh \
+ && UV_INSTALL_DIR=/usr/local/bin sh /tmp/uv-installer.sh \
+ && rm -f /tmp/uv-installer.sh \
+ && command -v uv \
+ && uv --version
 
 WORKDIR /opt/agent_hub
 
