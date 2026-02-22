@@ -5634,6 +5634,14 @@ class HubState:
         if not resolved:
             return
         flag, value = resolved
+        if flag == "base":
+            base_path = Path(value)
+            if base_path.is_file():
+                # Dockerfiles stored under subdirectories commonly still need the repository
+                # root as build context for COPY paths (for example COPY src ./src).
+                cmd.extend(["--base-docker-context", str(workspace.resolve())])
+                cmd.extend(["--base-dockerfile", str(base_path)])
+                return
         cmd.extend([f"--{flag}", value])
 
     def _project_setup_snapshot_tag(self, project: dict[str, Any]) -> str:

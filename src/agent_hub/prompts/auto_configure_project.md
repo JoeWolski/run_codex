@@ -6,6 +6,8 @@ Agent Hub project configuration semantics:
 - base_image_mode: 'tag' or 'repo_path'
   - 'tag': base_image_value is a Docker image tag.
   - 'repo_path': base_image_value is a repository-relative path to a Dockerfile or a directory containing Dockerfile.
+    - Dockerfile file path: build context is repository root.
+    - Directory path: build context is that directory (expects `Dockerfile` inside).
 - setup_script: newline-delimited shell commands run in project root during snapshot build (`set -e` is already enabled).
 - default_ro_mounts/default_rw_mounts: host:container mounts used for snapshot prep and all new chats.
 - default_env_vars: KEY=VALUE entries; do not set OPENAI_API_KEY, AGENT_HUB_GIT_USER_NAME, AGENT_HUB_GIT_USER_EMAIL.
@@ -19,6 +21,7 @@ Requirements:
 6) If ccache/sccache (or equivalent compiler cache) is used, include shared cache mounts.
    - ccache mount: $ccache_mount
    - sccache mount: $sccache_mount
+7) For `repo_path` recommendations, choose a Dockerfile file path when the Dockerfile needs repository-root context (for example it copies `src/` or `web/`); choose a directory path only when that directory is the intended build context.
 
 Return exactly one JSON object (no markdown fences, no prose) with this schema:
 {

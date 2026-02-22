@@ -135,6 +135,7 @@ Behavior highlights:
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
 - Applies permissive in-container defaults unless you explicitly override them with trailing agent args:
   Codex uses `--ask-for-approval never --sandbox danger-full-access`; Claude uses `--permission-mode bypassPermissions`.
+- In `agent_hub` repo-path mode, a Dockerfile file path uses repository-root build context, while a directory path uses that directory as context.
 
 Key argument groups:
 

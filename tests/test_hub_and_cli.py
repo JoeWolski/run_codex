@@ -613,6 +613,8 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("1. test prompt", codex_prompt)
         self.assertIn("Repository URL: https://github.com/acme/demo.git", auto_config_prompt)
         self.assertIn("Checked out branch: main", auto_config_prompt)
+        self.assertIn("Dockerfile file path: build context is repository root.", auto_config_prompt)
+        self.assertIn("choose a Dockerfile file path when the Dockerfile needs repository-root context", auto_config_prompt)
 
     def test_first_url_in_text_trims_trailing_punctuation(self) -> None:
         value = hub_server._first_url_in_text(
@@ -843,7 +845,10 @@ class HubStateTests(unittest.TestCase):
         cmd = captured["cmd"]
         workspace = self.state.chat_workdir(chat["id"])
         self.assertIn("--base", cmd)
-        self.assertIn(str(workspace / "docker" / "base"), cmd)
+        base_index = cmd.index("--base")
+        self.assertEqual(cmd[base_index + 1], str(workspace / "docker" / "base"))
+        self.assertNotIn("--base-docker-context", cmd)
+        self.assertNotIn("--base-dockerfile", cmd)
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
         self.assertIn("--agent-home-path", cmd)
@@ -874,6 +879,65 @@ class HubStateTests(unittest.TestCase):
             started_chat["artifact_publish_token_hash"],
             hub_server._hash_artifact_publish_token("artifact-token-test"),
         )
+
+    def test_start_chat_builds_cmd_with_repo_dockerfile_uses_workspace_context(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            base_image_mode="repo_path",
+            base_image_value="docker/development/Dockerfile",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="fast",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            dockerfile = workspace / "docker" / "development" / "Dockerfile"
+            dockerfile.parent.mkdir(parents=True, exist_ok=True)
+            dockerfile.write_text("FROM python:3.11-slim-bookworm\n", encoding="utf-8")
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        workspace = self.state.chat_workdir(chat["id"]).resolve()
+        dockerfile = workspace / "docker" / "development" / "Dockerfile"
+        self.assertNotIn("--base", cmd)
+        self.assertIn("--base-docker-context", cmd)
+        context_index = cmd.index("--base-docker-context")
+        self.assertEqual(cmd[context_index + 1], str(workspace))
+        self.assertIn("--base-dockerfile", cmd)
+        dockerfile_index = cmd.index("--base-dockerfile")
+        self.assertEqual(cmd[dockerfile_index + 1], str(dockerfile))
 
     def test_start_chat_uses_claude_agent_command_when_selected(self) -> None:
         project = self.state.add_project(
@@ -1570,6 +1634,53 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--git-credential-host", cmd)
         self.assertIn("github.com", cmd)
         self.assertIn("--no-alt-screen", cmd)
+        self.assertIn("--base", cmd)
+        base_index = cmd.index("--base")
+        self.assertEqual(cmd[base_index + 1], str(workspace / "docker" / "base"))
+        self.assertNotIn("--base-docker-context", cmd)
+        self.assertNotIn("--base-dockerfile", cmd)
+
+    def test_ensure_project_setup_snapshot_uses_repo_root_context_for_repo_dockerfile(self) -> None:
+        self._connect_github_app()
+        project = self.state.add_project(
+            repo_url="https://github.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+            base_image_mode="repo_path",
+            base_image_value="docker/development/Dockerfile",
+        )
+        workspace = self.tmp_path / "workspace-dockerfile"
+        dockerfile = workspace / "docker" / "development" / "Dockerfile"
+        dockerfile.parent.mkdir(parents=True, exist_ok=True)
+        dockerfile.write_text("FROM python:3.11-slim-bookworm\n", encoding="utf-8")
+
+        executed: list[list[str]] = []
+
+        def fake_run(cmd: list[str], cwd: Path | None = None, capture: bool = False, check: bool = True):
+            del cwd, capture, check
+            executed.append(list(cmd))
+
+            class Dummy:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return Dummy()
+
+        with patch("agent_hub.server._docker_image_exists", side_effect=[False]), patch(
+            "agent_hub.server._run", side_effect=fake_run
+        ):
+            self.state._ensure_project_setup_snapshot(workspace, project)
+
+        self.assertEqual(len(executed), 1)
+        cmd = executed[0]
+        self.assertNotIn("--base", cmd)
+        self.assertIn("--base-docker-context", cmd)
+        context_index = cmd.index("--base-docker-context")
+        self.assertEqual(cmd[context_index + 1], str(workspace.resolve()))
+        self.assertIn("--base-dockerfile", cmd)
+        dockerfile_index = cmd.index("--base-dockerfile")
+        self.assertEqual(cmd[dockerfile_index + 1], str(dockerfile.resolve()))
 
     def test_ensure_project_setup_snapshot_passes_git_identity_env_for_pat(self) -> None:
         self._connect_github_pat()
