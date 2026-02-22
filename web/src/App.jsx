@@ -1207,6 +1207,8 @@ function HubApp() {
   const [hubState, setHubState] = useState({ projects: [], chats: [] });
   const [error, setError] = useState("");
   const [createForm, setCreateForm] = useState(() => emptyCreateForm());
+  const [createAutoConfigRunning, setCreateAutoConfigRunning] = useState(false);
+  const [createAutoConfigResult, setCreateAutoConfigResult] = useState(null);
   const [projectDrafts, setProjectDrafts] = useState({});
   const [editingProjects, setEditingProjects] = useState({});
   const [projectBuildLogs, setProjectBuildLogs] = useState({});
@@ -1761,6 +1763,9 @@ function HubApp() {
 
   function updateCreateForm(patch) {
     setCreateForm((prev) => ({ ...prev, ...patch }));
+    if (Object.prototype.hasOwnProperty.call(patch, "repoUrl") || Object.prototype.hasOwnProperty.call(patch, "defaultBranch")) {
+      setCreateAutoConfigResult(null);
+    }
   }
 
   function updateProjectDraft(projectId, patch) {
@@ -1869,6 +1874,49 @@ function HubApp() {
     }
   }, [refreshState, removeOptimisticChatRow]);
 
+  async function handleAutoConfigureCreateForm() {
+    const repoUrl = String(createForm.repoUrl || "").trim();
+    if (!repoUrl) {
+      setError("Repo URL is required before auto configure.");
+      return;
+    }
+
+    setCreateAutoConfigRunning(true);
+    setCreateAutoConfigResult(null);
+    setError("");
+    try {
+      const payload = await fetchJson("/api/projects/auto-configure", {
+        method: "POST",
+        body: JSON.stringify({
+          repo_url: repoUrl,
+          default_branch: String(createForm.defaultBranch || "").trim()
+        })
+      });
+      const recommendation = payload?.recommendation || {};
+      setCreateForm((prev) => ({
+        ...prev,
+        defaultBranch: String(recommendation.default_branch || prev.defaultBranch || ""),
+        baseImageMode: normalizeBaseMode(recommendation.base_image_mode),
+        baseImageValue: String(recommendation.base_image_value || ""),
+        setupScript: String(recommendation.setup_script || ""),
+        defaultVolumes: mountRowsFromArrays(
+          recommendation.default_ro_mounts || [],
+          recommendation.default_rw_mounts || []
+        ),
+        defaultEnvVars: envRowsFromArray(recommendation.default_env_vars || [])
+      }));
+      setCreateAutoConfigResult({
+        model: String(recommendation.analysis_model || ""),
+        notes: String(recommendation.notes || "")
+      });
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setCreateAutoConfigRunning(false);
+    }
+  }
+
   async function handleCreateProject(event) {
     event.preventDefault();
     try {
@@ -1890,6 +1938,8 @@ function HubApp() {
         body: JSON.stringify(payload)
       });
       setCreateForm(emptyCreateForm());
+      setCreateAutoConfigResult(null);
+      setCreateAutoConfigRunning(false);
       setError("");
       await refreshState();
     } catch (err) {
@@ -3156,9 +3206,31 @@ function HubApp() {
                   <div className="label">Default environment variables for new chats</div>
                   <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
 
-                  <button type="submit" className="btn-primary">
-                    Add project
-                  </button>
+                  <div className="row two create-project-actions">
+                    <button type="submit" className="btn-primary" disabled={createAutoConfigRunning}>
+                      Add project
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={handleAutoConfigureCreateForm}
+                      disabled={createAutoConfigRunning || !String(createForm.repoUrl || "").trim()}
+                    >
+                      {createAutoConfigRunning ? <SpinnerLabel text="Auto configuring..." /> : "Auto configure"}
+                    </button>
+                  </div>
+                  {createAutoConfigRunning ? (
+                    <div className="meta auto-config-meta">
+                      Running temporary analysis chat and applying recommended base image, setup script, and cache mounts.
+                    </div>
+                  ) : null}
+                  {createAutoConfigResult ? (
+                    <div className="meta auto-config-meta">
+                      Auto configure complete
+                      {createAutoConfigResult.model ? ` (${createAutoConfigResult.model})` : ""}.
+                      {createAutoConfigResult.notes ? ` ${createAutoConfigResult.notes}` : ""}
+                    </div>
+                  ) : null}
                 </form>
               </section>
 

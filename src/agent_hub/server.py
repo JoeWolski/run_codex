@@ -19,6 +19,7 @@ import struct
 import subprocess
 import shutil
 import sys
+import tempfile
 import termios
 import time
 import urllib.error
@@ -101,6 +102,14 @@ CHAT_ARTIFACT_PROMPT_HISTORY_MAX_ITEMS = 64
 CHAT_ARTIFACT_PROMPT_LABEL_MAX_CHARS = 2000
 CHAT_ARTIFACT_NAME_MAX_CHARS = 180
 CHAT_ARTIFACT_PATH_MAX_CHARS = 1024
+AUTO_CONFIG_CHAT_TIMEOUT_SECONDS = float(os.environ.get("AGENT_HUB_AUTO_CONFIG_TIMEOUT_SECONDS", "240"))
+AUTO_CONFIG_MODEL = "chatgpt-account-codex"
+AUTO_CONFIG_NOT_CONNECTED_ERROR = (
+    "Auto configure needs a connected ChatGPT account in Settings to run a temporary repository analysis chat."
+)
+AUTO_CONFIG_MISSING_OUTPUT_ERROR = "Temporary auto-config chat did not return a JSON recommendation."
+AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid JSON."
+AUTO_CONFIG_NOTES_MAX_CHARS = 400
 ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:"
     r"[@-Z\\-_]"
@@ -1554,6 +1563,32 @@ def _codex_generate_chat_title(
     if not title:
         raise RuntimeError("ChatGPT account title request returned an invalid title.")
     return title
+
+
+def _parse_json_object_from_text(raw_text: Any) -> dict[str, Any]:
+    text = str(raw_text or "").strip()
+    if not text:
+        raise ValueError("empty payload")
+
+    candidates = [text]
+    if text.startswith("```"):
+        without_fence = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        without_fence = re.sub(r"\s*```\s*$", "", without_fence)
+        if without_fence.strip():
+            candidates.append(without_fence.strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(text[start : end + 1].strip())
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("invalid json object")
 
 
 def _normalize_chat_prompt_history(user_prompts: list[str]) -> list[str]:
@@ -3135,6 +3170,336 @@ class HubState:
             "issues": issues,
             "connectivity": connectivity,
         }
+
+    @staticmethod
+    def _dedupe_entries(entries: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for entry in entries:
+            normalized = str(entry or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    def _auto_config_prompt(self, repo_url: str, branch: str) -> str:
+        container_home = f"/home/{self.local_user}"
+        ccache_mount = f"{Path.home().resolve() / '.ccache'}:{container_home}/.ccache"
+        sccache_mount = f"{Path.home().resolve() / '.cache' / 'sccache'}:{container_home}/.cache/sccache"
+        return (
+            "You are running in a temporary Agent Hub analysis chat for project bootstrap configuration.\n"
+            "Inspect the checked-out repository and recommend the exact project setup inputs Agent Hub needs.\n"
+            "Prioritize project-provided development containers and CI Docker definitions over custom setup.\n\n"
+            "Agent Hub project configuration semantics:\n"
+            "- base_image_mode: 'tag' or 'repo_path'\n"
+            "  - 'tag': base_image_value is a Docker image tag.\n"
+            "  - 'repo_path': base_image_value is a repository-relative path to a Dockerfile or a directory containing Dockerfile.\n"
+            "- setup_script: newline-delimited shell commands run in project root during snapshot build (`set -e` is already enabled).\n"
+            "- default_ro_mounts/default_rw_mounts: host:container mounts used for snapshot prep and all new chats.\n"
+            "- default_env_vars: KEY=VALUE entries; do not set OPENAI_API_KEY, AGENT_HUB_GIT_USER_NAME, AGENT_HUB_GIT_USER_EMAIL.\n\n"
+            "Requirements:\n"
+            "1) Prefer existing devcontainer/docker-compose/CI Dockerfiles from the repo.\n"
+            "2) If existing container is missing packages needed for development, include only minimal additional setup commands.\n"
+            "3) If no development container is provided, include only the minimal packages needed to fully develop the project.\n"
+            "4) If setup installs apt packages, include `apt-get update` before apt installs unless an existing project container explicitly preserves apt lists and already includes the required packages.\n"
+            "5) Inspect build tooling for deferred toolchain downloads and include the smallest build/bootstrap commands to fetch toolchains.\n"
+            "6) If ccache/sccache (or equivalent compiler cache) is used, include shared cache mounts.\n"
+            f"   - ccache mount: {ccache_mount}\n"
+            f"   - sccache mount: {sccache_mount}\n\n"
+            "Return exactly one JSON object (no markdown fences, no prose) with this schema:\n"
+            "{\n"
+            '  "base_image_mode": "tag|repo_path",\n'
+            '  "base_image_value": "string",\n'
+            '  "setup_script": "string",\n'
+            '  "default_ro_mounts": ["host:container"],\n'
+            '  "default_rw_mounts": ["host:container"],\n'
+            '  "default_env_vars": ["KEY=VALUE"],\n'
+            '  "notes": "short rationale"\n'
+            "}\n"
+            "Use empty strings/arrays when appropriate. Keep recommendations minimal and deterministic.\n\n"
+            f"Repository URL: {repo_url}\n"
+            f"Checked out branch: {branch}\n"
+        )
+
+    def _repo_mentions_any_token(self, workspace: Path, tokens: set[str]) -> bool:
+        normalized_tokens = {token.strip().lower() for token in tokens if token and token.strip()}
+        if not normalized_tokens:
+            return False
+        ignored_dirs = {
+            ".git",
+            ".hg",
+            ".svn",
+            ".venv",
+            "venv",
+            "node_modules",
+            "build",
+            "dist",
+            "out",
+            "target",
+        }
+        max_files = 3000
+        files_scanned = 0
+        for root, dirs, files in os.walk(workspace):
+            dirs[:] = [name for name in dirs if name not in ignored_dirs]
+            for filename in files:
+                files_scanned += 1
+                if files_scanned > max_files:
+                    return False
+                path = Path(root) / filename
+                try:
+                    if path.stat().st_size > 1_500_000:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="ignore").lower()
+                except OSError:
+                    continue
+                if any(token in text for token in normalized_tokens):
+                    return True
+        return False
+
+    def _normalize_auto_config_setup_script(self, raw_script: Any) -> str:
+        script = str(raw_script or "").replace("\r\n", "\n").replace("\r", "\n")
+        commands = [line.strip() for line in script.split("\n") if line.strip()]
+        if not commands:
+            return ""
+        lowered = [line.lower() for line in commands]
+        has_apt_install = any(("apt-get install" in line) or ("apt install" in line) for line in lowered)
+        has_apt_update = any(("apt-get update" in line) or ("apt update" in line) for line in lowered)
+        if has_apt_install and not has_apt_update:
+            commands.insert(0, "apt-get update")
+        return "\n".join(commands)
+
+    def _normalize_auto_config_repo_path(self, workspace: Path, raw_value: Any) -> str:
+        value = str(raw_value or "").strip()
+        if not value:
+            raise HTTPException(status_code=400, detail="Auto-config recommendation requires base_image_value for repo_path mode.")
+        candidate = Path(value).expanduser()
+        resolved = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+        workspace_root = workspace.resolve()
+        try:
+            relative = resolved.relative_to(workspace_root)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Auto-config base_image_value must stay inside the repository: {value}",
+            ) from exc
+        if not (resolved.is_file() or resolved.is_dir()):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Auto-config base_image_value does not exist in repository: {value}",
+            )
+        return relative.as_posix()
+
+    def _normalize_auto_config_mounts(self, entries: list[str], direction: str) -> list[str]:
+        normalized_entries: list[str] = []
+        home_root = Path.home().resolve()
+        for raw_entry in entries:
+            if ":" not in raw_entry:
+                raise HTTPException(status_code=400, detail=f"Invalid auto-config {direction} mount '{raw_entry}'.")
+            host_raw, container_raw = raw_entry.split(":", 1)
+            container = container_raw.strip()
+            if not container.startswith("/"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid auto-config container path for {direction} mount '{raw_entry}'.",
+                )
+            host_path = Path(host_raw).expanduser()
+            if not host_path.exists():
+                try:
+                    host_path_resolved = host_path.resolve()
+                except OSError:
+                    host_path_resolved = host_path
+                should_create = False
+                try:
+                    host_path_resolved.relative_to(home_root)
+                    should_create = True
+                except ValueError:
+                    should_create = False
+                if should_create:
+                    try:
+                        host_path_resolved.mkdir(parents=True, exist_ok=True)
+                        host_path = host_path_resolved
+                    except OSError:
+                        pass
+            normalized_entries.append(f"{host_path}:{container}")
+        return _parse_mounts(normalized_entries, direction)
+
+    def _augment_auto_config_cache_mounts(self, workspace: Path, rw_mounts: list[str]) -> list[str]:
+        mounted = self._dedupe_entries(list(rw_mounts))
+        existing = set(mounted)
+        container_home = f"/home/{self.local_user}"
+        cache_specs = [
+            ("ccache", Path.home().resolve() / ".ccache", f"{container_home}/.ccache"),
+            ("sccache", Path.home().resolve() / ".cache" / "sccache", f"{container_home}/.cache/sccache"),
+        ]
+        for token, host_path, container_path in cache_specs:
+            if not self._repo_mentions_any_token(workspace, {token}):
+                continue
+            try:
+                host_path.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            entry = f"{host_path}:{container_path}"
+            if entry in existing:
+                continue
+            mounted.append(entry)
+            existing.add(entry)
+        return mounted
+
+    def _normalize_auto_config_recommendation(self, raw_payload: dict[str, Any], workspace: Path) -> dict[str, Any]:
+        if not isinstance(raw_payload, dict):
+            raise HTTPException(status_code=400, detail="Auto-config output must be a JSON object.")
+
+        base_image_mode = _normalize_base_image_mode(raw_payload.get("base_image_mode"))
+        base_image_value = str(raw_payload.get("base_image_value") or "").strip()
+        if base_image_mode == "repo_path":
+            base_image_value = self._normalize_auto_config_repo_path(workspace, base_image_value)
+
+        setup_script = self._normalize_auto_config_setup_script(raw_payload.get("setup_script"))
+        default_ro_mounts = self._normalize_auto_config_mounts(
+            _empty_list(raw_payload.get("default_ro_mounts")),
+            "default read-only mount",
+        )
+        default_rw_mounts = self._normalize_auto_config_mounts(
+            _empty_list(raw_payload.get("default_rw_mounts")),
+            "default read-write mount",
+        )
+        default_rw_mounts = self._augment_auto_config_cache_mounts(workspace, default_rw_mounts)
+        default_env_vars = _parse_env_vars(_empty_list(raw_payload.get("default_env_vars")))
+
+        notes_raw = _compact_whitespace(str(raw_payload.get("notes") or "")).strip()
+        if len(notes_raw) > AUTO_CONFIG_NOTES_MAX_CHARS:
+            notes = notes_raw[: AUTO_CONFIG_NOTES_MAX_CHARS - 1].rstrip() + "…"
+        else:
+            notes = notes_raw
+
+        return {
+            "base_image_mode": base_image_mode,
+            "base_image_value": base_image_value,
+            "setup_script": setup_script,
+            "default_ro_mounts": self._dedupe_entries(default_ro_mounts),
+            "default_rw_mounts": self._dedupe_entries(default_rw_mounts),
+            "default_env_vars": self._dedupe_entries(default_env_vars),
+            "notes": notes,
+        }
+
+    def _run_temporary_auto_config_chat(self, workspace: Path, repo_url: str, branch: str) -> dict[str, Any]:
+        account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
+        if not account_connected:
+            raise HTTPException(status_code=409, detail=AUTO_CONFIG_NOT_CONNECTED_ERROR)
+        try:
+            codex_exec = _resolve_codex_executable(self.host_codex_dir)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        prompt = self._auto_config_prompt(repo_url, branch)
+        output_file = self.host_codex_dir / f"auto-config-{uuid.uuid4().hex}.json"
+        env = os.environ.copy()
+        env["HOME"] = str(self.host_agent_home)
+        env["CODEX_HOME"] = str(self.host_codex_dir)
+        cmd = [
+            codex_exec,
+            "exec",
+            "--skip-git-repo-check",
+            "--cd",
+            str(workspace),
+            "--sandbox",
+            "workspace-write",
+            "--output-last-message",
+            str(output_file),
+            prompt,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=max(20.0, float(AUTO_CONFIG_CHAT_TIMEOUT_SECONDS)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(status_code=504, detail="Temporary auto-config chat timed out.") from exc
+
+        output_text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        if result.returncode != 0:
+            detail = _codex_exec_error_message(output_text)
+            raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed: {detail}")
+
+        try:
+            raw_payload_text = output_file.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError as exc:
+            raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR) from exc
+        finally:
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+        if not raw_payload_text:
+            raise HTTPException(status_code=502, detail=AUTO_CONFIG_MISSING_OUTPUT_ERROR)
+
+        try:
+            parsed_payload = _parse_json_object_from_text(raw_payload_text)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=AUTO_CONFIG_INVALID_OUTPUT_ERROR) from exc
+        return {"payload": parsed_payload, "model": AUTO_CONFIG_MODEL}
+
+    def auto_configure_project(self, repo_url: Any, default_branch: Any = None) -> dict[str, Any]:
+        normalized_repo_url = str(repo_url or "").strip()
+        if not normalized_repo_url:
+            raise HTTPException(status_code=400, detail="repo_url is required.")
+
+        requested_branch = str(default_branch or "").strip()
+        git_env = self._github_git_env_for_repo(normalized_repo_url)
+        resolved_branch = requested_branch or _detect_default_branch(normalized_repo_url, env=git_env)
+
+        with tempfile.TemporaryDirectory(prefix="agent-hub-auto-config-", dir=str(self.data_dir)) as temp_dir:
+            workspace = Path(temp_dir) / "repo"
+            clone_cmd = [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                resolved_branch,
+                normalized_repo_url,
+                str(workspace),
+            ]
+            clone_result = _run(clone_cmd, capture=True, check=False, env=git_env)
+            if clone_result.returncode != 0:
+                if requested_branch:
+                    detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Unable to clone repository branch '{requested_branch}'. "
+                            f"{detail or 'git clone failed.'}"
+                        ),
+                    )
+                if workspace.exists():
+                    self._delete_path(workspace)
+                _run(
+                    ["git", "clone", "--depth", "1", normalized_repo_url, str(workspace)],
+                    check=True,
+                    env=git_env,
+                )
+                head_result = _run_for_repo(
+                    ["rev-parse", "--abbrev-ref", "HEAD"],
+                    workspace,
+                    capture=True,
+                    check=False,
+                )
+                if head_result.returncode == 0 and head_result.stdout.strip():
+                    resolved_branch = head_result.stdout.strip()
+
+            chat_result = self._run_temporary_auto_config_chat(workspace, normalized_repo_url, resolved_branch)
+            recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
+
+        recommendation["default_branch"] = resolved_branch
+        recommendation["analysis_model"] = str(chat_result.get("model") or "")
+        recommendation["analysis_auth_mode"] = CHAT_TITLE_AUTH_MODE_ACCOUNT
+        recommendation["analyzed_repo_url"] = normalized_repo_url
+        return recommendation
 
     def connect_openai(self, api_key: Any, verify: bool = True) -> dict[str, Any]:
         normalized = _normalize_openai_api_key(api_key)
@@ -6087,6 +6452,17 @@ def main(
         payload = state.openai_account_session_payload()
         payload["callback"] = forwarded
         return payload
+
+    @app.post("/api/projects/auto-configure")
+    async def api_auto_configure_project(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        recommendation = state.auto_configure_project(
+            repo_url=payload.get("repo_url"),
+            default_branch=payload.get("default_branch"),
+        )
+        return {"recommendation": recommendation}
 
     @app.post("/api/projects")
     async def api_create_project(request: Request) -> dict[str, Any]:

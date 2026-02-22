@@ -2412,6 +2412,77 @@ class HubStateTests(unittest.TestCase):
             max_chars=hub_server.CHAT_TITLE_MAX_CHARS,
         )
 
+    def test_parse_json_object_from_text_accepts_markdown_fences(self) -> None:
+        payload = hub_server._parse_json_object_from_text(
+            "```json\n{\"base_image_mode\":\"tag\",\"base_image_value\":\"ubuntu:22.04\"}\n```"
+        )
+        self.assertEqual(payload["base_image_mode"], "tag")
+        self.assertEqual(payload["base_image_value"], "ubuntu:22.04")
+
+    def test_normalize_auto_config_recommendation_adds_apt_update_and_cache_mount(self) -> None:
+        workspace = self.tmp_path / "workspace-cache"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "CMakeLists.txt").write_text(
+            "set(CMAKE_CXX_COMPILER_LAUNCHER ccache)\n",
+            encoding="utf-8",
+        )
+        fake_home = self.tmp_path / "fake-home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "apt-get install -y ninja-build",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [],
+                    "default_env_vars": [],
+                    "notes": "minimal setup",
+                },
+                workspace,
+            )
+
+        self.assertEqual(recommendation["setup_script"].splitlines()[0], "apt-get update")
+        expected_mount = f"{fake_home / '.ccache'}:/home/{self.state.local_user}/.ccache"
+        self.assertIn(expected_mount, recommendation["default_rw_mounts"])
+        self.assertTrue((fake_home / ".ccache").exists())
+
+    def test_normalize_auto_config_recommendation_normalizes_repo_path_base(self) -> None:
+        workspace = self.tmp_path / "workspace-base"
+        docker_base = workspace / "docker" / "dev"
+        docker_base.mkdir(parents=True, exist_ok=True)
+        (docker_base / "Dockerfile").write_text("FROM ubuntu:22.04\n", encoding="utf-8")
+        fake_home = self.tmp_path / "fake-home-base"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "repo_path",
+                    "base_image_value": str(docker_base),
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                workspace,
+            )
+
+        self.assertEqual(recommendation["base_image_mode"], "repo_path")
+        self.assertEqual(recommendation["base_image_value"], "docker/dev")
+
+    def test_run_temporary_auto_config_chat_requires_connected_account(self) -> None:
+        workspace = self.tmp_path / "workspace-chat-auth"
+        workspace.mkdir(parents=True, exist_ok=True)
+        with patch("agent_hub.server._read_codex_auth", return_value=(False, "")):
+            with self.assertRaises(HTTPException) as ctx:
+                self.state._run_temporary_auto_config_chat(
+                    workspace,
+                    repo_url="https://example.com/org/repo.git",
+                    branch="main",
+                )
+        self.assertEqual(ctx.exception.status_code, 409)
+
     def test_state_payload_does_not_call_openai_title_generation_from_log_changes(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",

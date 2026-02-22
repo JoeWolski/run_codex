@@ -406,6 +406,14 @@ code {
   grid-template-columns: 1fr;
 }
 
+.create-project-actions {
+  margin-top: 2px;
+}
+
+.auto-config-meta {
+  margin-top: 2px;
+}
+
 input:not(.xterm-helper-textarea),
 select,
 textarea:not(.xterm-helper-textarea),
