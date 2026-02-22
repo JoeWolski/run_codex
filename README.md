@@ -2,6 +2,12 @@
 
 Local-first orchestration for containerized coding-agent workflows.
 
+## Demo Video
+
+<video src="docs/demo/agent_hub_demo_dark_trimmed_3s_cropped_webpage.mp4" controls muted playsinline width="980"></video>
+
+[Download demo video](docs/demo/agent_hub_demo_dark_trimmed_3s_cropped_webpage.mp4)
+
 ## Why this
 
 Codex and Claude web apps are strong hosted experiences. Agent Hub is for cases where hosted web UIs are the wrong boundary.
