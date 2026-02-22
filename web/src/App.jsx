@@ -1090,6 +1090,7 @@ function HubApp() {
   const [activeTab, setActiveTab] = useState("projects");
   const [openChats, setOpenChats] = useState({});
   const [openChatDetails, setOpenChatDetails] = useState({});
+  const [showArtifactThumbnailsByChat, setShowArtifactThumbnailsByChat] = useState({});
   const [collapsedProjectChats, setCollapsedProjectChats] = useState({});
   const [chatStartSettingsByProject, setChatStartSettingsByProject] = useState({});
   const [fullscreenChatId, setFullscreenChatId] = useState("");
@@ -2304,6 +2305,7 @@ function HubApp() {
       : [];
     const rowOpen = fullscreenChatId === chat.id ? true : (openChats[chat.id] ?? true);
     const detailsOpen = openChatDetails[chat.id] ?? false;
+    const thumbnailsVisible = showArtifactThumbnailsByChat[chat.id] ?? true;
     const isFullscreenChat = fullscreenChatId === chat.id;
     const containerClassName = ["card", isFullscreenChat ? "chat-card-popped" : ""].filter(Boolean).join(" ");
     const titleText = chat.display_name || chat.name;
@@ -2312,7 +2314,7 @@ function HubApp() {
       ? "Starting chat and preparing terminal..."
       : chat.display_subtitle || "No recent assistant summary yet.";
 
-    const renderArtifactBubble = (artifact, keyPrefix = "artifact") => {
+    const buildArtifactRenderInfo = (artifact) => {
       const artifactId = String(artifact?.id || "");
       const artifactName = String(artifact?.name || artifact?.relative_path || "artifact");
       const iconDescriptor = resolveArtifactIcon(artifact);
@@ -2327,48 +2329,63 @@ function HubApp() {
       ]
         .filter(Boolean)
         .join(" • ");
-      const hoverMeta = artifactMeta || (downloadUrl ? "Ready to download" : "Unavailable");
+      return {
+        artifactId,
+        artifactName,
+        iconDescriptor,
+        previewKind,
+        previewUrl,
+        downloadUrl,
+        canPreview,
+        artifactMeta
+      };
+    };
+
+    const openArtifactPreview = (artifactInfo) =>
+      setArtifactPreview({
+        chatId: chat.id,
+        artifactId: artifactInfo.artifactId,
+        name: artifactInfo.artifactName,
+        kind: artifactInfo.previewKind,
+        previewUrl: artifactInfo.previewUrl,
+        downloadUrl: artifactInfo.downloadUrl || artifactInfo.previewUrl
+      });
+
+    const renderArtifactBubble = (artifact, keyPrefix = "artifact", precomputedInfo = null) => {
+      const artifactInfo = precomputedInfo || buildArtifactRenderInfo(artifact);
+      const hoverMeta = artifactInfo.artifactMeta || (artifactInfo.downloadUrl ? "Ready to download" : "Unavailable");
       const bubbleContent = (
         <>
           <span className="chat-artifact-icon" aria-hidden="true">
-            {renderArtifactIcon(iconDescriptor)}
+            {renderArtifactIcon(artifactInfo.iconDescriptor)}
           </span>
-          <span className="chat-artifact-name" title={artifactName}>{artifactName}</span>
+          <span className="chat-artifact-name" title={artifactInfo.artifactName}>{artifactInfo.artifactName}</span>
           <span className="chat-artifact-meta-hover">{hoverMeta}</span>
         </>
       );
-      if (canPreview) {
+      if (artifactInfo.canPreview) {
         return (
           <button
-            key={`${keyPrefix}-${artifactId || artifactName}`}
+            key={`${keyPrefix}-${artifactInfo.artifactId || artifactInfo.artifactName}`}
             type="button"
             className="chat-artifact-bubble chat-artifact-bubble-action"
-            aria-label={`Preview ${artifactName}`}
-            title={`${artifactName} (preview)`}
-            onClick={() =>
-              setArtifactPreview({
-                chatId: chat.id,
-                artifactId,
-                name: artifactName,
-                kind: previewKind,
-                previewUrl,
-                downloadUrl: downloadUrl || previewUrl
-              })
-            }
+            aria-label={`Preview ${artifactInfo.artifactName}`}
+            title={`${artifactInfo.artifactName} (preview)`}
+            onClick={() => openArtifactPreview(artifactInfo)}
           >
             {bubbleContent}
           </button>
         );
       }
-      if (downloadUrl) {
+      if (artifactInfo.downloadUrl) {
         return (
           <a
-            key={`${keyPrefix}-${artifactId || artifactName}`}
+            key={`${keyPrefix}-${artifactInfo.artifactId || artifactInfo.artifactName}`}
             className="chat-artifact-bubble"
-            href={downloadUrl}
-            download={artifactName}
-            aria-label={`Download ${artifactName}`}
-            title={artifactName}
+            href={artifactInfo.downloadUrl}
+            download={artifactInfo.artifactName}
+            aria-label={`Download ${artifactInfo.artifactName}`}
+            title={artifactInfo.artifactName}
           >
             {bubbleContent}
           </a>
@@ -2376,14 +2393,65 @@ function HubApp() {
       }
       return (
         <span
-          key={`${keyPrefix}-${artifactId || artifactName}`}
+          key={`${keyPrefix}-${artifactInfo.artifactId || artifactInfo.artifactName}`}
           className="chat-artifact-bubble chat-artifact-bubble-unavailable"
-          title={artifactName}
+          title={artifactInfo.artifactName}
         >
           {bubbleContent}
         </span>
       );
     };
+
+    const renderArtifactThumbnail = (artifact, keyPrefix = "artifact-thumbnail", precomputedInfo = null) => {
+      const artifactInfo = precomputedInfo || buildArtifactRenderInfo(artifact);
+      if (!artifactInfo.canPreview) {
+        return renderArtifactBubble(artifact, keyPrefix, artifactInfo);
+      }
+      return (
+        <button
+          key={`${keyPrefix}-${artifactInfo.artifactId || artifactInfo.artifactName}`}
+          type="button"
+          className="chat-artifact-thumbnail"
+          aria-label={`Preview ${artifactInfo.artifactName}`}
+          title={`${artifactInfo.artifactName} (preview)`}
+          onClick={() => openArtifactPreview(artifactInfo)}
+        >
+          <span className="chat-artifact-thumbnail-media-wrap" aria-hidden="true">
+            {artifactInfo.previewKind === "video" ? (
+              <video
+                className="chat-artifact-thumbnail-media"
+                src={artifactInfo.previewUrl}
+                muted
+                preload="metadata"
+                playsInline
+              />
+            ) : (
+              <img
+                className="chat-artifact-thumbnail-media"
+                src={artifactInfo.previewUrl}
+                alt=""
+                loading="lazy"
+                decoding="async"
+              />
+            )}
+          </span>
+          <span className="chat-artifact-thumbnail-name" title={artifactInfo.artifactName}>
+            {artifactInfo.artifactName}
+          </span>
+          {artifactInfo.artifactMeta ? (
+            <span className="chat-artifact-thumbnail-meta">{artifactInfo.artifactMeta}</span>
+          ) : null}
+        </button>
+      );
+    };
+
+    const currentArtifactItems = currentArtifacts.map((artifact, index) => ({
+      artifact,
+      index,
+      artifactInfo: buildArtifactRenderInfo(artifact)
+    }));
+    const nonPreviewableCurrentArtifacts = currentArtifactItems.filter(({ artifactInfo }) => !artifactInfo.canPreview);
+    const previewableCurrentArtifacts = currentArtifactItems.filter(({ artifactInfo }) => artifactInfo.canPreview);
 
     return (
       <article className={containerClassName} key={chat.id}>
@@ -2546,9 +2614,47 @@ function HubApp() {
             {currentArtifacts.length > 0 ? (
               <section className="chat-artifacts" aria-label={`Generated files for ${titleText}`}>
                 <div className="meta">Attached files</div>
-                <div className="chat-artifact-list">
-                  {currentArtifacts.map((artifact, index) => renderArtifactBubble(artifact, `current-${index}`))}
-                </div>
+                {nonPreviewableCurrentArtifacts.length > 0 ? (
+                  <div className="chat-artifact-list">
+                    {nonPreviewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
+                      renderArtifactBubble(artifact, `current-${index}`, artifactInfo)
+                    )}
+                  </div>
+                ) : null}
+                {previewableCurrentArtifacts.length > 0 ? (
+                  <div className="chat-artifact-preview-group">
+                    <div className="chat-artifact-preview-header">
+                      <div className="meta">Previewable files</div>
+                      <button
+                        type="button"
+                        className="btn-secondary btn-small chat-artifact-thumbnail-toggle"
+                        aria-label={`${thumbnailsVisible ? "Hide" : "Show"} thumbnails for ${titleText}`}
+                        aria-pressed={thumbnailsVisible}
+                        onClick={() =>
+                          setShowArtifactThumbnailsByChat((prev) => ({
+                            ...prev,
+                            [chat.id]: !(prev[chat.id] ?? true)
+                          }))
+                        }
+                      >
+                        {thumbnailsVisible ? "Hide thumbnails" : "Show thumbnails"}
+                      </button>
+                    </div>
+                    {thumbnailsVisible ? (
+                      <div className="chat-artifact-thumbnail-row">
+                        {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
+                          renderArtifactThumbnail(artifact, `current-preview-${index}`, artifactInfo)
+                        )}
+                      </div>
+                    ) : (
+                      <div className="chat-artifact-list">
+                        {previewableCurrentArtifacts.map(({ artifact, index, artifactInfo }) =>
+                          renderArtifactBubble(artifact, `current-preview-bubble-${index}`, artifactInfo)
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ) : null}
               </section>
             ) : null}
           </div>
