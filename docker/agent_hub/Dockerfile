@@ -11,7 +11,7 @@ RUN corepack enable \
  && corepack yarn install --frozen-lockfile \
  && corepack yarn build
 
-FROM ${PYTHON_IMAGE} AS base
+FROM ${PYTHON_IMAGE} AS production
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
@@ -33,49 +33,16 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 WORKDIR /opt/agent_hub
 
-FROM base AS production
 COPY pyproject.toml uv.lock README.md ./
 COPY bin ./bin
 COPY config ./config
-COPY docker ./docker
 COPY src ./src
+COPY docker/agent_hub/run-agent-hub.sh /usr/local/bin/run-agent-hub.sh
 COPY --from=frontend-builder /opt/agent_hub/web/dist ./web/dist
 
-RUN install -m 0755 /opt/agent_hub/docker/agent_hub/run-agent-hub.sh /usr/local/bin/run-agent-hub.sh \
- && chmod +x /opt/agent_hub/bin/agent_hub /opt/agent_hub/docker/hub_artifact \
+RUN chmod +x /opt/agent_hub/bin/agent_hub /usr/local/bin/run-agent-hub.sh \
  && uv sync --frozen --no-dev
 
 EXPOSE 8765
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/run-agent-hub.sh"]
 CMD []
-
-FROM production AS development
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    jq \
-    nodejs \
-    npm \
-    xauth \
-    xdotool \
-    xvfb \
- && rm -rf /var/lib/apt/lists/*
-
-RUN if ! command -v corepack >/dev/null 2>&1; then npm install -g corepack@0.31.0; fi \
- && corepack enable
-
-COPY tests ./tests
-COPY tools/demo ./tools/demo
-COPY web ./web
-
-RUN uv sync --frozen --no-dev \
- && cd /opt/agent_hub/web \
- && corepack yarn install --frozen-lockfile \
- && cd /opt/agent_hub/tools/demo \
- && npm ci \
- && npx playwright install --with-deps firefox
-
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["bash"]

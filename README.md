@@ -24,14 +24,17 @@ If you need strict runtime control and local data locality, this is a better fit
 
 ## Hub Containers
 
-The existing `docker/Dockerfile` is the chat runtime image used by `agent_cli`.
+Docker images are split by responsibility:
 
-If you want to run the `agent_hub` server itself inside Docker, use the separate images in `docker/agent_hub/`:
+- `docker/agent_cli/Dockerfile`: chat runtime image used by `agent_cli`.
+- `docker/agent_hub/Dockerfile`: production image for running `agent_hub` with a prebuilt frontend.
+- `docker/development/Dockerfile`: full-project development container (tooling installed, no frontend prebuild).
 
-- `production`: container entrypoint runs `./bin/agent_hub`
-- `development`: adds demo/video tooling dependencies (`ffmpeg`, `xvfb`, `xdotool`, Playwright Firefox, etc.)
+Build/run instructions:
 
-Build/run instructions: `docker/agent_hub/README.md`
+- `docker/agent_cli/README.md`
+- `docker/agent_hub/README.md`
+- `docker/development/README.md`
 
 ## Quickstart
 

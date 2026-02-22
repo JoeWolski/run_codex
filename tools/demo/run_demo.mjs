@@ -637,7 +637,7 @@ async function publishArtifactsForChat({ baseUrl, chatId, workspacePath, repoRoo
   const token = await resolveArtifactTokenForWorkspace(workspacePath);
   const files = createFakeArtifacts(workspacePath);
   logStep(`Publishing artifacts via hub_artifact (${files.map((file) => path.basename(file)).join(", ")})`);
-  const hubArtifact = path.join(repoRootPath, "docker", "hub_artifact");
+  const hubArtifact = path.join(repoRootPath, "docker", "agent_cli", "hub_artifact");
   const artifactsUrl = `${baseUrl}/api/chats/${chatId}/artifacts/publish`;
   runChecked("bash", [hubArtifact, "publish", ...files], {
     cwd: repoRootPath,

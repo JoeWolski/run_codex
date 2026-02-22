@@ -21,7 +21,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-DOCKER_ENTRYPOINT = ROOT / "docker" / "docker-entrypoint.py"
+DOCKER_ENTRYPOINT = ROOT / "docker" / "agent_cli" / "docker-entrypoint.py"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -2600,7 +2600,7 @@ PY
 
     def _run_publish(self, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(ROOT / "docker" / "hub_artifact"), "publish", *args],
+            ["bash", str(ROOT / "docker" / "agent_cli" / "hub_artifact"), "publish", *args],
             cwd=ROOT,
             env=env,
             capture_output=True,
