@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import queue
@@ -10,7 +11,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 from types import SimpleNamespace
 
 from click.testing import CliRunner
@@ -20,6 +21,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+DOCKER_ENTRYPOINT = ROOT / "docker" / "docker-entrypoint.py"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -44,6 +46,14 @@ TEST_GITHUB_MANIFEST_CONVERSION_PAYLOAD = {
         "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDgManifestForTests\n"
         "-----END PRIVATE KEY-----\n"
     ),
+}
+TEST_GITHUB_PERSONAL_ACCESS_TOKEN = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890"
+TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION = {
+    "account_login": "joew",
+    "account_name": "Joe W",
+    "account_email": "joew@example.com",
+    "account_id": "10101",
+    "token_scopes": "repo,read:org",
 }
 
 
@@ -111,6 +121,18 @@ class HubStateTests(unittest.TestCase):
                 "token": "ghs_test_installation_token",
                 "expires_at": "2030-01-01T00:00:00Z",
             }
+        return status
+
+    def _connect_github_pat(self, host: str = "github.com") -> dict[str, object]:
+        with patch.object(
+            hub_server.HubState,
+            "_verify_github_personal_access_token",
+            return_value=dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION),
+        ):
+            status = self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+                host=host,
+            )
         return status
 
     def _current_github_setup_state_token(self) -> str:
@@ -209,6 +231,67 @@ class HubStateTests(unittest.TestCase):
         self.assertFalse(disconnected["connected"])
         self.assertFalse(self.state.github_app_installation_file.exists())
         self.assertFalse(self.state.github_git_credentials_file.exists())
+
+    def test_github_personal_access_token_credentials_round_trip_status(self) -> None:
+        initial = self.state.github_auth_status()
+        self.assertFalse(initial["connected"])
+
+        saved = self._connect_github_pat()
+        self.assertTrue(saved["connected"])
+        self.assertEqual(saved["connection_mode"], "personal_access_token")
+        self.assertEqual(saved["personal_access_token_user_login"], "joew")
+        self.assertEqual(saved["personal_access_token_user_name"], "Joe W")
+        self.assertEqual(saved["personal_access_token_user_email"], "joew@example.com")
+        self.assertEqual(saved["personal_access_token_git_user_name"], "Joe W")
+        self.assertEqual(saved["personal_access_token_git_user_email"], "joew@example.com")
+        self.assertEqual(saved["personal_access_token_host"], "github.com")
+        self.assertTrue(saved["updated_at"])
+        self.assertTrue(self.state.github_personal_access_token_file.exists())
+        self.assertTrue(self.state.github_git_credentials_file.exists())
+        credentials_line = self.state.github_git_credentials_file.read_text(encoding="utf-8").strip()
+        self.assertEqual(
+            credentials_line,
+            f"https://joew:{TEST_GITHUB_PERSONAL_ACCESS_TOKEN}@github.com",
+        )
+
+        token_mode = self.state.github_personal_access_token_file.stat().st_mode & 0o777
+        credentials_mode = self.state.github_git_credentials_file.stat().st_mode & 0o777
+        self.assertEqual(token_mode, 0o600)
+        self.assertEqual(credentials_mode, 0o600)
+
+        disconnected = self.state.disconnect_github_app()
+        self.assertFalse(disconnected["connected"])
+        self.assertFalse(self.state.github_personal_access_token_file.exists())
+        self.assertFalse(self.state.github_git_credentials_file.exists())
+
+    def test_connect_github_personal_access_token_rejects_invalid_token(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.connect_github_personal_access_token("short-token")
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("personal_access_token", str(ctx.exception.detail))
+
+    def test_connect_github_app_clears_personal_access_token_state(self) -> None:
+        self._connect_github_pat()
+        with patch.object(
+            hub_server.HubState,
+            "_github_api_request",
+            return_value=(200, json.dumps(TEST_GITHUB_INSTALLATION_PAYLOAD)),
+        ), patch.object(
+            hub_server.HubState,
+            "_github_installation_token",
+            return_value=("ghs_test_installation_token", "2030-01-01T00:00:00Z"),
+        ):
+            status = self.state.connect_github_app(TEST_GITHUB_INSTALLATION_ID)
+        self.assertEqual(status["connection_mode"], "github_app")
+        self.assertTrue(self.state.github_app_installation_file.exists())
+        self.assertFalse(self.state.github_personal_access_token_file.exists())
+
+    def test_connect_github_personal_access_token_clears_app_connection_state(self) -> None:
+        self._connect_github_app()
+        status = self._connect_github_pat()
+        self.assertEqual(status["connection_mode"], "personal_access_token")
+        self.assertTrue(self.state.github_personal_access_token_file.exists())
+        self.assertFalse(self.state.github_app_installation_file.exists())
 
     def test_connect_github_app_rejects_invalid_installation_id(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
@@ -687,6 +770,59 @@ class HubStateTests(unittest.TestCase):
         self.assertIn(str(self.state.github_git_credentials_file), cmd)
         self.assertIn("--git-credential-host", cmd)
         self.assertIn("github.com", cmd)
+
+    def test_start_chat_passes_github_pat_credentials_and_identity_when_configured(self) -> None:
+        self._connect_github_pat()
+        project = self.state.add_project(
+            repo_url="https://github.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4243
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertIn("--git-credential-file", cmd)
+        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        self.assertIn("--git-credential-host", cmd)
+        self.assertIn("github.com", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_NAME=Joe W", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=joew@example.com", cmd)
     def test_start_chat_uses_configured_artifact_publish_base_url(self) -> None:
         self.state.artifact_publish_base_url = "http://172.17.0.4:8765/hub"
         project = self.state.add_project(
@@ -1191,6 +1327,40 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--git-credential-host", cmd)
         self.assertIn("github.com", cmd)
         self.assertIn("--no-alt-screen", cmd)
+
+    def test_ensure_project_setup_snapshot_passes_git_identity_env_for_pat(self) -> None:
+        self._connect_github_pat()
+        project = self.state.add_project(
+            repo_url="https://github.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        workspace = self.tmp_path / "workspace-pat"
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        executed: list[list[str]] = []
+
+        def fake_run(cmd: list[str], cwd: Path | None = None, capture: bool = False, check: bool = True):
+            del cwd, capture, check
+            executed.append(list(cmd))
+            class Dummy:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return Dummy()
+
+        with patch("agent_hub.server._docker_image_exists", side_effect=[False]), patch(
+            "agent_hub.server._run", side_effect=fake_run
+        ):
+            self.state._ensure_project_setup_snapshot(workspace, project)
+
+        self.assertEqual(len(executed), 1)
+        cmd = executed[0]
+        self.assertIn("agent_cli", cmd)
+        self.assertIn("--git-credential-file", cmd)
+        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_NAME=Joe W", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=joew@example.com", cmd)
 
     def test_resize_terminal_sets_pty_size(self) -> None:
         runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1), master_fd=42)
@@ -3040,6 +3210,50 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, msg=result.output)
             kwargs = state_cls.call_args.kwargs
             self.assertEqual(kwargs.get("artifact_publish_base_url"), "http://172.17.0.4:8765/hub")
+
+
+class DockerEntrypointTests(unittest.TestCase):
+    @staticmethod
+    def _load_entrypoint_module():
+        spec = importlib.util.spec_from_file_location("agent_hub_docker_entrypoint", DOCKER_ENTRYPOINT)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Failed to load docker entrypoint module for tests.")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_configure_git_identity_sets_global_git_config(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.object(module, "_run", return_value=SimpleNamespace(returncode=0)) as run_mock, patch.dict(
+            os.environ,
+            {
+                "AGENT_HUB_GIT_USER_NAME": "Joe W",
+                "AGENT_HUB_GIT_USER_EMAIL": "joew@example.com",
+            },
+            clear=False,
+        ):
+            module._configure_git_identity("agent")
+
+        self.assertEqual(run_mock.call_count, 2)
+        run_mock.assert_has_calls(
+            [
+                call(["gosu", "agent", "git", "config", "--global", "user.name", "Joe W"]),
+                call(["gosu", "agent", "git", "config", "--global", "user.email", "joew@example.com"]),
+            ]
+        )
+
+    def test_configure_git_identity_requires_both_name_and_email(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.dict(
+            os.environ,
+            {
+                "AGENT_HUB_GIT_USER_NAME": "Joe W",
+                "AGENT_HUB_GIT_USER_EMAIL": "",
+            },
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                module._configure_git_identity("agent")
 
 
 if __name__ == "__main__":

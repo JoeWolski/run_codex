@@ -45,6 +45,20 @@ def _ensure_runtime_home_paths(local_home: str, local_uid: int, local_gid: int) 
         _ensure_path_owner(path, local_uid, local_gid)
 
 
+def _configure_git_identity(local_user: str) -> None:
+    git_user_name = os.environ.get("AGENT_HUB_GIT_USER_NAME", "").strip()
+    git_user_email = os.environ.get("AGENT_HUB_GIT_USER_EMAIL", "").strip()
+    if not git_user_name and not git_user_email:
+        return
+    if not git_user_name or not git_user_email:
+        raise RuntimeError(
+            "AGENT_HUB_GIT_USER_NAME and AGENT_HUB_GIT_USER_EMAIL must be set together."
+        )
+
+    _run(["gosu", local_user, "git", "config", "--global", "user.name", git_user_name])
+    _run(["gosu", local_user, "git", "config", "--global", "user.email", git_user_email])
+
+
 def _ensure_user_and_groups() -> None:
     local_user = os.environ.get("LOCAL_USER", "agent")
     local_group = os.environ.get("LOCAL_GROUP", local_user)
@@ -148,6 +162,7 @@ def _ensure_user_and_groups() -> None:
         sudoers_file.chmod(0o440)
 
     _ensure_runtime_home_paths(local_home, local_uid, local_gid)
+    _configure_git_identity(local_user)
 
     os.execvp("gosu", ["gosu", local_user, *command])
 

@@ -43,6 +43,7 @@ SECRETS_DIR_NAME = "secrets"
 OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
 GITHUB_APP_INSTALLATION_FILE_NAME = "github_app_installation.json"
+GITHUB_PERSONAL_ACCESS_TOKEN_FILE_NAME = "github_personal_access_token.json"
 GITHUB_GIT_CREDENTIALS_FILE_NAME = "github_credentials"
 GITHUB_APP_SETTINGS_FILE_NAME = "github_app_settings.json"
 GITHUB_APP_ID_ENV = "AGENT_HUB_GITHUB_APP_ID"
@@ -59,6 +60,9 @@ GITHUB_APP_API_TIMEOUT_SECONDS = 8.0
 GITHUB_APP_PRIVATE_KEY_MAX_CHARS = 256_000
 GITHUB_APP_SETUP_SESSION_LIFETIME_SECONDS = 60 * 60
 GITHUB_APP_DEFAULT_NAME = "Agent Hub"
+GITHUB_CONNECTION_MODE_GITHUB_APP = "github_app"
+GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN = "personal_access_token"
+GITHUB_PERSONAL_ACCESS_TOKEN_MIN_CHARS = 20
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_HUB_ARTIFACT_BASE_URL"
@@ -107,7 +111,11 @@ OSC_COLOR_RESPONSE_FRAGMENT_RE = re.compile(
     r"(?:^|\s)\]?\d{1,3};(?:rgb|rgba):[0-9a-f]{2,4}/[0-9a-f]{2,4}/[0-9a-f]{2,4}",
     re.IGNORECASE,
 )
-RESERVED_ENV_VAR_KEYS = {"OPENAI_API_KEY"}
+RESERVED_ENV_VAR_KEYS = {
+    "OPENAI_API_KEY",
+    "AGENT_HUB_GIT_USER_NAME",
+    "AGENT_HUB_GIT_USER_EMAIL",
+}
 HUB_LOG_LEVEL_CHOICES = ("critical", "error", "warning", "info", "debug")
 GITHUB_APP_PRIVATE_KEY_BEGIN_MARKERS = {
     "-----BEGIN RSA PRIVATE KEY-----",
@@ -747,6 +755,26 @@ def _normalize_github_installation_id(raw_value: Any) -> int:
     if installation_id <= 0:
         raise HTTPException(status_code=400, detail="installation_id must be a positive integer.")
     return installation_id
+
+
+def _normalize_github_credential_host(raw_value: Any, field_name: str = "host") -> str:
+    host = str(raw_value or "").strip().lower()
+    if not host:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
+    if not re.fullmatch(r"[a-z0-9.-]+", host):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+    return host
+
+
+def _normalize_github_personal_access_token(raw_value: Any) -> str:
+    token = str(raw_value or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="personal_access_token is required.")
+    if any(ch.isspace() for ch in token):
+        raise HTTPException(status_code=400, detail="personal_access_token must not contain whitespace.")
+    if len(token) < GITHUB_PERSONAL_ACCESS_TOKEN_MIN_CHARS:
+        raise HTTPException(status_code=400, detail="personal_access_token appears too short.")
+    return token
 
 
 def _base64url_encode(raw: bytes) -> str:
@@ -2003,6 +2031,7 @@ class HubState:
         self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
         self.github_app_settings_file = self.secrets_dir / GITHUB_APP_SETTINGS_FILE_NAME
         self.github_app_installation_file = self.secrets_dir / GITHUB_APP_INSTALLATION_FILE_NAME
+        self.github_personal_access_token_file = self.secrets_dir / GITHUB_PERSONAL_ACCESS_TOKEN_FILE_NAME
         self.github_git_credentials_file = self.secrets_dir / GITHUB_GIT_CREDENTIALS_FILE_NAME
         self.github_app_settings: GithubAppSettings | None = None
         self.github_app_settings_error = ""
@@ -2362,8 +2391,11 @@ class HubState:
             raise HTTPException(status_code=502, detail="GitHub returned invalid app setup conversion data.")
         return payload
 
-    def _clear_github_installation_state(self) -> None:
-        for path in [self.github_app_installation_file, self.github_git_credentials_file]:
+    def _clear_github_installation_state(self, remove_credentials: bool = True) -> None:
+        paths = [self.github_app_installation_file]
+        if remove_credentials:
+            paths.append(self.github_git_credentials_file)
+        for path in paths:
             if not path.exists():
                 continue
             try:
@@ -2372,6 +2404,21 @@ class HubState:
                 raise HTTPException(status_code=500, detail="Failed to clear previous GitHub installation state.") from exc
         with self._github_token_lock:
             self._github_token_cache = {}
+
+    def _clear_github_personal_access_token_state(self, remove_credentials: bool = True) -> None:
+        paths = [self.github_personal_access_token_file]
+        if remove_credentials:
+            paths.append(self.github_git_credentials_file)
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to clear stored GitHub personal access token credentials.",
+                ) from exc
 
     def _persist_github_app_settings(self, settings: GithubAppSettings) -> None:
         payload = {
@@ -2431,7 +2478,7 @@ class HubState:
                 "GitHub app setup conversion",
             )
             self._persist_github_app_settings(resolved_settings)
-            self._clear_github_installation_state()
+            self._clear_github_installation_state(remove_credentials=False)
         except ValueError as exc:
             with self._github_setup_lock:
                 session = self._github_setup_session_locked()
@@ -2496,6 +2543,120 @@ class HubState:
             payload["installation_id"] = installation_id
             return payload
         return None
+
+    def _github_connected_personal_access_token(self) -> dict[str, Any] | None:
+        payload = _read_json_if_exists(self.github_personal_access_token_file)
+        if payload is None:
+            return None
+        token = str(payload.get("personal_access_token") or "").strip()
+        account_login = str(payload.get("account_login") or "").strip()
+        host_value = payload.get("host") or self._github_provider_host()
+        try:
+            host = _normalize_github_credential_host(host_value, field_name="host")
+        except HTTPException:
+            return None
+        if not token or not account_login:
+            return None
+        account_name = str(payload.get("account_name") or account_login).strip() or account_login
+        account_email = str(payload.get("account_email") or "").strip()
+        if not account_email:
+            account_email = f"{account_login}@users.noreply.github.com"
+        git_user_name = str(payload.get("git_user_name") or account_name).strip() or account_name
+        git_user_email = str(payload.get("git_user_email") or account_email).strip() or account_email
+        payload["personal_access_token"] = token
+        payload["host"] = host
+        payload["account_login"] = account_login
+        payload["account_name"] = account_name
+        payload["account_email"] = account_email
+        payload["git_user_name"] = git_user_name
+        payload["git_user_email"] = git_user_email
+        return payload
+
+    def _github_api_base_url_for_host(self, host: str) -> str:
+        normalized_host = _normalize_github_credential_host(host, field_name="host")
+        if self.github_app_settings is not None and self._github_provider_host() == normalized_host:
+            return self.github_app_settings.api_base_url
+        if normalized_host == "github.com":
+            return GITHUB_APP_DEFAULT_API_BASE_URL
+        return f"https://{normalized_host}/api/v3"
+
+    def _verify_github_personal_access_token(self, token: str, host: str) -> dict[str, str]:
+        api_base_url = self._github_api_base_url_for_host(host)
+        request = urllib.request.Request(
+            f"{api_base_url}/user",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "agent-hub",
+                "Authorization": f"Bearer {token}",
+            },
+            method="GET",
+        )
+
+        oauth_scopes = ""
+        try:
+            with urllib.request.urlopen(request, timeout=GITHUB_APP_API_TIMEOUT_SECONDS) as response:
+                status = int(response.getcode() or 0)
+                payload_text = response.read().decode("utf-8", errors="ignore")
+                oauth_scopes = str(response.headers.get("X-OAuth-Scopes") or "").strip()
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code or 0)
+            payload_text = exc.read().decode("utf-8", errors="ignore")
+            oauth_scopes = str(exc.headers.get("X-OAuth-Scopes") or "").strip() if exc.headers else ""
+            detail = f"GitHub personal access token verification failed with status {status}."
+            message = _github_api_error_message(payload_text)
+            if message:
+                detail = f"{detail} {message}"
+            if status in {401, 403}:
+                raise HTTPException(status_code=400, detail=detail) from exc
+            raise HTTPException(status_code=502, detail=detail) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="GitHub personal access token verification failed due to a network error.",
+            ) from exc
+
+        if not (200 <= status < 300):
+            detail = f"GitHub personal access token verification failed with status {status}."
+            message = _github_api_error_message(payload_text)
+            if message:
+                detail = f"{detail} {message}"
+            if status in {401, 403}:
+                raise HTTPException(status_code=400, detail=detail)
+            raise HTTPException(status_code=502, detail=detail)
+
+        try:
+            payload = json.loads(payload_text) if payload_text else {}
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="GitHub returned invalid PAT verification payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="GitHub returned invalid PAT verification payload.")
+
+        account_login = str(payload.get("login") or "").strip()
+        account_name = str(payload.get("name") or "").strip()
+        if not account_login:
+            raise HTTPException(status_code=502, detail="GitHub did not return a user login for this token.")
+        raw_account_id = payload.get("id")
+        account_id = 0
+        if isinstance(raw_account_id, int) and raw_account_id > 0:
+            account_id = raw_account_id
+        elif isinstance(raw_account_id, str) and raw_account_id.isdigit():
+            account_id = int(raw_account_id)
+
+        account_email = str(payload.get("email") or "").strip()
+        if not account_email:
+            if account_id > 0:
+                account_email = f"{account_id}+{account_login}@users.noreply.github.com"
+            else:
+                account_email = f"{account_login}@users.noreply.github.com"
+
+        return {
+            "account_login": account_login,
+            "account_name": account_name or account_login,
+            "account_email": account_email,
+            "account_id": str(account_id) if account_id > 0 else "",
+            "token_scopes": oauth_scopes,
+        }
 
     def _github_api_request(
         self,
@@ -2597,12 +2758,39 @@ class HubState:
 
     def _refresh_github_git_credentials(self, installation_id: int, host: str) -> str:
         token, _expires_at = self._github_installation_token(installation_id)
-        encoded_token = urllib.parse.quote(token, safe="")
+        return self._write_github_git_credentials(
+            host=host,
+            username="x-access-token",
+            secret=token,
+        )
+
+    def _write_github_git_credentials(self, host: str, username: str, secret: str) -> str:
+        normalized_host = _normalize_github_credential_host(host, field_name="host")
+        resolved_username = str(username or "").strip()
+        resolved_secret = str(secret or "").strip()
+        if not resolved_username:
+            raise HTTPException(status_code=500, detail="Missing GitHub credential username.")
+        if not resolved_secret:
+            raise HTTPException(status_code=500, detail="Missing GitHub credential secret.")
+        encoded_username = urllib.parse.quote(resolved_username, safe="")
+        encoded_secret = urllib.parse.quote(resolved_secret, safe="")
         _write_private_env_file(
             self.github_git_credentials_file,
-            f"https://x-access-token:{encoded_token}@{host}\n",
+            f"https://{encoded_username}:{encoded_secret}@{normalized_host}\n",
         )
         return str(self.github_git_credentials_file)
+
+    def _refresh_github_git_credentials_for_personal_access_token(
+        self,
+        token: str,
+        host: str,
+        account_login: str,
+    ) -> str:
+        return self._write_github_git_credentials(
+            host=host,
+            username=account_login,
+            secret=token,
+        )
 
     @staticmethod
     def _git_env_for_credentials_file(credential_file: str, host: str) -> dict[str, str]:
@@ -2619,38 +2807,99 @@ class HubState:
             "GIT_CONFIG_VALUE_2": f"ssh://git@{normalized_host}/",
         }
 
-    def _github_repo_auth_context(self, repo_url: str) -> tuple[int, str] | None:
-        installation = self._github_connected_installation()
-        if installation is None:
-            return None
+    def _github_repo_auth_context(self, repo_url: str) -> tuple[str, str, dict[str, Any]] | None:
         repo_host = _git_repo_host(repo_url)
+        if not repo_host:
+            return None
+
+        personal_access = self._github_connected_personal_access_token()
+        if personal_access is not None:
+            pat_host = str(personal_access.get("host") or "")
+            if pat_host and repo_host == pat_host:
+                return (GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN, pat_host, personal_access)
+
+        installation = self._github_connected_installation()
         provider_host = self._github_provider_host()
-        if not repo_host or repo_host != provider_host:
-            return None
-        installation_id = int(installation.get("installation_id") or 0)
-        if installation_id <= 0:
-            return None
-        return installation_id, provider_host
+        if installation is not None and repo_host == provider_host:
+            installation_id = int(installation.get("installation_id") or 0)
+            if installation_id > 0:
+                return (
+                    GITHUB_CONNECTION_MODE_GITHUB_APP,
+                    provider_host,
+                    {"installation_id": installation_id},
+                )
+        return None
 
     def _github_git_env_for_repo(self, repo_url: str) -> dict[str, str]:
         context = self._github_repo_auth_context(repo_url)
         if context is None:
             return {}
-        installation_id, host = context
-        credentials_file = self._refresh_github_git_credentials(installation_id, host)
+        mode, host, auth_payload = context
+        if mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
+            installation_id = int(auth_payload.get("installation_id") or 0)
+            if installation_id <= 0:
+                return {}
+            credentials_file = self._refresh_github_git_credentials(installation_id, host)
+        elif mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+            token = str(auth_payload.get("personal_access_token") or "").strip()
+            account_login = str(auth_payload.get("account_login") or "").strip()
+            if not token or not account_login:
+                return {}
+            credentials_file = self._refresh_github_git_credentials_for_personal_access_token(
+                token=token,
+                host=host,
+                account_login=account_login,
+            )
+        else:
+            return {}
         return self._git_env_for_credentials_file(credentials_file, host)
 
     def _github_git_args_for_repo(self, repo_url: str) -> list[str]:
         context = self._github_repo_auth_context(repo_url)
         if context is None:
             return []
-        installation_id, host = context
-        credentials_file = self._refresh_github_git_credentials(installation_id, host)
+        mode, host, auth_payload = context
+        if mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
+            installation_id = int(auth_payload.get("installation_id") or 0)
+            if installation_id <= 0:
+                return []
+            credentials_file = self._refresh_github_git_credentials(installation_id, host)
+        elif mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+            token = str(auth_payload.get("personal_access_token") or "").strip()
+            account_login = str(auth_payload.get("account_login") or "").strip()
+            if not token or not account_login:
+                return []
+            credentials_file = self._refresh_github_git_credentials_for_personal_access_token(
+                token=token,
+                host=host,
+                account_login=account_login,
+            )
+        else:
+            return []
         return [
             "--git-credential-file",
             credentials_file,
             "--git-credential-host",
             host,
+        ]
+
+    def _github_git_identity_env_vars_for_repo(self, repo_url: str) -> list[str]:
+        context = self._github_repo_auth_context(repo_url)
+        if context is None:
+            return []
+        mode, _host, auth_payload = context
+        if mode != GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+            return []
+
+        git_user_name = str(auth_payload.get("git_user_name") or auth_payload.get("account_name") or "").strip()
+        if not git_user_name:
+            git_user_name = str(auth_payload.get("account_login") or "").strip()
+        git_user_email = str(auth_payload.get("git_user_email") or auth_payload.get("account_email") or "").strip()
+        if not git_user_name or not git_user_email:
+            return []
+        return [
+            f"AGENT_HUB_GIT_USER_NAME={git_user_name}",
+            f"AGENT_HUB_GIT_USER_EMAIL={git_user_email}",
         ]
 
     def _openai_account_payload(self) -> dict[str, Any]:
@@ -2688,28 +2937,74 @@ class HubState:
 
     def github_auth_status(self) -> dict[str, Any]:
         installation = self._github_connected_installation()
+        personal_access = self._github_connected_personal_access_token()
         app_configured = self.github_app_settings is not None and not self.github_app_settings_error
-        updated_at = ""
-        if self.github_app_installation_file.exists():
-            try:
-                updated_at = _iso_from_timestamp(self.github_app_installation_file.stat().st_mtime)
-            except OSError:
-                updated_at = ""
+
         installation_id = int(installation.get("installation_id") or 0) if installation else 0
         account_login = str(installation.get("account_login") or "") if installation else ""
         account_type = str(installation.get("account_type") or "") if installation else ""
         repository_selection = str(installation.get("repository_selection") or "") if installation else ""
+        personal_access_token = str(personal_access.get("personal_access_token") or "") if personal_access else ""
+        personal_access_host = str(personal_access.get("host") or "") if personal_access else ""
+        personal_access_login = str(personal_access.get("account_login") or "") if personal_access else ""
+        personal_access_name = str(personal_access.get("account_name") or "") if personal_access else ""
+        personal_access_email = str(personal_access.get("account_email") or "") if personal_access else ""
+        personal_access_account_id = str(personal_access.get("account_id") or "") if personal_access else ""
+        personal_access_git_user_name = str(personal_access.get("git_user_name") or "") if personal_access else ""
+        personal_access_git_user_email = str(personal_access.get("git_user_email") or "") if personal_access else ""
+        personal_access_scopes = str(personal_access.get("token_scopes") or "") if personal_access else ""
+        personal_access_verified_at = str(personal_access.get("verified_at") or "") if personal_access else ""
+
+        connected_via_app = bool(installation and installation_id > 0 and app_configured)
+        connected_via_pat = bool(personal_access_token and personal_access_host and personal_access_login)
+        connection_mode = ""
+        connection_host = ""
+        if connected_via_pat:
+            connection_mode = GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN
+            connection_host = personal_access_host
+        elif connected_via_app:
+            connection_mode = GITHUB_CONNECTION_MODE_GITHUB_APP
+            connection_host = self._github_provider_host()
+
+        updated_path: Path | None = None
+        if connection_mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN and self.github_personal_access_token_file.exists():
+            updated_path = self.github_personal_access_token_file
+        elif connection_mode == GITHUB_CONNECTION_MODE_GITHUB_APP and self.github_app_installation_file.exists():
+            updated_path = self.github_app_installation_file
+        elif self.github_personal_access_token_file.exists():
+            updated_path = self.github_personal_access_token_file
+        elif self.github_app_installation_file.exists():
+            updated_path = self.github_app_installation_file
+
+        updated_at = ""
+        if updated_path is not None:
+            try:
+                updated_at = _iso_from_timestamp(updated_path.stat().st_mtime)
+            except OSError:
+                updated_at = ""
+
         return {
             "provider": "github",
-            "connection_mode": "github_app",
+            "connection_mode": connection_mode,
+            "connection_host": connection_host,
             "app_configured": app_configured,
             "app_slug": self.github_app_settings.app_slug if self.github_app_settings else "",
             "install_url": self._github_install_url(),
-            "connected": bool(installation and installation_id > 0 and app_configured),
+            "connected": bool(connected_via_app or connected_via_pat),
             "installation_id": installation_id,
             "installation_account_login": account_login,
             "installation_account_type": account_type,
             "repository_selection": repository_selection,
+            "personal_access_token_hint": _mask_secret(personal_access_token) if personal_access_token else "",
+            "personal_access_token_host": personal_access_host,
+            "personal_access_token_user_login": personal_access_login,
+            "personal_access_token_user_name": personal_access_name,
+            "personal_access_token_user_email": personal_access_email,
+            "personal_access_token_user_id": personal_access_account_id,
+            "personal_access_token_git_user_name": personal_access_git_user_name,
+            "personal_access_token_git_user_email": personal_access_git_user_email,
+            "personal_access_token_scopes": personal_access_scopes,
+            "personal_access_token_verified_at": personal_access_verified_at,
             "updated_at": updated_at,
             "error": str(self.github_app_settings_error or ""),
         }
@@ -2930,6 +3225,7 @@ class HubState:
             account_type = str(account.get("type") or "")
         repository_selection = str(installation_payload.get("repository_selection") or "")
 
+        self._clear_github_personal_access_token_state(remove_credentials=True)
         self._refresh_github_git_credentials(normalized_id, self._github_provider_host())
         record = {
             "installation_id": normalized_id,
@@ -2944,19 +3240,65 @@ class HubState:
         LOGGER.debug("GitHub App installation connected: id=%s account=%s", normalized_id, account_login)
         return status
 
+    def connect_github_personal_access_token(self, personal_access_token: Any, host: Any = "") -> dict[str, Any]:
+        normalized_token = _normalize_github_personal_access_token(personal_access_token)
+        host_candidate = str(host or "").strip()
+        if not host_candidate:
+            host_candidate = self._github_provider_host()
+        normalized_host = _normalize_github_credential_host(host_candidate, field_name="host")
+        verification = self._verify_github_personal_access_token(normalized_token, normalized_host)
+        account_login = verification["account_login"]
+
+        self._clear_github_installation_state(remove_credentials=True)
+        self._clear_github_personal_access_token_state(remove_credentials=False)
+        self._refresh_github_git_credentials_for_personal_access_token(
+            token=normalized_token,
+            host=normalized_host,
+            account_login=account_login,
+        )
+        account_name = str(verification.get("account_name") or account_login).strip() or account_login
+        account_email = str(verification.get("account_email") or "").strip()
+        account_id = str(verification.get("account_id") or "").strip()
+        record = {
+            "host": normalized_host,
+            "personal_access_token": normalized_token,
+            "account_login": account_login,
+            "account_name": account_name,
+            "account_email": account_email,
+            "account_id": account_id,
+            "git_user_name": account_name,
+            "git_user_email": account_email,
+            "token_scopes": verification.get("token_scopes") or "",
+            "verified_at": _iso_now(),
+            "connected_at": _iso_now(),
+        }
+        _write_private_env_file(self.github_personal_access_token_file, json.dumps(record, indent=2) + "\n")
+        status = self.github_auth_status()
+        self._emit_auth_changed(reason="github_personal_access_token_connected")
+        LOGGER.debug(
+            "GitHub personal access token connected: host=%s account=%s",
+            normalized_host,
+            account_login,
+        )
+        return status
+
     def disconnect_github_app(self) -> dict[str, Any]:
-        for path in [self.github_app_installation_file, self.github_git_credentials_file]:
+        for path in [
+            self.github_app_installation_file,
+            self.github_personal_access_token_file,
+            self.github_git_credentials_file,
+        ]:
             if not path.exists():
                 continue
             try:
                 path.unlink()
             except OSError as exc:
-                raise HTTPException(status_code=500, detail="Failed to remove stored GitHub App credentials.") from exc
+                raise HTTPException(status_code=500, detail="Failed to remove stored GitHub credentials.") from exc
         with self._github_token_lock:
             self._github_token_cache = {}
         status = self.github_auth_status()
-        self._emit_auth_changed(reason="github_app_disconnected")
-        LOGGER.debug("GitHub App disconnected.")
+        self._emit_auth_changed(reason="github_disconnected")
+        LOGGER.debug("GitHub credentials disconnected.")
         return status
 
     def disconnect_openai_account(self) -> dict[str, Any]:
@@ -4455,8 +4797,11 @@ class HubState:
             str(self.config_file),
             "--no-alt-screen",
         ]
+        repo_url = str(project.get("repo_url") or "")
         cmd.extend(self._openai_credentials_arg())
-        cmd.extend(self._github_git_args_for_repo(str(project.get("repo_url") or "")))
+        cmd.extend(self._github_git_args_for_repo(repo_url))
+        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url):
+            cmd.extend(["--env-var", git_identity_env])
         self._append_project_base_args(cmd, workspace, project)
         for mount in project.get("default_ro_mounts") or []:
             cmd.extend(["--ro-mount", mount])
@@ -4673,8 +5018,11 @@ class HubState:
             str(self.config_file),
             "--no-alt-screen",
         ]
+        repo_url = str(project.get("repo_url") or "")
         cmd.extend(self._openai_credentials_arg())
-        cmd.extend(self._github_git_args_for_repo(str(project.get("repo_url") or "")))
+        cmd.extend(self._github_git_args_for_repo(repo_url))
+        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url):
+            cmd.extend(["--env-var", git_identity_env])
         self._append_project_base_args(cmd, workspace, project)
         cmd.extend(["--snapshot-image-tag", snapshot_tag])
         for mount in chat.get("ro_mounts") or []:
@@ -5575,7 +5923,23 @@ def main(
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return {"provider": state.connect_github_app(payload.get("installation_id"))}
+        connection_mode = str(payload.get("connection_mode") or "").strip().lower()
+        if not connection_mode:
+            if str(payload.get("personal_access_token") or "").strip():
+                connection_mode = GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN
+            else:
+                connection_mode = GITHUB_CONNECTION_MODE_GITHUB_APP
+
+        if connection_mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
+            provider = state.connect_github_app(payload.get("installation_id"))
+        elif connection_mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+            provider = state.connect_github_personal_access_token(
+                payload.get("personal_access_token"),
+                host=payload.get("host"),
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported GitHub connection mode: {connection_mode}")
+        return {"provider": provider}
 
     @app.post("/api/settings/auth/github/app/setup/start")
     async def api_start_github_app_setup(request: Request) -> dict[str, Any]:

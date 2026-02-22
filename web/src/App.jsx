@@ -899,6 +899,8 @@ function normalizeGithubProviderStatus(rawProvider) {
   return {
     provider: "github",
     connected: Boolean(rawProvider?.connected),
+    connectionMode: String(rawProvider?.connection_mode || ""),
+    connectionHost: String(rawProvider?.connection_host || ""),
     appConfigured: Boolean(rawProvider?.app_configured),
     appSlug: String(rawProvider?.app_slug || ""),
     installUrl: String(rawProvider?.install_url || ""),
@@ -906,6 +908,15 @@ function normalizeGithubProviderStatus(rawProvider) {
     installationAccountLogin: String(rawProvider?.installation_account_login || ""),
     installationAccountType: String(rawProvider?.installation_account_type || ""),
     repositorySelection: String(rawProvider?.repository_selection || ""),
+    personalAccessTokenHint: String(rawProvider?.personal_access_token_hint || ""),
+    personalAccessTokenHost: String(rawProvider?.personal_access_token_host || ""),
+    personalAccessTokenUserLogin: String(rawProvider?.personal_access_token_user_login || ""),
+    personalAccessTokenUserName: String(rawProvider?.personal_access_token_user_name || ""),
+    personalAccessTokenUserEmail: String(rawProvider?.personal_access_token_user_email || ""),
+    personalAccessTokenScopes: String(rawProvider?.personal_access_token_scopes || ""),
+    personalAccessTokenVerifiedAt: String(rawProvider?.personal_access_token_verified_at || ""),
+    personalAccessTokenGitUserName: String(rawProvider?.personal_access_token_git_user_name || ""),
+    personalAccessTokenGitUserEmail: String(rawProvider?.personal_access_token_git_user_email || ""),
     updatedAt: String(rawProvider?.updated_at || ""),
     error: String(rawProvider?.error || "")
   };
@@ -1182,6 +1193,9 @@ function HubApp() {
   const [githubInstallationsLoading, setGithubInstallationsLoading] = useState(false);
   const [githubSaving, setGithubSaving] = useState(false);
   const [githubDisconnecting, setGithubDisconnecting] = useState(false);
+  const [githubPersonalAccessTokenDraft, setGithubPersonalAccessTokenDraft] = useState("");
+  const [githubPersonalAccessHostDraft, setGithubPersonalAccessHostDraft] = useState("github.com");
+  const [showGithubPersonalAccessTokenDraft, setShowGithubPersonalAccessTokenDraft] = useState(false);
   const stateRefreshInFlightRef = useRef(false);
   const stateRefreshQueuedRef = useRef(false);
   const authRefreshInFlightRef = useRef(false);
@@ -1246,6 +1260,23 @@ function HubApp() {
     setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
     const normalizedGithubProvider = normalizeGithubProviderStatus(githubProvider);
     setGithubProviderStatus(normalizedGithubProvider);
+    setGithubPersonalAccessHostDraft((prev) => {
+      const connectedPatHost = String(normalizedGithubProvider.personalAccessTokenHost || "");
+      if (normalizedGithubProvider.connectionMode === "personal_access_token" && connectedPatHost) {
+        return connectedPatHost;
+      }
+      const existing = String(prev || "").trim();
+      if (existing) {
+        return prev;
+      }
+      if (connectedPatHost) {
+        return connectedPatHost;
+      }
+      if (normalizedGithubProvider.connectionHost) {
+        return normalizedGithubProvider.connectionHost;
+      }
+      return "github.com";
+    });
     setGithubSelectedInstallationId((prev) => {
       const connectedId = Number(normalizedGithubProvider.installationId || 0) || 0;
       if (connectedId > 0) {
@@ -1450,6 +1481,23 @@ function HubApp() {
       setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
       const normalizedGithubProvider = normalizeGithubProviderStatus(githubProvider);
       setGithubProviderStatus(normalizedGithubProvider);
+      setGithubPersonalAccessHostDraft((prev) => {
+        const connectedPatHost = String(normalizedGithubProvider.personalAccessTokenHost || "");
+        if (normalizedGithubProvider.connectionMode === "personal_access_token" && connectedPatHost) {
+          return connectedPatHost;
+        }
+        const existing = String(prev || "").trim();
+        if (existing) {
+          return prev;
+        }
+        if (connectedPatHost) {
+          return connectedPatHost;
+        }
+        if (normalizedGithubProvider.connectionHost) {
+          return normalizedGithubProvider.connectionHost;
+        }
+        return "github.com";
+      });
       setGithubSelectedInstallationId((prev) => {
         const connectedId = Number(normalizedGithubProvider.installationId || 0) || 0;
         if (connectedId > 0) {
@@ -2064,6 +2112,38 @@ function HubApp() {
     }
   }
 
+  async function handleConnectGithubPersonalAccessToken(event) {
+    event.preventDefault();
+    const personalAccessToken = githubPersonalAccessTokenDraft.trim();
+    if (!personalAccessToken) {
+      setError("GitHub personal access token is required.");
+      return;
+    }
+    const host = String(githubPersonalAccessHostDraft || "").trim() || "github.com";
+
+    setGithubSaving(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/github/connect", {
+        method: "POST",
+        body: JSON.stringify({
+          connection_mode: "personal_access_token",
+          personal_access_token: personalAccessToken,
+          host
+        })
+      });
+      setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
+      setGithubPersonalAccessTokenDraft("");
+      setShowGithubPersonalAccessTokenDraft(false);
+      setGithubPersonalAccessHostDraft(host);
+      refreshGithubInstallations().catch(() => {});
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setGithubSaving(false);
+    }
+  }
+
   async function handleStartGithubAppSetup() {
     setGithubAppSetupStarting(true);
     try {
@@ -2090,6 +2170,8 @@ function HubApp() {
         method: "POST"
       });
       setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
+      setGithubPersonalAccessTokenDraft("");
+      setShowGithubPersonalAccessTokenDraft(false);
       refreshGithubInstallations().catch(() => {});
       setGithubCardExpanded(true);
       setError("");
@@ -2263,6 +2345,9 @@ function HubApp() {
         : "Not connected yet. Expand this section and choose one login method.";
   const githubAppConfigured = githubProviderStatus.appConfigured;
   const githubConnected = githubProviderStatus.connected;
+  const githubConnectionMode = String(githubProviderStatus.connectionMode || "");
+  const githubConnectedWithPat = githubConnected && githubConnectionMode === "personal_access_token";
+  const githubConnectedWithApp = githubConnected && githubConnectionMode === "github_app";
   const githubAppSetupStatus = githubAppSetupSession.status;
   const githubAppSetupInFlight = githubAppSetupSession.active &&
     ["awaiting_user", "converting"].includes(githubAppSetupStatus);
@@ -2279,17 +2364,19 @@ function HubApp() {
           : githubAppSetupStatus === "failed"
             ? "failed"
             : "idle";
-  const githubConnectionSummary = !githubAppConfigured
-    ? githubAppSetupInFlight
-      ? "GitHub App setup in progress. Complete the GitHub authorization window to continue."
-      : githubAppSetupDone
-        ? "GitHub App setup completed. Select an installation below to connect."
-        : githubProviderStatus.error || "GitHub App is not configured on this server."
-    : githubConnected
+  const githubConnectionSummary = githubConnectedWithPat
+    ? `Connected as ${githubProviderStatus.personalAccessTokenUserLogin || "unknown user"} using a personal access token${githubProviderStatus.personalAccessTokenHost ? ` on ${githubProviderStatus.personalAccessTokenHost}` : ""}.`
+    : githubConnectedWithApp
       ? githubProviderStatus.installationAccountLogin
         ? `Connected to installation #${githubProviderStatus.installationId} (${githubProviderStatus.installationAccountLogin}).`
         : `Connected to installation #${githubProviderStatus.installationId}.`
-      : "Not connected yet. Install the app and select an installation to enable in-container git access.";
+      : !githubAppConfigured
+        ? githubAppSetupInFlight
+          ? "GitHub App setup in progress. Complete the GitHub authorization window to continue."
+          : githubAppSetupDone
+            ? "GitHub App setup completed. Select an installation below to connect."
+            : githubProviderStatus.error || "GitHub App is not configured on this server."
+        : "Not connected yet. Connect a personal access token (acts as you) or a GitHub App installation (acts as the app).";
   const selectedGithubInstallation = useMemo(() => {
     const selectedId = Number(githubSelectedInstallationId || 0) || 0;
     if (selectedId <= 0) {
@@ -3700,12 +3787,101 @@ function HubApp() {
               {githubCardExpanded ? (
                 <>
                   <p className="meta">
-                    Connect with a GitHub App installation. Agent Hub mints short-lived installation tokens and injects git
-                    credentials for project sync plus in-container git commands.
+                    GitHub App connections run as the app installation. Personal access token connections run as your GitHub
+                    user and also configure git commit identity in each chat container.
                   </p>
+                  <div className="settings-auth-block">
+                    <h4>Connect as You (Personal Access Token)</h4>
+                    <p className="meta">
+                      Use this mode for push/commit/PR actions as your user identity. The connected token also sets git
+                      global <code>user.name</code> and <code>user.email</code> inside chat containers.
+                    </p>
+                    <form className="stack compact" onSubmit={handleConnectGithubPersonalAccessToken}>
+                      <div className="settings-auth-input-row">
+                        <input
+                          type={showGithubPersonalAccessTokenDraft ? "text" : "password"}
+                          value={githubPersonalAccessTokenDraft}
+                          onChange={(event) => setGithubPersonalAccessTokenDraft(event.target.value)}
+                          placeholder="github_pat_..."
+                          spellCheck={false}
+                          autoComplete="off"
+                          disabled={githubSaving || githubDisconnecting}
+                        />
+                        <button
+                          type="button"
+                          className="btn-secondary btn-small"
+                          onClick={() => setShowGithubPersonalAccessTokenDraft((current) => !current)}
+                          disabled={githubSaving || githubDisconnecting}
+                        >
+                          {showGithubPersonalAccessTokenDraft ? "Hide token" : "Show token"}
+                        </button>
+                      </div>
+                      <label htmlFor="github-personal-access-host" className="meta">GitHub host</label>
+                      <input
+                        id="github-personal-access-host"
+                        value={githubPersonalAccessHostDraft}
+                        onChange={(event) => setGithubPersonalAccessHostDraft(event.target.value)}
+                        placeholder="github.com"
+                        spellCheck={false}
+                        autoComplete="off"
+                        disabled={githubSaving || githubDisconnecting}
+                      />
+                      <div className="actions">
+                        <button
+                          type="submit"
+                          className="btn-primary"
+                          disabled={!githubPersonalAccessTokenDraft.trim() || githubSaving || githubDisconnecting}
+                        >
+                          {githubSaving ? <SpinnerLabel text="Connecting..." /> : "Connect token"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          disabled={!githubConnected || githubSaving || githubDisconnecting}
+                          onClick={handleDisconnectGithubApp}
+                        >
+                          {githubDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect"}
+                        </button>
+                      </div>
+                    </form>
+                    <div className="meta">
+                      Connected user:{" "}
+                      {githubConnectedWithPat
+                        ? `${githubProviderStatus.personalAccessTokenUserLogin || "unknown"}${
+                            githubProviderStatus.personalAccessTokenUserName &&
+                            githubProviderStatus.personalAccessTokenUserName !== githubProviderStatus.personalAccessTokenUserLogin
+                              ? ` (${githubProviderStatus.personalAccessTokenUserName})`
+                              : ""
+                          }`
+                        : "none"}
+                    </div>
+                    <div className="meta">
+                      Connected host: {githubConnectedWithPat ? githubProviderStatus.personalAccessTokenHost || "unknown" : "none"}
+                    </div>
+                    <div className="meta">
+                      Git commit identity:{" "}
+                      {githubConnectedWithPat
+                        ? `${githubProviderStatus.personalAccessTokenGitUserName || githubProviderStatus.personalAccessTokenUserName || githubProviderStatus.personalAccessTokenUserLogin || "unknown"} <${
+                            githubProviderStatus.personalAccessTokenGitUserEmail || githubProviderStatus.personalAccessTokenUserEmail || "unknown"
+                          }>`
+                        : "not configured"}
+                    </div>
+                    {githubConnectedWithPat ? (
+                      <>
+                        <div className="meta">Token hint: {githubProviderStatus.personalAccessTokenHint || "saved"}</div>
+                        <div className="meta">
+                          Token scopes: {githubProviderStatus.personalAccessTokenScopes || "unavailable"}
+                        </div>
+                        <div className="meta">
+                          Token verified: {formatTimestamp(githubProviderStatus.personalAccessTokenVerifiedAt)}
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+
                   {githubAppConfigured ? (
                     <div className="settings-auth-block">
-                      <h4>Connect with GitHub App</h4>
+                      <h4>Connect as App (GitHub App installation)</h4>
                       <div className="actions">
                         {githubProviderStatus.installUrl ? (
                           <a
@@ -3781,7 +3957,7 @@ function HubApp() {
                           <button
                             type="button"
                             className="btn-secondary"
-                            disabled={!githubProviderStatus.connected || githubSaving || githubDisconnecting}
+                            disabled={!githubConnected || githubSaving || githubDisconnecting}
                             onClick={handleDisconnectGithubApp}
                           >
                             {githubDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect"}
@@ -3789,12 +3965,14 @@ function HubApp() {
                         </div>
                       </form>
                       <div className="meta">
-                        Connected installation: {githubProviderStatus.installationId ? `#${githubProviderStatus.installationId}` : "none"}
-                        {githubProviderStatus.installationAccountLogin ? ` (${githubProviderStatus.installationAccountLogin})` : ""}
+                        Connected installation: {githubConnectedWithApp ? `#${githubProviderStatus.installationId}` : "none"}
+                        {githubConnectedWithApp && githubProviderStatus.installationAccountLogin
+                          ? ` (${githubProviderStatus.installationAccountLogin})`
+                          : ""}
                       </div>
                       <div className="meta">Connection updated: {formatTimestamp(githubProviderStatus.updatedAt)}</div>
                       <div className="meta">
-                        Repository scope: {githubProviderStatus.repositorySelection || "unknown"}
+                        Repository scope: {githubConnectedWithApp ? (githubProviderStatus.repositorySelection || "unknown") : "unknown"}
                       </div>
                     </div>
                   ) : (
@@ -3845,7 +4023,8 @@ function HubApp() {
                     </div>
                   )}
                   <p className="meta settings-auth-note">
-                    GitHub access uses short-lived installation tokens. Agent Hub no longer requires manual SSH key entry.
+                    GitHub access credentials are stored only on this machine with restricted file permissions. Use PAT mode
+                    for personal identity actions and GitHub App mode for installation-scoped automation.
                   </p>
                 </>
               ) : null}
