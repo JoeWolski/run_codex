@@ -871,21 +871,15 @@ def main(
                 "run",
                 "--name",
                 container_name,
-                "--entrypoint",
-                "bash",
                 *run_args,
                 DEFAULT_SETUP_RUNTIME_IMAGE,
+                "bash",
                 "-lc",
                 (
                     "set -e\n"
-                    "git config --system --add safe.directory '*' || true\n"
-                    'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ] && [ -f "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" ]; then\n'
-                    '  cp "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" "${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}" || true\n'
-                    '  chmod 600 "${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}" || true\n'
-                    "fi\n"
+                    'git config --global --add safe.directory "${CONTAINER_PROJECT_PATH}" || true\n'
                     + script
                     + "\n"
-                    + 'chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true\n'
                 ),
             ]
             _docker_rm_force(container_name)

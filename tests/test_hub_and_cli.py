@@ -3494,13 +3494,13 @@ class CliEnvVarTests(unittest.TestCase):
             setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(setup_cmd)
             assert setup_cmd is not None
-            self.assertIn("--entrypoint", setup_cmd)
-            self.assertIn("bash", setup_cmd)
+            self.assertNotIn("--entrypoint", setup_cmd)
+            image_index = setup_cmd.index(image_cli.DEFAULT_SETUP_RUNTIME_IMAGE)
+            self.assertEqual(setup_cmd[image_index + 1], "bash")
+            self.assertEqual(setup_cmd[image_index + 2], "-lc")
             setup_script = setup_cmd[-1]
-            self.assertIn("git config --system --add safe.directory '*'", setup_script)
-            self.assertIn('AGENT_HUB_GIT_CREDENTIALS_SOURCE', setup_script)
-            self.assertIn('AGENT_HUB_GIT_CREDENTIALS_FILE', setup_script)
-            self.assertIn('chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true', setup_script)
+            self.assertIn('git config --global --add safe.directory "${CONTAINER_PROJECT_PATH}" || true', setup_script)
+            self.assertNotIn('chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true', setup_script)
             commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
             self.assertIsNotNone(commit_cmd)
             assert commit_cmd is not None
