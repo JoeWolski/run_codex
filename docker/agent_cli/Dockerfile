@@ -24,7 +24,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
  && case "${AGENT_PROVIDER}" in \
       codex) npm install -g @openai/codex ;; \
-      claude) npm install -g @anthropic-ai/claude-code ;; \
+      claude) curl -fsSL https://claude.ai/install.sh | bash \
+              && cp -L /root/.local/bin/claude /usr/local/bin/claude ;; \
       none) echo "Skipping agent CLI install for setup image." ;; \
       *) echo "Unsupported AGENT_PROVIDER='${AGENT_PROVIDER}'" >&2; exit 1 ;; \
     esac \
