@@ -138,6 +138,18 @@ function emptyCreateForm() {
   };
 }
 
+function extractProjectNameFromRepoUrl(repoUrl) {
+  const raw = String(repoUrl || "").trim();
+  if (!raw) {
+    return "project";
+  }
+  const trimmed = raw.replace(/[\\/]+$/, "");
+  const lastSlash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf(":"));
+  const tail = lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed;
+  const withoutGit = tail.replace(/\.git$/i, "");
+  return withoutGit || "project";
+}
+
 function normalizeBaseMode(mode) {
   return mode === "repo_path" ? "repo_path" : "tag";
 }
@@ -235,6 +247,13 @@ function buildEnvPayload(rows) {
     envVars.push(`${key}=${value}`);
   }
   return envVars;
+}
+
+function normalizeStringArray(rawValue, fallback = []) {
+  if (!Array.isArray(rawValue)) {
+    return [...fallback];
+  }
+  return rawValue.map((item) => String(item || "").trim()).filter(Boolean);
 }
 
 function setupCommandCount(text) {
@@ -1237,8 +1256,7 @@ function HubApp() {
   const [hubState, setHubState] = useState({ projects: [], chats: [] });
   const [error, setError] = useState("");
   const [createForm, setCreateForm] = useState(() => emptyCreateForm());
-  const [createAutoConfigRunning, setCreateAutoConfigRunning] = useState(false);
-  const [createAutoConfigResult, setCreateAutoConfigResult] = useState(null);
+  const [pendingAutoConfigProjects, setPendingAutoConfigProjects] = useState([]);
   const [projectDrafts, setProjectDrafts] = useState({});
   const [editingProjects, setEditingProjects] = useState({});
   const [projectBuildLogs, setProjectBuildLogs] = useState({});
@@ -1252,8 +1270,6 @@ function HubApp() {
   const [chatStartSettingsByProject, setChatStartSettingsByProject] = useState({});
   const [fullscreenChatId, setFullscreenChatId] = useState("");
   const [artifactPreview, setArtifactPreview] = useState(null);
-  const createChatQueueRef = useRef(new Map());
-  const createChatActiveProjectsRef = useRef(new Set());
   const [pendingSessions, setPendingSessions] = useState([]);
   const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
   const [pendingChatStarts, setPendingChatStarts] = useState({});
@@ -1793,11 +1809,30 @@ function HubApp() {
     return map;
   }, [hubState.projects]);
 
+  const autoConfigInFlightCount = useMemo(
+    () => pendingAutoConfigProjects.filter((project) => project.auto_config_status === "running").length,
+    [pendingAutoConfigProjects]
+  );
+
+  const projectsForList = useMemo(() => {
+    const pendingRows = pendingAutoConfigProjects.map((project) => ({
+      id: project.id,
+      name: project.name,
+      repo_url: project.repo_url,
+      default_branch: project.default_branch,
+      build_status: project.auto_config_status === "failed" ? "failed" : "building",
+      build_error: project.auto_config_error || "",
+      is_auto_config_pending: true
+    }));
+    return [...pendingRows, ...(hubState.projects || [])];
+  }, [hubState.projects, pendingAutoConfigProjects]);
+
   function updateCreateForm(patch) {
     setCreateForm((prev) => ({ ...prev, ...patch }));
-    if (Object.prototype.hasOwnProperty.call(patch, "repoUrl") || Object.prototype.hasOwnProperty.call(patch, "defaultBranch")) {
-      setCreateAutoConfigResult(null);
-    }
+  }
+
+  function dismissPendingAutoConfigProject(projectId) {
+    setPendingAutoConfigProjects((prev) => prev.filter((project) => project.id !== projectId));
   }
 
   function updateProjectDraft(projectId, patch) {
@@ -1853,59 +1888,6 @@ function HubApp() {
     });
   }, []);
 
-  const processCreateChatQueue = useCallback(async (projectId) => {
-    if (createChatActiveProjectsRef.current.has(projectId)) {
-      return;
-    }
-    createChatActiveProjectsRef.current.add(projectId);
-
-    try {
-      while (true) {
-        const queue = createChatQueueRef.current.get(projectId) || [];
-        const nextJob = queue.shift();
-        if (!nextJob) {
-          createChatQueueRef.current.delete(projectId);
-          break;
-        }
-        createChatQueueRef.current.set(projectId, queue);
-
-        const uiId = nextJob.uiId;
-        const agentType = normalizeAgentType(nextJob.agentType);
-        const agentArgs = Array.isArray(nextJob.agentArgs)
-          ? nextJob.agentArgs.map((arg) => String(arg)).filter((arg) => arg.trim())
-          : [];
-        try {
-          const response = await fetchJson(`/api/projects/${projectId}/chats/start`, {
-            method: "POST",
-            body: JSON.stringify({ agent_type: agentType, agent_args: agentArgs })
-          });
-          const chatId = response?.chat?.id;
-          if (!chatId) {
-            removeOptimisticChatRow(uiId);
-            continue;
-          }
-          setPendingSessions((prev) =>
-            prev.map((session) =>
-              session.ui_id === uiId ? { ...session, server_chat_id: chatId } : session
-            )
-          );
-          setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
-          setError("");
-          refreshState().catch(() => {});
-        } catch (err) {
-          removeOptimisticChatRow(uiId);
-          setError(err.message || String(err));
-          refreshState().catch(() => {});
-        }
-      }
-    } finally {
-      createChatActiveProjectsRef.current.delete(projectId);
-      if ((createChatQueueRef.current.get(projectId) || []).length > 0) {
-        processCreateChatQueue(projectId).catch(() => {});
-      }
-    }
-  }, [refreshState, removeOptimisticChatRow]);
-
   async function handleAutoConfigureCreateForm() {
     const repoUrl = String(createForm.repoUrl || "").trim();
     if (!repoUrl) {
@@ -1913,39 +1895,89 @@ function HubApp() {
       return;
     }
 
-    setCreateAutoConfigRunning(true);
-    setCreateAutoConfigResult(null);
+    const formSnapshot = {
+      repoUrl,
+      name: String(createForm.name || ""),
+      defaultBranch: String(createForm.defaultBranch || "").trim(),
+      baseImageMode: normalizeBaseMode(createForm.baseImageMode),
+      baseImageValue: String(createForm.baseImageValue || ""),
+      setupScript: String(createForm.setupScript || ""),
+      defaultVolumes: (createForm.defaultVolumes || []).map((row) => ({ ...row })),
+      defaultEnvVars: (createForm.defaultEnvVars || []).map((row) => ({ ...row }))
+    };
+    let fallbackMounts;
+    let fallbackEnvVars;
+    try {
+      fallbackMounts = buildMountPayload(formSnapshot.defaultVolumes);
+      fallbackEnvVars = buildEnvPayload(formSnapshot.defaultEnvVars);
+    } catch (err) {
+      setError(err.message || String(err));
+      return;
+    }
+
+    const pendingProjectId = `pending-auto-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const pendingProjectName = String(formSnapshot.name || "").trim() || extractProjectNameFromRepoUrl(repoUrl);
+    const pendingProjectBranch = formSnapshot.defaultBranch || "auto-detect";
+    setPendingAutoConfigProjects((prev) => [
+      {
+        id: pendingProjectId,
+        name: pendingProjectName,
+        repo_url: repoUrl,
+        default_branch: pendingProjectBranch,
+        auto_config_status: "running",
+        auto_config_error: ""
+      },
+      ...prev
+    ]);
     setError("");
+
     try {
       const payload = await fetchJson("/api/projects/auto-configure", {
         method: "POST",
         body: JSON.stringify({
           repo_url: repoUrl,
-          default_branch: String(createForm.defaultBranch || "").trim()
+          default_branch: formSnapshot.defaultBranch
         })
       });
       const recommendation = payload?.recommendation || {};
-      setCreateForm((prev) => ({
-        ...prev,
-        defaultBranch: String(recommendation.default_branch || prev.defaultBranch || ""),
-        baseImageMode: normalizeBaseMode(recommendation.base_image_mode),
-        baseImageValue: String(recommendation.base_image_value || ""),
-        setupScript: String(recommendation.setup_script || ""),
-        defaultVolumes: mountRowsFromArrays(
-          recommendation.default_ro_mounts || [],
-          recommendation.default_rw_mounts || []
+      const autoConfigProjectPayload = {
+        repo_url: repoUrl,
+        name: String(formSnapshot.name || "").trim(),
+        default_branch: String(recommendation.default_branch || formSnapshot.defaultBranch || "").trim(),
+        base_image_mode: normalizeBaseMode(recommendation.base_image_mode || formSnapshot.baseImageMode),
+        base_image_value: String(recommendation.base_image_value || formSnapshot.baseImageValue || ""),
+        setup_script: String(recommendation.setup_script || formSnapshot.setupScript || ""),
+        default_ro_mounts: normalizeStringArray(
+          recommendation.default_ro_mounts,
+          fallbackMounts.roMounts
         ),
-        defaultEnvVars: envRowsFromArray(recommendation.default_env_vars || [])
-      }));
-      setCreateAutoConfigResult({
-        model: String(recommendation.analysis_model || ""),
-        notes: String(recommendation.notes || "")
+        default_rw_mounts: normalizeStringArray(
+          recommendation.default_rw_mounts,
+          fallbackMounts.rwMounts
+        ),
+        default_env_vars: normalizeStringArray(
+          recommendation.default_env_vars,
+          fallbackEnvVars
+        )
+      };
+      await fetchJson("/api/projects", {
+        method: "POST",
+        body: JSON.stringify(autoConfigProjectPayload)
       });
+      setPendingAutoConfigProjects((prev) => prev.filter((project) => project.id !== pendingProjectId));
       setError("");
+      refreshState().catch(() => {});
     } catch (err) {
-      setError(err.message || String(err));
-    } finally {
-      setCreateAutoConfigRunning(false);
+      const message = err.message || String(err);
+      setPendingAutoConfigProjects((prev) =>
+        prev.map((project) =>
+          project.id === pendingProjectId
+            ? { ...project, auto_config_status: "failed", auto_config_error: message }
+            : project
+        )
+      );
+      setError(message);
+      refreshState().catch(() => {});
     }
   }
 
@@ -1970,8 +2002,6 @@ function HubApp() {
         body: JSON.stringify(payload)
       });
       setCreateForm(emptyCreateForm());
-      setCreateAutoConfigResult(null);
-      setCreateAutoConfigRunning(false);
       setError("");
       await refreshState();
     } catch (err) {
@@ -2063,11 +2093,31 @@ function HubApp() {
     setOpenChats((prev) => ({ ...prev, [uiId]: true }));
     setOpenChatDetails((prev) => ({ ...prev, [uiId]: false }));
     setCollapsedProjectChats((prev) => ({ ...prev, [projectId]: false }));
-
-    const queue = createChatQueueRef.current.get(projectId) || [];
-    queue.push({ uiId, agentType, agentArgs });
-    createChatQueueRef.current.set(projectId, queue);
-    processCreateChatQueue(projectId).catch(() => {});
+    try {
+      const response = await fetchJson(`/api/projects/${projectId}/chats/start`, {
+        method: "POST",
+        body: JSON.stringify({ agent_type: agentType, agent_args: agentArgs })
+      });
+      const chatId = response?.chat?.id;
+      if (!chatId) {
+        removeOptimisticChatRow(uiId);
+        setError("Chat start request succeeded but did not include a chat id.");
+        refreshState().catch(() => {});
+        return;
+      }
+      setPendingSessions((prev) =>
+        prev.map((session) =>
+          session.ui_id === uiId ? { ...session, server_chat_id: chatId } : session
+        )
+      );
+      setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
+      setError("");
+      refreshState().catch(() => {});
+    } catch (err) {
+      removeOptimisticChatRow(uiId);
+      setError(err.message || String(err));
+      refreshState().catch(() => {});
+    }
   }
 
   async function handleDeleteProject(projectId) {
@@ -2082,8 +2132,6 @@ function HubApp() {
       chats: (prev.chats || []).filter((chat) => chat.project_id !== projectId)
     }));
     setPendingSessions((prev) => prev.filter((session) => session.project_id !== projectId));
-    createChatQueueRef.current.delete(projectId);
-    createChatActiveProjectsRef.current.delete(projectId);
     try {
       await fetchJson(`/api/projects/${projectId}`, { method: "DELETE" });
       setError("");
@@ -3271,28 +3319,23 @@ function HubApp() {
                   <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
 
                   <div className="row two create-project-actions">
-                    <button type="submit" className="btn-primary" disabled={createAutoConfigRunning}>
+                    <button type="submit" className="btn-primary">
                       Add project
                     </button>
                     <button
                       type="button"
                       className="btn-secondary"
                       onClick={handleAutoConfigureCreateForm}
-                      disabled={createAutoConfigRunning || !String(createForm.repoUrl || "").trim()}
+                      disabled={!String(createForm.repoUrl || "").trim()}
                     >
-                      {createAutoConfigRunning ? <SpinnerLabel text="Auto configuring..." /> : "Auto configure"}
+                      {autoConfigInFlightCount > 0
+                        ? <SpinnerLabel text={`Auto configure (${autoConfigInFlightCount} running)`} />
+                        : "Auto configure"}
                     </button>
                   </div>
-                  {createAutoConfigRunning ? (
+                  {autoConfigInFlightCount > 0 ? (
                     <div className="meta auto-config-meta">
-                      Running temporary analysis chat and applying recommended base image, setup script, and cache mounts.
-                    </div>
-                  ) : null}
-                  {createAutoConfigResult ? (
-                    <div className="meta auto-config-meta">
-                      Auto configure complete
-                      {createAutoConfigResult.model ? ` (${createAutoConfigResult.model})` : ""}.
-                      {createAutoConfigResult.notes ? ` ${createAutoConfigResult.notes}` : ""}
+                      Auto-configuring projects in the background. You can continue adding projects and starting chats.
                     </div>
                   ) : null}
                 </form>
@@ -3301,8 +3344,47 @@ function HubApp() {
               <section className="projects-list">
                 <h3 className="section-title">Existing projects</h3>
                 <div className="stack">
-              {hubState.projects.length === 0 ? <div className="empty">No projects yet.</div> : null}
-              {hubState.projects.map((project) => {
+              {projectsForList.length === 0 ? <div className="empty">No projects yet.</div> : null}
+              {projectsForList.map((project) => {
+                if (project.is_auto_config_pending) {
+                  const isFailed = String(project.build_status || "") === "failed";
+                  const statusLabel = isFailed ? "Auto configure failed" : "Auto configuring";
+                  return (
+                    <article className="card project-card" key={project.id}>
+                      <div className="project-head">
+                        <h3>{project.name}</h3>
+                      </div>
+                      <div className="meta">ID: {project.id}</div>
+                      <div className="meta">Repo: {project.repo_url}</div>
+                      <div className="meta">Branch: {project.default_branch || "auto-detect"}</div>
+                      <div className="meta">
+                        Status:{" "}
+                        <span className={`project-build-state ${isFailed ? "failed" : "building"}`}>
+                          {statusLabel}
+                        </span>
+                      </div>
+                      {!isFailed ? (
+                        <div className="meta auto-config-meta">
+                          Running temporary analysis chat, then creating a configured project entry.
+                        </div>
+                      ) : null}
+                      {isFailed ? (
+                        <div className="meta build-error">
+                          {project.build_error || "Auto configure failed before project creation completed."}
+                        </div>
+                      ) : null}
+                      <div className="actions">
+                        <button
+                          type="button"
+                          className="btn-secondary btn-small"
+                          onClick={() => dismissPendingAutoConfigProject(project.id)}
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </article>
+                  );
+                }
                 const draft = projectDrafts[project.id] || projectDraftFromProject(project);
                 const setupCommands = String(project.setup_script || "")
                   .split("\n")

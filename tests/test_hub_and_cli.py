@@ -11,11 +11,12 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from unittest.mock import call, patch
+from unittest.mock import AsyncMock, call, patch
 from types import SimpleNamespace
 
 from click.testing import CliRunner
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 import sys
 
@@ -4056,6 +4057,153 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, msg=result.output)
             kwargs = state_cls.call_args.kwargs
             self.assertEqual(kwargs.get("artifact_publish_base_url"), "http://172.17.0.4:8765/hub")
+
+
+class HubApiAsyncRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name)
+        self.data_dir = self.tmp_path / "hub"
+        self.config = self.tmp_path / "agent.config.toml"
+        self.config.write_text("model = 'test'\n", encoding="utf-8")
+        self.runner = CliRunner()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _build_app(self):
+        with patch("agent_hub.server.uvicorn.run", return_value=None) as uvicorn_run:
+            result = self.runner.invoke(
+                hub_server.main,
+                [
+                    "--data-dir",
+                    str(self.data_dir),
+                    "--config-file",
+                    str(self.config),
+                    "--no-frontend-build",
+                ],
+            )
+        self.assertEqual(result.exit_code, 0, msg=result.output)
+        return uvicorn_run.call_args.args[0]
+
+    @staticmethod
+    async def _fake_to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def test_auto_configure_route_runs_state_call_in_worker_thread(self) -> None:
+        app = self._build_app()
+        recommendation = {
+            "default_branch": "main",
+            "base_image_mode": "tag",
+            "base_image_value": "ubuntu:22.04",
+            "setup_script": "",
+            "default_ro_mounts": [],
+            "default_rw_mounts": [],
+            "default_env_vars": [],
+            "notes": "",
+            "analysis_model": "chatgpt-account-codex",
+        }
+
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ) as to_thread, patch.object(
+            hub_server.HubState,
+            "auto_configure_project",
+            return_value=recommendation,
+        ) as auto_config:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/auto-configure",
+                    json={"repo_url": "https://example.com/org/repo.git", "default_branch": "main"},
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {"recommendation": recommendation})
+        to_thread.assert_awaited_once()
+        auto_config.assert_called_once_with(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+
+    def test_create_project_route_runs_state_call_in_worker_thread(self) -> None:
+        app = self._build_app()
+        host_ro = self.tmp_path / "host_ro"
+        host_rw = self.tmp_path / "host_rw"
+        host_ro.mkdir(parents=True, exist_ok=True)
+        host_rw.mkdir(parents=True, exist_ok=True)
+        project = {
+            "id": "project-1",
+            "name": "demo",
+            "repo_url": "https://example.com/org/repo.git",
+            "default_branch": "main",
+        }
+
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ) as to_thread, patch.object(
+            hub_server.HubState,
+            "add_project",
+            return_value=project,
+        ) as add_project:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects",
+                    json={
+                        "repo_url": "https://example.com/org/repo.git",
+                        "name": "demo",
+                        "default_branch": "main",
+                        "setup_script": "echo hello",
+                        "base_image_mode": "tag",
+                        "base_image_value": "ubuntu:22.04",
+                        "default_ro_mounts": [f"{host_ro}:/container/ro"],
+                        "default_rw_mounts": [f"{host_rw}:/container/rw"],
+                        "default_env_vars": ["FOO=bar"],
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {"project": project})
+        to_thread.assert_awaited_once()
+        add_project.assert_called_once_with(
+            repo_url="https://example.com/org/repo.git",
+            name="demo",
+            default_branch="main",
+            setup_script="echo hello",
+            base_image_mode="tag",
+            base_image_value="ubuntu:22.04",
+            default_ro_mounts=[f"{host_ro}:/container/ro"],
+            default_rw_mounts=[f"{host_rw}:/container/rw"],
+            default_env_vars=["FOO=bar"],
+        )
+
+    def test_project_chat_start_route_runs_state_call_in_worker_thread(self) -> None:
+        app = self._build_app()
+        chat = {"id": "chat-1", "status": "running"}
+
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ) as to_thread, patch.object(
+            hub_server.HubState,
+            "create_and_start_chat",
+            return_value=chat,
+        ) as start_chat:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/chats/start",
+                    json={"agent_type": "codex", "agent_args": ["--model", "gpt-5.3-codex"]},
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {"chat": chat})
+        to_thread.assert_awaited_once()
+        start_chat.assert_called_once_with(
+            "project-1",
+            agent_args=["--model", "gpt-5.3-codex"],
+            agent_type="codex",
+        )
 
 
 class DockerEntrypointTests(unittest.TestCase):

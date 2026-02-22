@@ -6969,7 +6969,8 @@ def main(
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        recommendation = state.auto_configure_project(
+        recommendation = await asyncio.to_thread(
+            state.auto_configure_project,
             repo_url=payload.get("repo_url"),
             default_branch=payload.get("default_branch"),
         )
@@ -6993,18 +6994,20 @@ def main(
             setup_script = str(setup_script).strip()
         if isinstance(branch, str):
             branch = branch.strip() or None
+        project = await asyncio.to_thread(
+            state.add_project,
+            repo_url=repo_url,
+            name=name,
+            default_branch=branch,
+            setup_script=setup_script,
+            base_image_mode=base_image_mode,
+            base_image_value=base_image_value,
+            default_ro_mounts=default_ro_mounts,
+            default_rw_mounts=default_rw_mounts,
+            default_env_vars=default_env_vars,
+        )
         return {
-            "project": state.add_project(
-                repo_url=repo_url,
-                name=name,
-                default_branch=branch,
-                setup_script=setup_script,
-                base_image_mode=base_image_mode,
-                base_image_value=base_image_value,
-                default_ro_mounts=default_ro_mounts,
-                default_rw_mounts=default_rw_mounts,
-                default_env_vars=default_env_vars,
-            )
+            "project": project
         }
 
     @app.patch("/api/projects/{project_id}")
@@ -7039,7 +7042,8 @@ def main(
             update["default_env_vars"] = _parse_env_vars(_empty_list(payload.get("default_env_vars")))
         if not update:
             raise HTTPException(status_code=400, detail="No patch values provided.")
-        return {"project": state.update_project(project_id, update)}
+        project = await asyncio.to_thread(state.update_project, project_id, update)
+        return {"project": project}
 
     @app.delete("/api/projects/{project_id}")
     def api_delete_project(project_id: str) -> None:
@@ -7080,12 +7084,14 @@ def main(
             if "agent_type" in payload
             else DEFAULT_CHAT_AGENT_TYPE
         )
+        chat = await asyncio.to_thread(
+            state.create_and_start_chat,
+            project_id,
+            agent_args=[str(arg) for arg in agent_args],
+            agent_type=agent_type,
+        )
         return {
-            "chat": state.create_and_start_chat(
-                project_id,
-                agent_args=[str(arg) for arg in agent_args],
-                agent_type=agent_type,
-            )
+            "chat": chat
         }
 
     @app.post("/api/chats")
@@ -7114,16 +7120,18 @@ def main(
             if "agent_type" in payload
             else DEFAULT_CHAT_AGENT_TYPE
         )
+        chat = await asyncio.to_thread(
+            state.create_chat,
+            project_id,
+            profile,
+            ro_mounts,
+            rw_mounts,
+            env_vars,
+            agent_args=[str(arg) for arg in agent_args],
+            agent_type=agent_type,
+        )
         return {
-            "chat": state.create_chat(
-                project_id,
-                profile,
-                ro_mounts,
-                rw_mounts,
-                env_vars,
-                agent_args=[str(arg) for arg in agent_args],
-                agent_type=agent_type,
-            )
+            "chat": chat
         }
 
     @app.post("/api/chats/{chat_id}/start")
