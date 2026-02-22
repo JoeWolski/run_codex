@@ -24,7 +24,7 @@ const DEFAULTS = {
   viewportWidth: 1580,
   viewportHeight: 980,
   projectName: "Agent Hub Frontend Demo Project",
-  repoUrl: "https://github.com/JoeWolski/agent_hub.git",
+  repoUrl: "https://github.com/example/demo.git",
   configFile: path.join(hostVisibleRepoRoot, "config", "agent.config.toml"),
   outputDir: path.join(hostVisibleRepoRoot, "tools", "demo", "output"),
   scriptFile: path.join(hostVisibleRepoRoot, "tools", "demo", "output", "demo_script.json"),

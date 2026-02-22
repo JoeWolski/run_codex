@@ -2705,8 +2705,81 @@ class HubStateTests(unittest.TestCase):
 
         self.assertEqual(recommendation["setup_script"].splitlines()[0], "apt-get update")
         expected_mount = f"{fake_home / '.ccache'}:/home/{self.state.local_user}/.ccache"
+        unexpected_mount = f"{fake_home / '.cache' / 'sccache'}:/home/{self.state.local_user}/.cache/sccache"
         self.assertIn(expected_mount, recommendation["default_rw_mounts"])
+        self.assertNotIn(unexpected_mount, recommendation["default_rw_mounts"])
         self.assertTrue((fake_home / ".ccache").exists())
+
+    def test_normalize_auto_config_recommendation_drops_undetected_cache_mounts(self) -> None:
+        workspace = self.tmp_path / "workspace-no-cache"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "README.md").write_text(
+            "This text mentions ccache and sccache but does not configure either tool.\n",
+            encoding="utf-8",
+        )
+        fake_home = self.tmp_path / "fake-home-no-cache"
+        ccache_host = fake_home / ".ccache"
+        sccache_host = fake_home / ".cache" / "sccache"
+        ccache_host.mkdir(parents=True, exist_ok=True)
+        sccache_host.mkdir(parents=True, exist_ok=True)
+
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [
+                        f"{ccache_host}:/home/{self.state.local_user}/.ccache",
+                        f"{sccache_host}:/home/{self.state.local_user}/.cache/sccache",
+                    ],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                workspace,
+            )
+
+        self.assertEqual(recommendation["default_rw_mounts"], [])
+
+    def test_normalize_auto_config_recommendation_keeps_detected_ccache_mount_only(self) -> None:
+        workspace = self.tmp_path / "workspace-ccache-only"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "CMakeLists.txt").write_text(
+            "set(CMAKE_C_COMPILER_LAUNCHER ccache)\n",
+            encoding="utf-8",
+        )
+        fake_home = self.tmp_path / "fake-home-ccache-only"
+        ccache_host = fake_home / ".ccache"
+        sccache_host = fake_home / ".cache" / "sccache"
+        ccache_host.mkdir(parents=True, exist_ok=True)
+        sccache_host.mkdir(parents=True, exist_ok=True)
+
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [
+                        f"{ccache_host}:/home/{self.state.local_user}/.ccache",
+                        f"{sccache_host}:/home/{self.state.local_user}/.cache/sccache",
+                    ],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                workspace,
+            )
+
+        self.assertIn(
+            f"{ccache_host}:/home/{self.state.local_user}/.ccache",
+            recommendation["default_rw_mounts"],
+        )
+        self.assertNotIn(
+            f"{sccache_host}:/home/{self.state.local_user}/.cache/sccache",
+            recommendation["default_rw_mounts"],
+        )
 
     def test_normalize_auto_config_recommendation_normalizes_repo_path_base(self) -> None:
         workspace = self.tmp_path / "workspace-base"
@@ -2731,6 +2804,42 @@ class HubStateTests(unittest.TestCase):
 
         self.assertEqual(recommendation["base_image_mode"], "repo_path")
         self.assertEqual(recommendation["base_image_value"], "docker/dev")
+
+    def test_normalize_auto_config_recommendation_dedupes_setup_commands_from_repo_dockerfile(self) -> None:
+        workspace = self.tmp_path / "workspace-setup-dedupe"
+        docker_dir = workspace / "docker" / "development"
+        docker_dir.mkdir(parents=True, exist_ok=True)
+        (docker_dir / "Dockerfile").write_text(
+            (
+                "FROM ubuntu:22.04\n"
+                "RUN uv sync --frozen --no-dev \\\n"
+                " && cd /opt/workspace/web \\\n"
+                " && corepack yarn install --frozen-lockfile \\\n"
+                " && cd /opt/workspace/tools/demo \\\n"
+                " && npm ci\n"
+            ),
+            encoding="utf-8",
+        )
+
+        recommendation = self.state._normalize_auto_config_recommendation(
+            {
+                "base_image_mode": "repo_path",
+                "base_image_value": "docker/development/Dockerfile",
+                "setup_script": (
+                    "uv sync --frozen --no-dev\n"
+                    "corepack yarn install --frozen-lockfile --cwd web\n"
+                    "npm ci --prefix tools/demo\n"
+                    "echo keep-me\n"
+                ),
+                "default_ro_mounts": [],
+                "default_rw_mounts": [],
+                "default_env_vars": [],
+                "notes": "",
+            },
+            workspace,
+        )
+
+        self.assertEqual(recommendation["setup_script"], "echo keep-me")
 
     def test_run_temporary_auto_config_chat_requires_connected_account(self) -> None:
         workspace = self.tmp_path / "workspace-chat-auth"
@@ -2789,7 +2898,7 @@ class HubStateTests(unittest.TestCase):
             },
         ):
             recommendation = self.state.auto_configure_project(
-                repo_url="https://github.com/scptr-ai/av.git",
+                repo_url="https://example.com/org/repo.git",
                 default_branch="",
             )
 
@@ -2842,6 +2951,30 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(recommendation["base_image_value"], "ci/x86_docker/Dockerfile")
         self.assertEqual(recommendation["setup_script"], "bash make.sh rbufc")
         self.assertIn("selected repository Dockerfile: ci/x86_docker/Dockerfile", recommendation["notes"])
+
+    def test_apply_auto_config_repository_hints_prefers_repo_dockerfile_for_high_confidence_path(self) -> None:
+        workspace = self.tmp_path / "workspace-hints-docker"
+        (workspace / "docker" / "development").mkdir(parents=True, exist_ok=True)
+        (workspace / "docker" / "development" / "Dockerfile").write_text(
+            "FROM ubuntu:22.04\n",
+            encoding="utf-8",
+        )
+
+        recommendation = self.state._apply_auto_config_repository_hints(
+            {
+                "base_image_mode": "tag",
+                "base_image_value": "ubuntu:22.04",
+                "setup_script": "",
+                "default_ro_mounts": [],
+                "default_rw_mounts": [],
+                "default_env_vars": [],
+                "notes": "",
+            },
+            workspace,
+        )
+
+        self.assertEqual(recommendation["base_image_mode"], "repo_path")
+        self.assertEqual(recommendation["base_image_value"], "docker/development/Dockerfile")
 
     def test_state_payload_does_not_call_openai_title_generation_from_log_changes(self) -> None:
         project = self.state.add_project(

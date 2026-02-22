@@ -114,6 +114,81 @@ AUTO_CONFIG_NOT_CONNECTED_ERROR = (
 AUTO_CONFIG_MISSING_OUTPUT_ERROR = "Temporary auto-config chat did not return a JSON recommendation."
 AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid JSON."
 AUTO_CONFIG_NOTES_MAX_CHARS = 400
+AUTO_CONFIG_REPO_DOCKERFILE_MIN_SCORE = 70
+AUTO_CONFIG_CACHE_SIGNAL_MAX_FILES = 3000
+AUTO_CONFIG_CACHE_SIGNAL_IGNORED_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "build",
+    "dist",
+    "out",
+    "target",
+}
+AUTO_CONFIG_CACHE_SIGNAL_DOC_DIRS = {"docs", "doc", "documentation"}
+AUTO_CONFIG_CACHE_SIGNAL_FILENAMES = {
+    "cmakelists.txt",
+    "meson.build",
+    "meson.options",
+    "makefile",
+    "gnu makefile",
+    "build.bazel",
+    "workspace",
+    ".bazelrc",
+    "cargo.toml",
+    "cargo.config",
+    "config.toml",
+    "dockerfile",
+    "sconstruct",
+    "sconscript",
+}
+AUTO_CONFIG_CACHE_SIGNAL_SUFFIXES = {
+    ".cmake",
+    ".mk",
+    ".ninja",
+    ".bazel",
+    ".bzl",
+    ".toml",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".py",
+    ".yaml",
+    ".yml",
+    ".json",
+    ".cfg",
+    ".conf",
+    ".ini",
+}
+AUTO_CONFIG_CCACHE_SIGNAL_PATTERNS = (
+    re.compile(r"\bCMAKE_[A-Z0-9_]*COMPILER_LAUNCHER\b[^\n#]*\bccache\b", re.IGNORECASE),
+    re.compile(r"\bccache\b\s+(?:--|[A-Za-z0-9_./-])", re.IGNORECASE),
+    re.compile(r"\bCCACHE_[A-Z0-9_]+\b", re.IGNORECASE),
+    re.compile(r"\b(?:export\s+)?(?:CC|CXX)\s*=\s*(?:\"|')?ccache\b", re.IGNORECASE),
+)
+AUTO_CONFIG_SCCACHE_SIGNAL_PATTERNS = (
+    re.compile(r"\bCMAKE_[A-Z0-9_]*COMPILER_LAUNCHER\b[^\n#]*\bsccache\b", re.IGNORECASE),
+    re.compile(r"\bsccache\b\s+(?:--|[A-Za-z0-9_./-])", re.IGNORECASE),
+    re.compile(r"\bSCCACHE_[A-Z0-9_]+\b", re.IGNORECASE),
+    re.compile(r"\bRUSTC_WRAPPER\s*=\s*(?:\"|')?sccache\b", re.IGNORECASE),
+)
+AUTO_CONFIG_SETUP_CHAIN_SPLIT_RE = re.compile(r"\s*&&\s*")
+AUTO_CONFIG_SETUP_CD_RE = re.compile(r"^cd\s+([^\s;&|]+)$", re.IGNORECASE)
+AUTO_CONFIG_SETUP_CWD_RE = re.compile(
+    r"(?:^|\s)--cwd\s+([^\s\"']+|\"[^\"]+\"|'[^']+')",
+    re.IGNORECASE,
+)
+AUTO_CONFIG_SETUP_PREFIX_RE = re.compile(
+    r"(?:^|\s)--prefix\s+([^\s\"']+|\"[^\"]+\"|'[^']+')",
+    re.IGNORECASE,
+)
+AUTO_CONFIG_SETUP_UV_SYNC_RE = re.compile(r"^uv\s+sync\b", re.IGNORECASE)
+AUTO_CONFIG_SETUP_YARN_INSTALL_RE = re.compile(r"^(?:corepack\s+)?yarn\s+install\b", re.IGNORECASE)
+AUTO_CONFIG_SETUP_NPM_CI_RE = re.compile(r"^npm\s+ci\b", re.IGNORECASE)
 PROMPTS_DIR_NAME = "prompts"
 PROMPT_CHAT_TITLE_OPENAI_SYSTEM_FILE = "chat_title_openai_system.md"
 PROMPT_CHAT_TITLE_OPENAI_USER_FILE = "chat_title_openai_user.md"
@@ -3442,41 +3517,6 @@ class HubState:
             branch=branch,
         )
 
-    def _repo_mentions_any_token(self, workspace: Path, tokens: set[str]) -> bool:
-        normalized_tokens = {token.strip().lower() for token in tokens if token and token.strip()}
-        if not normalized_tokens:
-            return False
-        ignored_dirs = {
-            ".git",
-            ".hg",
-            ".svn",
-            ".venv",
-            "venv",
-            "node_modules",
-            "build",
-            "dist",
-            "out",
-            "target",
-        }
-        max_files = 3000
-        files_scanned = 0
-        for root, dirs, files in os.walk(workspace):
-            dirs[:] = [name for name in dirs if name not in ignored_dirs]
-            for filename in files:
-                files_scanned += 1
-                if files_scanned > max_files:
-                    return False
-                path = Path(root) / filename
-                try:
-                    if path.stat().st_size > 1_500_000:
-                        continue
-                    text = path.read_text(encoding="utf-8", errors="ignore").lower()
-                except OSError:
-                    continue
-                if any(token in text for token in normalized_tokens):
-                    return True
-        return False
-
     def _normalize_auto_config_setup_script(self, raw_script: Any) -> str:
         script = str(raw_script or "").replace("\r\n", "\n").replace("\r", "\n")
         commands = [line.strip() for line in script.split("\n") if line.strip()]
@@ -3488,6 +3528,249 @@ class HubState:
         if has_apt_install and not has_apt_update:
             commands.insert(0, "apt-get update")
         return "\n".join(commands)
+
+    @staticmethod
+    def _normalize_auto_config_shell_path(path_value: str) -> str:
+        normalized = str(path_value or "").strip().strip("\"'").replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized.rstrip("/") or "."
+
+    @staticmethod
+    def _extract_auto_config_option_path(command: str, pattern: re.Pattern[str]) -> str:
+        match = pattern.search(str(command or ""))
+        if not match:
+            return ""
+        return HubState._normalize_auto_config_shell_path(str(match.group(1) or ""))
+
+    @staticmethod
+    def _auto_config_setup_scope_matches(left_scope: str, right_scope: str) -> bool:
+        left = HubState._normalize_auto_config_shell_path(left_scope)
+        right = HubState._normalize_auto_config_shell_path(right_scope)
+        if left == right:
+            return True
+        if left == "." or right == ".":
+            return left == right
+        return left.endswith(f"/{right}") or right.endswith(f"/{left}")
+
+    def _auto_config_setup_signature_for_command(self, command: str, cwd: str) -> tuple[str, str] | None:
+        normalized = _compact_whitespace(str(command or "")).strip()
+        if not normalized:
+            return None
+        normalized_cwd = self._normalize_auto_config_shell_path(cwd)
+
+        if AUTO_CONFIG_SETUP_UV_SYNC_RE.search(normalized):
+            return "uv_sync", normalized_cwd
+
+        if AUTO_CONFIG_SETUP_YARN_INSTALL_RE.search(normalized):
+            cwd_path = self._extract_auto_config_option_path(normalized, AUTO_CONFIG_SETUP_CWD_RE)
+            return "yarn_install", self._normalize_auto_config_shell_path(cwd_path or normalized_cwd)
+
+        if AUTO_CONFIG_SETUP_NPM_CI_RE.search(normalized):
+            prefix_path = self._extract_auto_config_option_path(normalized, AUTO_CONFIG_SETUP_PREFIX_RE)
+            return "npm_ci", self._normalize_auto_config_shell_path(prefix_path or normalized_cwd)
+
+        return None
+
+    def _auto_config_setup_signatures_from_shell(self, shell_command: str) -> set[tuple[str, str]]:
+        signatures: set[tuple[str, str]] = set()
+        cwd = "."
+        for segment in AUTO_CONFIG_SETUP_CHAIN_SPLIT_RE.split(str(shell_command or "").strip()):
+            normalized = _compact_whitespace(segment).strip()
+            if not normalized:
+                continue
+            cd_match = AUTO_CONFIG_SETUP_CD_RE.match(normalized)
+            if cd_match:
+                cwd = self._normalize_auto_config_shell_path(str(cd_match.group(1) or ""))
+                continue
+            signature = self._auto_config_setup_signature_for_command(normalized, cwd)
+            if signature is not None:
+                signatures.add(signature)
+        return signatures
+
+    @staticmethod
+    def _dockerfile_run_commands(dockerfile: Path) -> list[str]:
+        try:
+            raw_text = dockerfile.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return []
+
+        instructions: list[str] = []
+        current = ""
+        for raw_line in raw_text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if current:
+                current = f"{current} {stripped}"
+            else:
+                current = stripped
+            if current.endswith("\\"):
+                current = current[:-1].rstrip()
+                continue
+            instructions.append(current)
+            current = ""
+        if current:
+            instructions.append(current)
+
+        run_commands: list[str] = []
+        for instruction in instructions:
+            lowered = instruction.lower()
+            if not lowered.startswith("run "):
+                continue
+            run_commands.append(instruction[4:].strip())
+        return run_commands
+
+    def _auto_config_setup_signatures_from_repo_dockerfile(self, dockerfile: Path) -> set[tuple[str, str]]:
+        signatures: set[tuple[str, str]] = set()
+        for run_command in self._dockerfile_run_commands(dockerfile):
+            signatures.update(self._auto_config_setup_signatures_from_shell(run_command))
+        return signatures
+
+    def _auto_config_signature_in(self, signature: tuple[str, str], known: set[tuple[str, str]]) -> bool:
+        kind, scope = signature
+        for known_kind, known_scope in known:
+            if kind != known_kind:
+                continue
+            if self._auto_config_setup_scope_matches(scope, known_scope):
+                return True
+        return False
+
+    def _resolve_auto_config_repo_dockerfile(self, workspace: Path, base_image_value: str) -> Path | None:
+        raw_value = str(base_image_value or "").strip()
+        if not raw_value:
+            return None
+        candidate = (workspace / raw_value).resolve()
+        workspace_root = workspace.resolve()
+        try:
+            candidate.relative_to(workspace_root)
+        except ValueError:
+            return None
+        dockerfile = candidate / "Dockerfile" if candidate.is_dir() else candidate
+        if not dockerfile.is_file():
+            return None
+        return dockerfile
+
+    def _dedupe_setup_script_commands_present_in_repo_dockerfile(
+        self,
+        workspace: Path,
+        base_image_mode: str,
+        base_image_value: str,
+        setup_script: str,
+    ) -> str:
+        normalized_script = str(setup_script or "").strip()
+        if not normalized_script:
+            return ""
+        if base_image_mode != "repo_path":
+            return normalized_script
+
+        dockerfile = self._resolve_auto_config_repo_dockerfile(workspace, base_image_value)
+        if dockerfile is None:
+            return normalized_script
+        docker_signatures = self._auto_config_setup_signatures_from_repo_dockerfile(dockerfile)
+        if not docker_signatures:
+            return normalized_script
+
+        kept_lines: list[str] = []
+        for raw_line in normalized_script.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line_signatures = self._auto_config_setup_signatures_from_shell(line)
+            if line_signatures and all(self._auto_config_signature_in(sig, docker_signatures) for sig in line_signatures):
+                continue
+            kept_lines.append(line)
+        return "\n".join(kept_lines)
+
+    @staticmethod
+    def _is_auto_config_cache_signal_file(path: Path, workspace: Path) -> bool:
+        try:
+            relative = path.relative_to(workspace)
+        except ValueError:
+            return False
+        parts = [part.lower() for part in relative.parts]
+        if not parts:
+            return False
+        if any(part in AUTO_CONFIG_CACHE_SIGNAL_DOC_DIRS for part in parts[:-1]):
+            return False
+        filename = parts[-1]
+        if filename in AUTO_CONFIG_CACHE_SIGNAL_FILENAMES:
+            return True
+        if "dockerfile" in filename:
+            return True
+        return path.suffix.lower() in AUTO_CONFIG_CACHE_SIGNAL_SUFFIXES
+
+    def _detected_auto_config_cache_backends(self, workspace: Path) -> set[str]:
+        detected: set[str] = set()
+        files_scanned = 0
+        for root, dirs, files in os.walk(workspace):
+            dirs[:] = [name for name in dirs if name not in AUTO_CONFIG_CACHE_SIGNAL_IGNORED_DIRS]
+            for filename in files:
+                path = Path(root) / filename
+                if not self._is_auto_config_cache_signal_file(path, workspace):
+                    continue
+                files_scanned += 1
+                if files_scanned > AUTO_CONFIG_CACHE_SIGNAL_MAX_FILES:
+                    return detected
+                try:
+                    if path.stat().st_size > 1_500_000:
+                        continue
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                lowered = text.lower()
+                if "ccache" in lowered and any(pattern.search(text) for pattern in AUTO_CONFIG_CCACHE_SIGNAL_PATTERNS):
+                    detected.add("ccache")
+                if "sccache" in lowered and any(pattern.search(text) for pattern in AUTO_CONFIG_SCCACHE_SIGNAL_PATTERNS):
+                    detected.add("sccache")
+                if len(detected) == 2:
+                    return detected
+        return detected
+
+    @staticmethod
+    def _cache_mount_backend_from_entry(entry: str) -> str:
+        if ":" not in entry:
+            return ""
+        _host, container_raw = entry.split(":", 1)
+        container = container_raw.strip().replace("\\", "/").rstrip("/").lower()
+        if container.endswith("/.ccache"):
+            return "ccache"
+        if container.endswith("/.cache/sccache"):
+            return "sccache"
+        return ""
+
+    def _augment_auto_config_cache_mounts(self, workspace: Path, rw_mounts: list[str]) -> list[str]:
+        mounted = self._dedupe_entries(list(rw_mounts))
+        detected = self._detected_auto_config_cache_backends(workspace)
+        filtered: list[str] = []
+        existing: set[str] = set()
+        for entry in mounted:
+            backend = self._cache_mount_backend_from_entry(entry)
+            if backend and backend not in detected:
+                continue
+            if entry in existing:
+                continue
+            filtered.append(entry)
+            existing.add(entry)
+
+        container_home = f"/home/{self.local_user}"
+        cache_specs = [
+            ("ccache", Path.home().resolve() / ".ccache", f"{container_home}/.ccache"),
+            ("sccache", Path.home().resolve() / ".cache" / "sccache", f"{container_home}/.cache/sccache"),
+        ]
+        for token, host_path, container_path in cache_specs:
+            if token not in detected:
+                continue
+            try:
+                host_path.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            entry = f"{host_path}:{container_path}"
+            if entry in existing:
+                continue
+            filtered.append(entry)
+            existing.add(entry)
+        return filtered
 
     def _normalize_auto_config_repo_path(self, workspace: Path, raw_value: Any) -> str:
         value = str(raw_value or "").strip()
@@ -3544,28 +3827,6 @@ class HubState:
             normalized_entries.append(f"{host_path}:{container}")
         return _parse_mounts(normalized_entries, direction)
 
-    def _augment_auto_config_cache_mounts(self, workspace: Path, rw_mounts: list[str]) -> list[str]:
-        mounted = self._dedupe_entries(list(rw_mounts))
-        existing = set(mounted)
-        container_home = f"/home/{self.local_user}"
-        cache_specs = [
-            ("ccache", Path.home().resolve() / ".ccache", f"{container_home}/.ccache"),
-            ("sccache", Path.home().resolve() / ".cache" / "sccache", f"{container_home}/.cache/sccache"),
-        ]
-        for token, host_path, container_path in cache_specs:
-            if not self._repo_mentions_any_token(workspace, {token}):
-                continue
-            try:
-                host_path.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                continue
-            entry = f"{host_path}:{container_path}"
-            if entry in existing:
-                continue
-            mounted.append(entry)
-            existing.add(entry)
-        return mounted
-
     def _normalize_auto_config_recommendation(self, raw_payload: dict[str, Any], workspace: Path) -> dict[str, Any]:
         if not isinstance(raw_payload, dict):
             raise HTTPException(status_code=400, detail="Auto-config output must be a JSON object.")
@@ -3576,6 +3837,12 @@ class HubState:
             base_image_value = self._normalize_auto_config_repo_path(workspace, base_image_value)
 
         setup_script = self._normalize_auto_config_setup_script(raw_payload.get("setup_script"))
+        setup_script = self._dedupe_setup_script_commands_present_in_repo_dockerfile(
+            workspace=workspace,
+            base_image_mode=base_image_mode,
+            base_image_value=base_image_value,
+            setup_script=setup_script,
+        )
         default_ro_mounts = self._normalize_auto_config_mounts(
             _empty_list(raw_payload.get("default_ro_mounts")),
             "default read-only mount",
@@ -3749,12 +4016,15 @@ class HubState:
     ) -> dict[str, Any]:
         next_recommendation = dict(recommendation)
         dockerfile_path = self._infer_repo_dockerfile_path(workspace)
+        current_mode = _normalize_base_image_mode(next_recommendation.get("base_image_mode"))
         current_value = str(next_recommendation.get("base_image_value") or "").strip()
 
         if dockerfile_path:
-            normalized = f"/{dockerfile_path.lower()}"
-            strong_ci_container_hint = "/ci/" in normalized and "docker" in normalized
-            if strong_ci_container_hint or not current_value:
+            dockerfile_score, _depth_score, _path = self._dockerfile_path_score(dockerfile_path)
+            should_use_repo_dockerfile = (
+                current_mode != "repo_path" or not current_value
+            ) and (dockerfile_score >= AUTO_CONFIG_REPO_DOCKERFILE_MIN_SCORE or not current_value)
+            if should_use_repo_dockerfile:
                 next_recommendation["base_image_mode"] = "repo_path"
                 next_recommendation["base_image_value"] = dockerfile_path
 
