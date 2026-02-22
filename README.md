@@ -103,6 +103,7 @@ If you want an Android/iOS wrapper around the existing Agent Hub web server, see
 
 This includes Linux-first deploy scripts:
 
+- `tools/mobile/deploy_phone.sh` (single wrapper command)
 - `tools/mobile/deploy_android.sh`
 - `tools/mobile/deploy_ios_via_ssh.sh` (Linux -> macOS via SSH)
 - `tools/mobile/deploy_ios_on_macos.sh` (direct on macOS)
