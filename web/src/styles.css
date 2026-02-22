@@ -406,7 +406,8 @@ code {
   grid-template-columns: 1fr;
 }
 
-.create-project-actions {
+.create-project-auto-config-button,
+.create-project-submit-button {
   margin-top: 2px;
 }
 
@@ -1579,6 +1580,14 @@ button:focus-visible {
 
 .project-build-view {
   height: 220px;
+}
+
+.auto-config-terminal-shell {
+  margin-top: 8px;
+}
+
+.auto-config-terminal-view {
+  height: 180px;
 }
 
 .inline-spinner {

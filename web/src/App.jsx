@@ -813,10 +813,12 @@ function ChatTerminal({ chatId, running }) {
   );
 }
 
-function ProjectBuildTerminal({ text }) {
+function ProjectBuildTerminal({ text, title = "Image build output", shellClassName = "", viewClassName = "" }) {
   const hostRef = useRef(null);
   const terminalRef = useRef(null);
   const fitRef = useRef(null);
+  const shellClasses = ["terminal-shell", "project-build-shell", shellClassName].filter(Boolean).join(" ");
+  const viewClasses = ["terminal-view", "project-build-view", viewClassName].filter(Boolean).join(" ");
 
   useEffect(() => {
     if (!hostRef.current) {
@@ -864,11 +866,11 @@ function ProjectBuildTerminal({ text }) {
   }, [text]);
 
   return (
-    <div className="terminal-shell project-build-shell">
+    <div className={shellClasses}>
       <div className="terminal-toolbar">
-        <span className="terminal-title">Image build output</span>
+        <span className="terminal-title">{title}</span>
       </div>
-      <div className="terminal-view project-build-view" ref={hostRef} />
+      <div className={viewClasses} ref={hostRef} />
     </div>
   );
 }
@@ -1810,11 +1812,6 @@ function HubApp() {
     }
     return map;
   }, [hubState.projects]);
-
-  const autoConfigInFlightCount = useMemo(
-    () => pendingAutoConfigProjects.filter((project) => project.auto_config_status === "running").length,
-    [pendingAutoConfigProjects]
-  );
 
   const projectsForList = useMemo(() => {
     const pendingRows = pendingAutoConfigProjects.map((project) => ({
@@ -3278,6 +3275,14 @@ function HubApp() {
                     onChange={(event) => updateCreateForm({ repoUrl: event.target.value })}
                     placeholder="git@github.com:org/repo.git or https://..."
                   />
+                  <button
+                    type="button"
+                    className="btn-secondary create-project-auto-config-button"
+                    onClick={handleAutoConfigureCreateForm}
+                    disabled={!String(createForm.repoUrl || "").trim()}
+                  >
+                    Auto configure
+                  </button>
                   <div className="row two">
                     <input
                       value={createForm.name}
@@ -3320,26 +3325,9 @@ function HubApp() {
                   <div className="label">Default environment variables for new chats</div>
                   <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
 
-                  <div className="row two create-project-actions">
-                    <button type="submit" className="btn-primary">
-                      Add project
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      onClick={handleAutoConfigureCreateForm}
-                      disabled={!String(createForm.repoUrl || "").trim()}
-                    >
-                      {autoConfigInFlightCount > 0
-                        ? <SpinnerLabel text={`Auto configure (${autoConfigInFlightCount} running)`} />
-                        : "Auto configure"}
-                    </button>
-                  </div>
-                  {autoConfigInFlightCount > 0 ? (
-                    <div className="meta auto-config-meta">
-                      Auto-configuring projects in the background. You can continue adding projects and starting chats.
-                    </div>
-                  ) : null}
+                  <button type="submit" className="btn-primary create-project-submit-button">
+                    Add project
+                  </button>
                 </form>
               </section>
 
@@ -3366,9 +3354,23 @@ function HubApp() {
                         </span>
                       </div>
                       {!isFailed ? (
-                        <div className="meta auto-config-meta">
-                          Running temporary analysis chat, then creating a configured project entry.
-                        </div>
+                        <>
+                          <div className="meta auto-config-meta">
+                            Running temporary analysis chat, then creating a configured project entry.
+                          </div>
+                          <ProjectBuildTerminal
+                            title="Temporary analysis chat"
+                            shellClassName="auto-config-terminal-shell"
+                            viewClassName="auto-config-terminal-view"
+                            text={[
+                              "Starting temporary repository analysis chat...",
+                              `Repo: ${project.repo_url}`,
+                              `Branch: ${project.default_branch || "auto-detect"}`,
+                              "",
+                              "Waiting for recommendation output."
+                            ].join("\r\n")}
+                          />
+                        </>
                       ) : null}
                       {isFailed ? (
                         <div className="meta build-error">
