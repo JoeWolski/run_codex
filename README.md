@@ -96,10 +96,6 @@ These paths are resolved from each chat's checked-out target project workspace, 
    - Main place for `developer_instructions` and project-doc auto-load settings.
 2. `AGENTS.md` (in the checked-out project repo)
    - Primary repo-specific instruction file loaded by the agent.
-3. `README.md` (in the checked-out project repo)
-   - Fallback context/instructions file loaded when present.
-4. `docs/repo-map.md`, `docs/agent-mcp.md`, `docs/agent-setup.md` (in the checked-out project repo)
-   - Additional context files listed in the default config for auto-loading.
 
 If you run with a custom `--config-file`, that file replaces the default `config/agent.config.toml` source for chat setup/context.
 
