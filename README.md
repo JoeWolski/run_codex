@@ -89,6 +89,7 @@ No manual artifact wiring is required for `agent_hub` chats:
 ## Chat Agent Prompt Context (Major Files)
 
 For day-to-day prompt/setup changes, these are the main files that assemble most of the chat agent context:
+These paths are resolved from each chat's checked-out target project workspace, not from the Agent Hub repository itself (unless Agent Hub is the target project).
 
 1. `config/agent.config.toml`
    - Primary config passed into chats as `~/.codex/config.toml`.
