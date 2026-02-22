@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Iterable, Tuple
 
@@ -59,13 +60,77 @@ def _codex_default_runtime_flags(*, no_alt_screen: bool, explicit_args: Iterable
     return flags
 
 
-def _claude_default_runtime_flags(explicit_args: Iterable[str]) -> list[str]:
+def _normalize_string_list(raw_value: object) -> list[str]:
+    if not isinstance(raw_value, list):
+        return []
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in raw_value:
+        value = str(item).strip()
+        if not value or value in seen:
+            continue
+        cleaned.append(value)
+        seen.add(value)
+    return cleaned
+
+
+def _shared_prompt_context_from_config(config_path: Path) -> str:
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+
+    try:
+        parsed = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError as exc:
+        click.echo(
+            f"Warning: unable to parse shared prompt context from {config_path}: {exc}",
+            err=True,
+        )
+        return ""
+
+    if not isinstance(parsed, dict):
+        return ""
+
+    developer_instructions = str(parsed.get("developer_instructions") or "").strip()
+    project_doc_auto_load = parsed.get("project_doc_auto_load") is True
+    doc_fallback_files = _normalize_string_list(parsed.get("project_doc_fallback_filenames"))
+    doc_extra_files = _normalize_string_list(parsed.get("project_doc_auto_load_extra_filenames"))
+    project_doc_max_bytes = parsed.get("project_doc_max_bytes")
+
+    sections: list[str] = []
+    if developer_instructions:
+        sections.append(developer_instructions)
+
+    project_doc_files = _normalize_string_list(doc_fallback_files + doc_extra_files)
+    if project_doc_auto_load and project_doc_files:
+        doc_lines = "\n".join(f"- {name}" for name in project_doc_files)
+        doc_section = (
+            "Before you start coding, read these repository files if they exist and treat them as authoritative context:\n"
+            f"{doc_lines}"
+        )
+        if isinstance(project_doc_max_bytes, int) and project_doc_max_bytes > 0:
+            doc_section += f"\nLimit each file read to about {project_doc_max_bytes} bytes."
+        sections.append(doc_section)
+
+    return "\n\n".join(section for section in sections if section)
+
+
+def _claude_default_runtime_flags(*, explicit_args: Iterable[str], shared_prompt_context: str) -> list[str]:
     parsed_args = [str(arg) for arg in explicit_args]
-    if _has_cli_option(parsed_args, long_option="--dangerously-skip-permissions"):
-        return []
-    if _has_cli_option(parsed_args, long_option="--permission-mode"):
-        return []
-    return ["--permission-mode", DEFAULT_CLAUDE_PERMISSION_MODE]
+    flags: list[str] = []
+    if not _has_cli_option(parsed_args, long_option="--dangerously-skip-permissions") and not _has_cli_option(
+        parsed_args, long_option="--permission-mode"
+    ):
+        flags.extend(["--permission-mode", DEFAULT_CLAUDE_PERMISSION_MODE])
+
+    has_explicit_system_prompt = _has_cli_option(parsed_args, long_option="--append-system-prompt") or _has_cli_option(
+        parsed_args, long_option="--append-system-prompt-file"
+    )
+    if shared_prompt_context and not has_explicit_system_prompt:
+        flags.extend(["--append-system-prompt", shared_prompt_context])
+
+    return flags
 
 
 def _resume_shell_command(*, no_alt_screen: bool, agent_command: str, codex_runtime_flags: Iterable[str] = ()) -> str:
@@ -587,12 +652,20 @@ def main(
         no_alt_screen=no_alt_screen,
         explicit_args=explicit_container_args,
     )
+    shared_prompt_context = ""
+    if selected_agent_command == AGENT_PROVIDER_CLAUDE:
+        shared_prompt_context = _shared_prompt_context_from_config(config_path)
 
     command = [selected_agent_command]
     if selected_agent_command == DEFAULT_AGENT_COMMAND:
         command.extend(codex_runtime_flags)
     elif selected_agent_command == AGENT_PROVIDER_CLAUDE:
-        command.extend(_claude_default_runtime_flags(explicit_container_args))
+        command.extend(
+            _claude_default_runtime_flags(
+                explicit_args=explicit_container_args,
+                shared_prompt_context=shared_prompt_context,
+            )
+        )
 
     if container_args:
         command.extend(explicit_container_args)
