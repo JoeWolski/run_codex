@@ -4,9 +4,13 @@ Local-first orchestration for containerized coding-agent workflows.
 
 ## Demo Video
 
-<video src="docs/demo/agent_hub_demo_dark_trimmed_3s_cropped_webpage.mp4" controls muted playsinline width="980"></video>
+<div align="center">
+  <a href="docs/demo/agent_hub_demo_dark_trimmed_3s_cropped_webpage.mp4">
+    <img src="docs/demo/agent_hub_demo_dark_trimmed_3s_cropped_webpage_preview.gif" width="980px" alt="Agent Hub demo preview"/>
+  </a>
+</div>
 
-[Download demo video](docs/demo/agent_hub_demo_dark_trimmed_3s_cropped_webpage.mp4)
+[Download full demo video](docs/demo/agent_hub_demo_dark_trimmed_3s_cropped_webpage.mp4)
 
 ## Why this
 
