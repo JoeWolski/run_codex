@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import codecs
 import fcntl
 import hashlib
+import html
 import hmac
 import json
 import logging
@@ -24,6 +26,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, Thread, current_thread
 from typing import Any, Callable
@@ -39,12 +42,27 @@ STATE_FILE_NAME = "state.json"
 SECRETS_DIR_NAME = "secrets"
 OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
-GITHUB_SSH_PRIVATE_KEY_FILE_NAME = "github_ssh_key"
-GITHUB_SSH_KNOWN_HOSTS_FILE_NAME = "github_known_hosts"
-GITHUB_SSH_PRIVATE_KEY_MAX_CHARS = 256_000
-GITHUB_SSH_KNOWN_HOSTS_MAX_CHARS = 256_000
+GITHUB_APP_INSTALLATION_FILE_NAME = "github_app_installation.json"
+GITHUB_GIT_CREDENTIALS_FILE_NAME = "github_credentials"
+GITHUB_APP_SETTINGS_FILE_NAME = "github_app_settings.json"
+GITHUB_APP_ID_ENV = "AGENT_HUB_GITHUB_APP_ID"
+GITHUB_APP_PRIVATE_KEY_ENV = "AGENT_HUB_GITHUB_APP_PRIVATE_KEY"
+GITHUB_APP_PRIVATE_KEY_FILE_ENV = "AGENT_HUB_GITHUB_APP_PRIVATE_KEY_FILE"
+GITHUB_APP_SLUG_ENV = "AGENT_HUB_GITHUB_APP_SLUG"
+GITHUB_APP_WEB_BASE_URL_ENV = "AGENT_HUB_GITHUB_WEB_BASE_URL"
+GITHUB_APP_API_BASE_URL_ENV = "AGENT_HUB_GITHUB_API_BASE_URL"
+GITHUB_APP_DEFAULT_WEB_BASE_URL = "https://github.com"
+GITHUB_APP_DEFAULT_API_BASE_URL = "https://api.github.com"
+GITHUB_APP_JWT_LIFETIME_SECONDS = 9 * 60
+GITHUB_APP_TOKEN_REFRESH_SKEW_SECONDS = 120
+GITHUB_APP_API_TIMEOUT_SECONDS = 8.0
+GITHUB_APP_PRIVATE_KEY_MAX_CHARS = 256_000
+GITHUB_APP_SETUP_SESSION_LIFETIME_SECONDS = 60 * 60
+GITHUB_APP_DEFAULT_NAME = "Agent Hub"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
+ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_HUB_ARTIFACT_BASE_URL"
+DEFAULT_ARTIFACT_PUBLISH_HOST = "host.docker.internal"
 TERMINAL_QUEUE_MAX = 256
 HUB_EVENT_QUEUE_MAX = 512
 OPENAI_ACCOUNT_LOGIN_LOG_MAX_CHARS = 16_000
@@ -91,17 +109,13 @@ OSC_COLOR_RESPONSE_FRAGMENT_RE = re.compile(
 )
 RESERVED_ENV_VAR_KEYS = {"OPENAI_API_KEY"}
 HUB_LOG_LEVEL_CHOICES = ("critical", "error", "warning", "info", "debug")
-GITHUB_SSH_PRIVATE_KEY_BEGIN_MARKERS = {
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
+GITHUB_APP_PRIVATE_KEY_BEGIN_MARKERS = {
     "-----BEGIN RSA PRIVATE KEY-----",
-    "-----BEGIN EC PRIVATE KEY-----",
-    "-----BEGIN DSA PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----",
 }
-GITHUB_SSH_PRIVATE_KEY_END_MARKERS = {
-    "-----END OPENSSH PRIVATE KEY-----",
+GITHUB_APP_PRIVATE_KEY_END_MARKERS = {
     "-----END RSA PRIVATE KEY-----",
-    "-----END EC PRIVATE KEY-----",
-    "-----END DSA PRIVATE KEY-----",
+    "-----END PRIVATE KEY-----",
 }
 
 EVENT_TYPE_SNAPSHOT = "snapshot"
@@ -138,6 +152,33 @@ class OpenAIAccountLoginSession:
     exit_code: int | None = None
     completed_at: str = ""
     error: str = ""
+
+
+@dataclass(frozen=True)
+class GithubAppSettings:
+    app_id: str
+    app_slug: str
+    private_key: str
+    web_base_url: str
+    api_base_url: str
+
+
+@dataclass
+class GithubAppSetupSession:
+    id: str
+    state: str
+    status: str
+    form_action: str
+    manifest: dict[str, Any]
+    callback_url: str
+    web_base_url: str
+    api_base_url: str
+    started_at: str
+    expires_at: str
+    completed_at: str = ""
+    error: str = ""
+    app_id: str = ""
+    app_slug: str = ""
 
 
 def _repo_root() -> Path:
@@ -193,6 +234,25 @@ def _uvicorn_log_level(hub_level: str) -> str:
     if normalized == "debug":
         return "info"
     return normalized
+
+
+def _default_artifact_publish_base_url(hub_port: int) -> str:
+    return f"http://{DEFAULT_ARTIFACT_PUBLISH_HOST}:{int(hub_port or DEFAULT_PORT)}"
+
+
+def _resolve_artifact_publish_base_url(value: Any, hub_port: int) -> str:
+    raw_value = str(value or os.environ.get(ARTIFACT_PUBLISH_BASE_URL_ENV, "")).strip()
+    if not raw_value:
+        return _default_artifact_publish_base_url(hub_port)
+
+    parsed = urllib.parse.urlsplit(raw_value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(
+            "Invalid artifact publish base URL. "
+            "Expected an absolute http(s) URL reachable from agent_cli containers."
+        )
+    normalized_path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
 
 
 def _run_cli_command(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -293,13 +353,121 @@ yarn build</pre>
     """
 
 
-def _run(cmd: list[str], cwd: Path | None = None, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+def _github_app_setup_callback_page(success: bool, message: str, app_slug: str = "") -> str:
+    status_text = "connected" if success else "failed"
+    status_class = "ok" if success else "error"
+    title_text = "GitHub Connected" if success else "GitHub Connection Failed"
+    escaped_message = html.escape(message or "")
+    escaped_slug = html.escape(app_slug or "")
+    slug_line = f"<p class=\"meta\">App slug: <code>{escaped_slug}</code></p>" if escaped_slug else ""
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title_text}</title>
+  <style>
+    body {{
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      margin: 0;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }}
+    .panel {{
+      width: min(560px, 100%);
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      background: #111827;
+      padding: 1.25rem;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.4);
+    }}
+    .status {{
+      display: inline-block;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      padding: 0.2rem 0.5rem;
+      border-radius: 999px;
+      margin-bottom: 0.75rem;
+    }}
+    .status.ok {{
+      background: rgba(34, 197, 94, 0.2);
+      color: #86efac;
+    }}
+    .status.error {{
+      background: rgba(239, 68, 68, 0.2);
+      color: #fca5a5;
+    }}
+    p {{
+      margin: 0.5rem 0 0;
+      line-height: 1.45;
+    }}
+    .meta {{
+      color: #94a3b8;
+      font-size: 0.95rem;
+    }}
+    .actions {{
+      margin-top: 1rem;
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }}
+    a, button {{
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #1e293b;
+      color: #e2e8f0;
+      padding: 0.5rem 0.9rem;
+      text-decoration: none;
+      cursor: pointer;
+      font: inherit;
+    }}
+    a:hover, button:hover {{
+      border-color: #475569;
+    }}
+  </style>
+</head>
+<body>
+  <section class="panel">
+    <div class="status {status_class}">{status_text}</div>
+    <h1>{title_text}</h1>
+    <p>{escaped_message}</p>
+    {slug_line}
+    <div class="actions">
+      <a href="/">Return to Agent Hub</a>
+      <button type="button" onclick="window.close()">Close window</button>
+    </div>
+  </section>
+</body>
+</html>
+    """
+
+
+def _run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    capture: bool = False,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    resolved_env: dict[str, str] | None = None
+    if env:
+        resolved_env = dict(os.environ)
+        for key, value in env.items():
+            resolved_env[str(key)] = str(value)
     result = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
         check=False,
         text=True,
         capture_output=capture,
+        env=resolved_env,
     )
     if check and result.returncode != 0:
         message = (result.stdout or "") + (result.stderr or "")
@@ -350,8 +518,14 @@ def _run_logged(
     return completed
 
 
-def _run_for_repo(cmd: list[str], repo_dir: Path, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
-    return _run(["git", "-C", str(repo_dir), *cmd], capture=capture, check=check)
+def _run_for_repo(
+    cmd: list[str],
+    repo_dir: Path,
+    capture: bool = False,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    return _run(["git", "-C", str(repo_dir), *cmd], capture=capture, check=check, env=env)
 
 
 def _iso_now() -> str:
@@ -404,63 +578,214 @@ def _normalize_openai_api_key(raw_value: Any) -> str:
     return value
 
 
-def _normalize_github_ssh_private_key(raw_value: Any) -> str:
+def _normalize_github_app_id(raw_value: Any) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        raise ValueError(f"{GITHUB_APP_ID_ENV} is required.")
+    if not value.isdigit():
+        raise ValueError(f"{GITHUB_APP_ID_ENV} must be numeric.")
+    return value
+
+
+def _normalize_github_app_slug(raw_value: Any) -> str:
+    value = str(raw_value or "").strip().lower()
+    if not value:
+        raise ValueError(f"{GITHUB_APP_SLUG_ENV} is required.")
+    if not re.fullmatch(r"[a-z0-9-]+", value):
+        raise ValueError(f"{GITHUB_APP_SLUG_ENV} must contain only lowercase letters, numbers, and hyphens.")
+    return value
+
+
+def _normalize_github_app_private_key(raw_value: Any) -> str:
     value = str(raw_value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not value:
-        raise HTTPException(status_code=400, detail="private_key is required.")
+        raise ValueError("GitHub App private key is required.")
     if "\x00" in value:
-        raise HTTPException(status_code=400, detail="private_key contains invalid binary data.")
-    if len(value) > GITHUB_SSH_PRIVATE_KEY_MAX_CHARS:
-        raise HTTPException(status_code=400, detail="private_key is too large.")
+        raise ValueError("GitHub App private key contains invalid binary data.")
+    if len(value) > GITHUB_APP_PRIVATE_KEY_MAX_CHARS:
+        raise ValueError("GitHub App private key is too large.")
 
     lines = [line.rstrip() for line in value.split("\n")]
     if not lines:
-        raise HTTPException(status_code=400, detail="private_key is required.")
+        raise ValueError("GitHub App private key is required.")
     begin_marker = lines[0].strip()
     end_marker = lines[-1].strip()
-    if begin_marker not in GITHUB_SSH_PRIVATE_KEY_BEGIN_MARKERS or end_marker not in GITHUB_SSH_PRIVATE_KEY_END_MARKERS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "private_key must be a PEM-style SSH private key "
-                "(for example, BEGIN/END OPENSSH PRIVATE KEY)."
-            ),
-        )
+    if begin_marker not in GITHUB_APP_PRIVATE_KEY_BEGIN_MARKERS or end_marker not in GITHUB_APP_PRIVATE_KEY_END_MARKERS:
+        raise ValueError("GitHub App private key must be a PEM key (BEGIN/END PRIVATE KEY).")
     if begin_marker.replace("BEGIN", "END") != end_marker:
-        raise HTTPException(status_code=400, detail="private_key BEGIN/END markers do not match.")
+        raise ValueError("GitHub App private key BEGIN/END markers do not match.")
     if len(lines) < 3:
-        raise HTTPException(status_code=400, detail="private_key appears incomplete.")
+        raise ValueError("GitHub App private key appears incomplete.")
 
     return "\n".join(lines) + "\n"
 
 
-def _normalize_github_known_hosts(raw_value: Any) -> str:
-    if raw_value is None:
-        return ""
-    value = str(raw_value).replace("\r\n", "\n").replace("\r", "\n")
-    if "\x00" in value:
-        raise HTTPException(status_code=400, detail="known_hosts contains invalid binary data.")
-    if len(value) > GITHUB_SSH_KNOWN_HOSTS_MAX_CHARS:
-        raise HTTPException(status_code=400, detail="known_hosts is too large.")
-
-    lines = [line.rstrip() for line in value.split("\n")]
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines:
-        return ""
-    return "\n".join(lines) + "\n"
+def _normalize_absolute_http_base_url(raw_value: Any, field_name: str) -> str:
+    value = str(raw_value or "").strip()
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field_name} must be an absolute http(s) URL.")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
-def _known_hosts_entry_count(text: str) -> int:
-    count = 0
-    for line in str(text or "").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        count += 1
-    return count
+def _github_app_env_config_present() -> bool:
+    return any(
+        str(os.environ.get(name, "")).strip()
+        for name in (
+            GITHUB_APP_ID_ENV,
+            GITHUB_APP_SLUG_ENV,
+            GITHUB_APP_PRIVATE_KEY_ENV,
+            GITHUB_APP_PRIVATE_KEY_FILE_ENV,
+        )
+    )
+
+
+def _normalize_github_app_settings_payload(payload: dict[str, Any], source_name: str) -> GithubAppSettings:
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source_name} must be a JSON object.")
+
+    app_id_raw = payload.get("app_id")
+    if app_id_raw is None:
+        app_id_raw = payload.get("id")
+
+    slug_raw = payload.get("app_slug")
+    if slug_raw is None:
+        slug_raw = payload.get("slug")
+
+    key_raw = payload.get("private_key")
+    if key_raw is None:
+        key_raw = payload.get("pem")
+
+    web_base_raw = payload.get("web_base_url")
+    if web_base_raw is None or not str(web_base_raw).strip():
+        web_base_raw = GITHUB_APP_DEFAULT_WEB_BASE_URL
+
+    api_base_raw = payload.get("api_base_url")
+    if api_base_raw is None or not str(api_base_raw).strip():
+        api_base_raw = GITHUB_APP_DEFAULT_API_BASE_URL
+
+    try:
+        app_id = _normalize_github_app_id(app_id_raw)
+        app_slug = _normalize_github_app_slug(slug_raw)
+        private_key = _normalize_github_app_private_key(key_raw)
+        web_base = _normalize_absolute_http_base_url(web_base_raw, "web_base_url")
+        api_base = _normalize_absolute_http_base_url(api_base_raw, "api_base_url")
+    except ValueError as exc:
+        raise ValueError(f"{source_name}: {exc}") from exc
+
+    return GithubAppSettings(
+        app_id=app_id,
+        app_slug=app_slug,
+        private_key=private_key,
+        web_base_url=web_base,
+        api_base_url=api_base,
+    )
+
+
+def _load_github_app_settings_from_env() -> tuple[GithubAppSettings | None, str]:
+    app_id_raw = str(os.environ.get(GITHUB_APP_ID_ENV, "")).strip()
+    slug_raw = str(os.environ.get(GITHUB_APP_SLUG_ENV, "")).strip()
+    key_raw = str(os.environ.get(GITHUB_APP_PRIVATE_KEY_ENV, "")).strip()
+    key_file_raw = str(os.environ.get(GITHUB_APP_PRIVATE_KEY_FILE_ENV, "")).strip()
+
+    if not app_id_raw and not slug_raw and not key_raw and not key_file_raw:
+        return None, ""
+    if bool(key_raw) and bool(key_file_raw):
+        return None, (
+            f"Set only one of {GITHUB_APP_PRIVATE_KEY_ENV} or {GITHUB_APP_PRIVATE_KEY_FILE_ENV}, not both."
+        )
+
+    if key_file_raw and not key_raw:
+        key_path = Path(key_file_raw).expanduser()
+        if not key_path.is_file():
+            return None, f"{GITHUB_APP_PRIVATE_KEY_FILE_ENV} does not point to a readable file."
+        try:
+            key_raw = key_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return None, f"Failed to read {GITHUB_APP_PRIVATE_KEY_FILE_ENV}."
+
+    try:
+        settings = _normalize_github_app_settings_payload(
+            {
+                "app_id": app_id_raw,
+                "app_slug": slug_raw,
+                "private_key": key_raw,
+                "web_base_url": str(
+                    os.environ.get(GITHUB_APP_WEB_BASE_URL_ENV, GITHUB_APP_DEFAULT_WEB_BASE_URL)
+                ).strip(),
+                "api_base_url": str(
+                    os.environ.get(GITHUB_APP_API_BASE_URL_ENV, GITHUB_APP_DEFAULT_API_BASE_URL)
+                ).strip(),
+            },
+            "GitHub App environment variables",
+        )
+    except ValueError as exc:
+        return None, str(exc)
+    return settings, ""
+
+
+def _load_github_app_settings_from_file(path: Path) -> tuple[GithubAppSettings | None, str]:
+    if not path.exists():
+        return None, ""
+    payload = _read_json_if_exists(path)
+    if payload is None:
+        return None, f"Stored GitHub App settings file is invalid: {path}"
+    try:
+        settings = _normalize_github_app_settings_payload(payload, "Stored GitHub App settings")
+    except ValueError as exc:
+        return None, str(exc)
+    return settings, ""
+
+
+def _normalize_github_installation_id(raw_value: Any) -> int:
+    value = str(raw_value or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="installation_id is required.")
+    if not value.isdigit():
+        raise HTTPException(status_code=400, detail="installation_id must be a positive integer.")
+    installation_id = int(value)
+    if installation_id <= 0:
+        raise HTTPException(status_code=400, detail="installation_id must be a positive integer.")
+    return installation_id
+
+
+def _base64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _github_sign_rs256(private_key_pem: str, message: bytes) -> bytes:
+    temp_key_path = Path("/tmp") / f".agent_hub_github_app_key_{uuid.uuid4().hex}.pem"
+    _write_private_env_file(temp_key_path, private_key_pem)
+    try:
+        result = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", str(temp_key_path)],
+            input=message,
+            capture_output=True,
+            check=False,
+        )
+    finally:
+        try:
+            temp_key_path.unlink()
+        except OSError:
+            pass
+
+    if result.returncode != 0:
+        raise HTTPException(status_code=500, detail="Failed to sign GitHub App JWT with OpenSSL.")
+    return result.stdout
+
+
+def _github_app_jwt(settings: GithubAppSettings) -> str:
+    now = int(time.time())
+    payload = {
+        "iat": now - 30,
+        "exp": now + GITHUB_APP_JWT_LIFETIME_SECONDS,
+        "iss": settings.app_id,
+    }
+    header_segment = _base64url_encode(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
+    payload_segment = _base64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signing_input = f"{header_segment}.{payload_segment}".encode("ascii")
+    signature_segment = _base64url_encode(_github_sign_rs256(settings.private_key, signing_input))
+    return f"{header_segment}.{payload_segment}.{signature_segment}"
 
 
 def _read_text_if_exists(path: Path) -> str:
@@ -472,16 +797,60 @@ def _read_text_if_exists(path: Path) -> str:
         return ""
 
 
-def _private_file_fingerprint(path: Path) -> str:
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
     if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _iso_to_unix_seconds(value: str) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
+    except ValueError:
+        return 0
+
+
+def _github_api_error_message(body_text: str) -> str:
+    text = str(body_text or "").strip()
+    if not text:
         return ""
     try:
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return _short_summary(text, max_words=24, max_chars=200)
+    if not isinstance(payload, dict):
         return ""
-    if not digest:
+    message = str(payload.get("message") or "").strip()
+    return _short_summary(message, max_words=24, max_chars=200) if message else ""
+
+
+def _git_repo_host(repo_url: str) -> str:
+    candidate = str(repo_url or "").strip()
+    if not candidate:
         return ""
-    return f"sha256:{digest[:16]}"
+
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.hostname:
+        return parsed.hostname.lower()
+
+    scp_match = re.match(r"^[^@]+@([^:]+):", candidate)
+    if scp_match:
+        return scp_match.group(1).lower().strip()
+
+    ssh_match = re.match(r"^ssh://[^@]+@([^/]+)/", candidate)
+    if ssh_match:
+        return ssh_match.group(1).lower().strip()
+
+    return ""
 
 
 def _openai_error_message(body_text: str) -> str:
@@ -1448,8 +1817,8 @@ def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
     )
 
 
-def _detect_default_branch(repo_url: str) -> str:
-    result = _run(["git", "ls-remote", "--symref", repo_url, "HEAD"], capture=True, check=False)
+def _detect_default_branch(repo_url: str, env: dict[str, str] | None = None) -> str:
+    result = _run(["git", "ls-remote", "--symref", repo_url, "HEAD"], capture=True, check=False, env=env)
     if result.returncode != 0:
         return "master"
 
@@ -1605,6 +1974,7 @@ class HubState:
         config_file: Path,
         hub_host: str = DEFAULT_HOST,
         hub_port: int = DEFAULT_PORT,
+        artifact_publish_base_url: str | None = None,
     ):
         self.local_user = _default_user()
         self.local_group = _default_group_name()
@@ -1621,14 +1991,21 @@ class HubState:
         self.config_file = config_file
         self.hub_host = str(hub_host or DEFAULT_HOST)
         self.hub_port = int(hub_port or DEFAULT_PORT)
+        self.artifact_publish_base_url = _resolve_artifact_publish_base_url(
+            artifact_publish_base_url,
+            self.hub_port,
+        )
         self.state_file = self.data_dir / STATE_FILE_NAME
         self.project_dir = self.data_dir / "projects"
         self.chat_dir = self.data_dir / "chats"
         self.log_dir = self.data_dir / "logs"
         self.secrets_dir = self.data_dir / SECRETS_DIR_NAME
         self.openai_credentials_file = self.secrets_dir / OPENAI_CREDENTIALS_FILE_NAME
-        self.github_ssh_private_key_file = self.secrets_dir / GITHUB_SSH_PRIVATE_KEY_FILE_NAME
-        self.github_ssh_known_hosts_file = self.secrets_dir / GITHUB_SSH_KNOWN_HOSTS_FILE_NAME
+        self.github_app_settings_file = self.secrets_dir / GITHUB_APP_SETTINGS_FILE_NAME
+        self.github_app_installation_file = self.secrets_dir / GITHUB_APP_INSTALLATION_FILE_NAME
+        self.github_git_credentials_file = self.secrets_dir / GITHUB_GIT_CREDENTIALS_FILE_NAME
+        self.github_app_settings: GithubAppSettings | None = None
+        self.github_app_settings_error = ""
         self._lock = Lock()
         self._runtime_lock = Lock()
         self._events_lock = Lock()
@@ -1644,6 +2021,10 @@ class HubState:
         self._chat_title_job_lock = Lock()
         self._chat_title_jobs_inflight: set[str] = set()
         self._chat_title_jobs_pending: set[str] = set()
+        self._github_token_lock = Lock()
+        self._github_token_cache: dict[str, Any] = {}
+        self._github_setup_lock = Lock()
+        self._github_setup_session: GithubAppSetupSession | None = None
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
@@ -1654,6 +2035,7 @@ class HubState:
             os.chmod(self.secrets_dir, 0o700)
         except OSError:
             pass
+        self._reload_github_app_settings()
 
     def load(self) -> dict[str, Any]:
         with self._lock:
@@ -1793,16 +2175,482 @@ class HubState:
     def _openai_credentials_arg(self) -> list[str]:
         return ["--credentials-file", str(self.openai_credentials_file)]
 
-    def _github_ssh_args(self) -> list[str]:
-        if not self.github_ssh_private_key_file.exists():
+    def _reload_github_app_settings(self) -> None:
+        env_settings, env_error = _load_github_app_settings_from_env()
+        if env_settings is not None or env_error:
+            self.github_app_settings = env_settings
+            self.github_app_settings_error = env_error
+            return
+
+        file_settings, file_error = _load_github_app_settings_from_file(self.github_app_settings_file)
+        self.github_app_settings = file_settings
+        self.github_app_settings_error = file_error
+
+    def _github_setup_base_urls(self) -> tuple[str, str]:
+        if self.github_app_settings is not None:
+            return self.github_app_settings.web_base_url, self.github_app_settings.api_base_url
+
+        web_base_raw = str(os.environ.get(GITHUB_APP_WEB_BASE_URL_ENV, GITHUB_APP_DEFAULT_WEB_BASE_URL)).strip()
+        api_base_raw = str(os.environ.get(GITHUB_APP_API_BASE_URL_ENV, GITHUB_APP_DEFAULT_API_BASE_URL)).strip()
+        try:
+            web_base = _normalize_absolute_http_base_url(web_base_raw, GITHUB_APP_WEB_BASE_URL_ENV)
+            api_base = _normalize_absolute_http_base_url(api_base_raw, GITHUB_APP_API_BASE_URL_ENV)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return web_base, api_base
+
+    @staticmethod
+    def _github_setup_session_is_active(status: str) -> bool:
+        return status in {"awaiting_user", "converting"}
+
+    @staticmethod
+    def _github_setup_session_is_expired(expires_at: str) -> bool:
+        expires_unix = _iso_to_unix_seconds(expires_at)
+        return expires_unix > 0 and int(time.time()) >= expires_unix
+
+    def _github_setup_session_locked(self) -> GithubAppSetupSession | None:
+        session = self._github_setup_session
+        if session is None:
+            return None
+        if (
+            self._github_setup_session_is_active(session.status)
+            and self._github_setup_session_is_expired(session.expires_at)
+        ):
+            session.status = "expired"
+            session.completed_at = session.completed_at or _iso_now()
+            if not session.error:
+                session.error = "GitHub setup session expired. Click Connect to GitHub and try again."
+        return session
+
+    def _github_setup_session_payload_locked(self) -> dict[str, Any]:
+        session = self._github_setup_session_locked()
+        if session is None:
+            return {
+                "active": False,
+                "id": "",
+                "status": "idle",
+                "form_action": "",
+                "manifest": {},
+                "started_at": "",
+                "expires_at": "",
+                "completed_at": "",
+                "error": "",
+                "app_id": "",
+                "app_slug": "",
+                "callback_url": "",
+            }
+        return {
+            "active": self._github_setup_session_is_active(session.status),
+            "id": session.id,
+            "status": session.status,
+            "form_action": session.form_action,
+            "manifest": dict(session.manifest),
+            "started_at": session.started_at,
+            "expires_at": session.expires_at,
+            "completed_at": session.completed_at,
+            "error": session.error,
+            "app_id": session.app_id,
+            "app_slug": session.app_slug,
+            "callback_url": session.callback_url,
+        }
+
+    def github_app_setup_session_payload(self) -> dict[str, Any]:
+        with self._github_setup_lock:
+            return self._github_setup_session_payload_locked()
+
+    def start_github_app_setup(self, origin: Any) -> dict[str, Any]:
+        if _github_app_env_config_present():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "GitHub App setup from Settings is disabled while AGENT_HUB_GITHUB_APP_* environment variables are set."
+                ),
+            )
+
+        origin_text = str(origin or "").strip()
+        if not origin_text:
+            raise HTTPException(status_code=400, detail="origin is required.")
+        try:
+            normalized_origin = _normalize_absolute_http_base_url(origin_text, "origin")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        parsed_origin = urllib.parse.urlsplit(normalized_origin)
+        callback_url = urllib.parse.urlunsplit(
+            (parsed_origin.scheme, parsed_origin.netloc, "/api/settings/auth/github/app/setup/callback", "", "")
+        )
+        web_base_url, api_base_url = self._github_setup_base_urls()
+        setup_state = secrets.token_urlsafe(24)
+        form_action = f"{web_base_url}/settings/apps/new?state={urllib.parse.quote(setup_state, safe='')}"
+        app_name = f"{GITHUB_APP_DEFAULT_NAME}-{secrets.token_hex(2)}"
+        manifest = {
+            "name": app_name,
+            "url": normalized_origin,
+            "redirect_url": callback_url,
+            "callback_urls": [callback_url],
+            "public": False,
+            "request_oauth_on_install": False,
+            "hook_attributes": {
+                "url": callback_url,
+                "active": False,
+            },
+            "default_permissions": {
+                "contents": "write",
+                "pull_requests": "write",
+                "issues": "write",
+            },
+            "default_events": [],
+        }
+        now = time.time()
+        with self._github_setup_lock:
+            self._github_setup_session = GithubAppSetupSession(
+                id=uuid.uuid4().hex,
+                state=setup_state,
+                status="awaiting_user",
+                form_action=form_action,
+                manifest=manifest,
+                callback_url=callback_url,
+                web_base_url=web_base_url,
+                api_base_url=api_base_url,
+                started_at=_iso_from_timestamp(now),
+                expires_at=_iso_from_timestamp(now + GITHUB_APP_SETUP_SESSION_LIFETIME_SECONDS),
+            )
+            return self._github_setup_session_payload_locked()
+
+    def _github_manifest_conversion_request(self, api_base_url: str, code: str) -> dict[str, Any]:
+        path_code = urllib.parse.quote(str(code or "").strip(), safe="")
+        request = urllib.request.Request(
+            f"{api_base_url}/app-manifests/{path_code}/conversions",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "agent-hub",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=GITHUB_APP_API_TIMEOUT_SECONDS) as response:
+                status = int(response.getcode() or 0)
+                body_text = response.read().decode("utf-8", errors="ignore")
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code or 0)
+            body_text = exc.read().decode("utf-8", errors="ignore")
+            message = _github_api_error_message(body_text)
+            detail = f"GitHub app setup conversion failed with status {status}."
+            if message:
+                detail = f"{detail} {message}"
+            raise HTTPException(status_code=400 if status < 500 else 502, detail=detail) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="GitHub app setup conversion failed due to a network error.",
+            ) from exc
+
+        if not (200 <= status < 300):
+            message = _github_api_error_message(body_text)
+            detail = f"GitHub app setup conversion failed with status {status}."
+            if message:
+                detail = f"{detail} {message}"
+            raise HTTPException(status_code=400 if status < 500 else 502, detail=detail)
+
+        try:
+            payload = json.loads(body_text) if body_text else {}
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="GitHub returned invalid app setup conversion data.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="GitHub returned invalid app setup conversion data.")
+        return payload
+
+    def _clear_github_installation_state(self) -> None:
+        for path in [self.github_app_installation_file, self.github_git_credentials_file]:
+            if not path.exists():
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail="Failed to clear previous GitHub installation state.") from exc
+        with self._github_token_lock:
+            self._github_token_cache = {}
+
+    def _persist_github_app_settings(self, settings: GithubAppSettings) -> None:
+        payload = {
+            "app_id": settings.app_id,
+            "app_slug": settings.app_slug,
+            "private_key": settings.private_key,
+            "web_base_url": settings.web_base_url,
+            "api_base_url": settings.api_base_url,
+            "configured_at": _iso_now(),
+        }
+        _write_private_env_file(self.github_app_settings_file, json.dumps(payload, indent=2) + "\n")
+        self.github_app_settings = settings
+        self.github_app_settings_error = ""
+        with self._github_token_lock:
+            self._github_token_cache = {}
+
+    def complete_github_app_setup(self, code: Any, state_value: Any) -> dict[str, Any]:
+        code_text = str(code or "").strip()
+        if not code_text:
+            raise HTTPException(status_code=400, detail="Missing GitHub setup code.")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", code_text):
+            raise HTTPException(status_code=400, detail="Invalid GitHub setup code.")
+
+        state_text = str(state_value or "").strip()
+        if not state_text:
+            raise HTTPException(status_code=400, detail="Missing GitHub setup state.")
+
+        with self._github_setup_lock:
+            session = self._github_setup_session_locked()
+            if session is None:
+                raise HTTPException(status_code=400, detail="No GitHub setup session is active.")
+            if session.status == "completed":
+                return self._github_setup_session_payload_locked()
+            if session.status in {"failed", "expired"}:
+                detail = session.error or "GitHub setup session is not active."
+                raise HTTPException(status_code=400, detail=detail)
+            if not hmac.compare_digest(session.state, state_text):
+                session.status = "failed"
+                session.completed_at = _iso_now()
+                session.error = "GitHub setup state did not match. Start setup again from Settings."
+                raise HTTPException(status_code=400, detail=session.error)
+            session.status = "converting"
+            session.error = ""
+            api_base_url = session.api_base_url
+            web_base_url = session.web_base_url
+
+        try:
+            conversion_payload = self._github_manifest_conversion_request(api_base_url, code_text)
+            resolved_settings = _normalize_github_app_settings_payload(
+                {
+                    "app_id": conversion_payload.get("id"),
+                    "app_slug": conversion_payload.get("slug"),
+                    "private_key": conversion_payload.get("pem"),
+                    "web_base_url": web_base_url,
+                    "api_base_url": api_base_url,
+                },
+                "GitHub app setup conversion",
+            )
+            self._persist_github_app_settings(resolved_settings)
+            self._clear_github_installation_state()
+        except ValueError as exc:
+            with self._github_setup_lock:
+                session = self._github_setup_session_locked()
+                if session is not None:
+                    session.status = "failed"
+                    session.completed_at = _iso_now()
+                    session.error = str(exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except HTTPException as exc:
+            with self._github_setup_lock:
+                session = self._github_setup_session_locked()
+                if session is not None and session.status != "completed":
+                    session.status = "failed"
+                    session.completed_at = _iso_now()
+                    session.error = str(exc.detail or "GitHub app setup failed.")
+            raise
+
+        with self._github_setup_lock:
+            session = self._github_setup_session_locked()
+            if session is not None:
+                session.status = "completed"
+                session.completed_at = _iso_now()
+                session.error = ""
+                session.app_id = resolved_settings.app_id
+                session.app_slug = resolved_settings.app_slug
+            payload = self._github_setup_session_payload_locked()
+
+        self._emit_auth_changed(reason="github_app_configured")
+        return payload
+
+    def fail_github_app_setup(self, message: Any, state_value: Any = "") -> dict[str, Any]:
+        detail = str(message or "").strip() or "GitHub app setup failed."
+        state_text = str(state_value or "").strip()
+        with self._github_setup_lock:
+            session = self._github_setup_session_locked()
+            if session is None:
+                return self._github_setup_session_payload_locked()
+            if state_text and not hmac.compare_digest(session.state, state_text):
+                return self._github_setup_session_payload_locked()
+            session.status = "failed"
+            session.completed_at = _iso_now()
+            session.error = detail
+            return self._github_setup_session_payload_locked()
+
+    def _github_provider_host(self) -> str:
+        if self.github_app_settings is None:
+            return "github.com"
+        parsed = urllib.parse.urlsplit(self.github_app_settings.web_base_url)
+        return (parsed.hostname or "github.com").lower()
+
+    def _github_install_url(self) -> str:
+        if self.github_app_settings is None:
+            return ""
+        return f"{self.github_app_settings.web_base_url}/apps/{self.github_app_settings.app_slug}/installations/new"
+
+    def _github_connected_installation(self) -> dict[str, Any] | None:
+        payload = _read_json_if_exists(self.github_app_installation_file)
+        if payload is None:
+            return None
+        installation_id = payload.get("installation_id")
+        if isinstance(installation_id, int) and installation_id > 0:
+            payload["installation_id"] = installation_id
+            return payload
+        return None
+
+    def _github_api_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        auth_mode: str = "app",
+        token: str = "",
+    ) -> tuple[int, str]:
+        settings = self.github_app_settings
+        if settings is None:
+            raise HTTPException(status_code=400, detail="GitHub App is not configured on this server.")
+        url = f"{settings.api_base_url}{path}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "agent-hub",
+        }
+        if auth_mode == "app":
+            headers["Authorization"] = f"Bearer {_github_app_jwt(settings)}"
+        elif auth_mode == "installation":
+            resolved_token = str(token or "").strip()
+            if not resolved_token:
+                raise HTTPException(status_code=500, detail="Missing GitHub installation token.")
+            headers["Authorization"] = f"Bearer {resolved_token}"
+        else:
+            raise HTTPException(status_code=500, detail=f"Unsupported GitHub auth mode: {auth_mode}")
+
+        raw_data = None
+        if body is not None:
+            raw_data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        request = urllib.request.Request(
+            url,
+            data=raw_data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=GITHUB_APP_API_TIMEOUT_SECONDS) as response:
+                status = int(response.getcode() or 0)
+                payload_text = response.read().decode("utf-8", errors="ignore")
+        except urllib.error.HTTPError as exc:
+            status = int(exc.code or 0)
+            payload_text = exc.read().decode("utf-8", errors="ignore")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise HTTPException(status_code=502, detail="GitHub API request failed due to a network error.") from exc
+
+        if 200 <= status < 300:
+            return status, payload_text
+
+        detail = f"GitHub API request failed with status {status}."
+        message = _github_api_error_message(payload_text)
+        if message:
+            detail = f"{detail} {message}"
+        raise HTTPException(status_code=502, detail=detail)
+
+    def _github_installation_token(self, installation_id: int, force_refresh: bool = False) -> tuple[str, str]:
+        now = int(time.time())
+        with self._github_token_lock:
+            cached_installation_id = int(self._github_token_cache.get("installation_id") or 0)
+            cached_token = str(self._github_token_cache.get("token") or "")
+            cached_expires_at = str(self._github_token_cache.get("expires_at") or "")
+            expires_unix = _iso_to_unix_seconds(cached_expires_at)
+            if (
+                not force_refresh
+                and cached_installation_id == installation_id
+                and cached_token
+                and expires_unix > now + GITHUB_APP_TOKEN_REFRESH_SKEW_SECONDS
+            ):
+                return cached_token, cached_expires_at
+
+        _status, payload_text = self._github_api_request(
+            "POST",
+            f"/app/installations/{installation_id}/access_tokens",
+            body={},
+            auth_mode="app",
+        )
+        try:
+            payload = json.loads(payload_text) if payload_text else {}
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="GitHub API returned invalid installation token payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="GitHub API returned invalid installation token payload.")
+
+        token = str(payload.get("token") or "").strip()
+        expires_at = str(payload.get("expires_at") or "").strip()
+        if not token or not expires_at:
+            raise HTTPException(status_code=502, detail="GitHub API did not return a valid installation token.")
+
+        with self._github_token_lock:
+            self._github_token_cache = {
+                "installation_id": installation_id,
+                "token": token,
+                "expires_at": expires_at,
+            }
+        return token, expires_at
+
+    def _refresh_github_git_credentials(self, installation_id: int, host: str) -> str:
+        token, _expires_at = self._github_installation_token(installation_id)
+        encoded_token = urllib.parse.quote(token, safe="")
+        _write_private_env_file(
+            self.github_git_credentials_file,
+            f"https://x-access-token:{encoded_token}@{host}\n",
+        )
+        return str(self.github_git_credentials_file)
+
+    @staticmethod
+    def _git_env_for_credentials_file(credential_file: str, host: str) -> dict[str, str]:
+        normalized_host = str(host or "github.com").strip().lower()
+        https_prefix = f"https://{normalized_host}/"
+        return {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": f"store --file={credential_file}",
+            "GIT_CONFIG_KEY_1": f"url.{https_prefix}.insteadOf",
+            "GIT_CONFIG_VALUE_1": f"git@{normalized_host}:",
+            "GIT_CONFIG_KEY_2": f"url.{https_prefix}.insteadOf",
+            "GIT_CONFIG_VALUE_2": f"ssh://git@{normalized_host}/",
+        }
+
+    def _github_repo_auth_context(self, repo_url: str) -> tuple[int, str] | None:
+        installation = self._github_connected_installation()
+        if installation is None:
+            return None
+        repo_host = _git_repo_host(repo_url)
+        provider_host = self._github_provider_host()
+        if not repo_host or repo_host != provider_host:
+            return None
+        installation_id = int(installation.get("installation_id") or 0)
+        if installation_id <= 0:
+            return None
+        return installation_id, provider_host
+
+    def _github_git_env_for_repo(self, repo_url: str) -> dict[str, str]:
+        context = self._github_repo_auth_context(repo_url)
+        if context is None:
+            return {}
+        installation_id, host = context
+        credentials_file = self._refresh_github_git_credentials(installation_id, host)
+        return self._git_env_for_credentials_file(credentials_file, host)
+
+    def _github_git_args_for_repo(self, repo_url: str) -> list[str]:
+        context = self._github_repo_auth_context(repo_url)
+        if context is None:
             return []
-        if not self.github_ssh_known_hosts_file.exists():
-            _write_private_env_file(self.github_ssh_known_hosts_file, "")
+        installation_id, host = context
+        credentials_file = self._refresh_github_git_credentials(installation_id, host)
         return [
-            "--git-ssh-key-file",
-            str(self.github_ssh_private_key_file),
-            "--git-ssh-known-hosts-file",
-            str(self.github_ssh_known_hosts_file),
+            "--git-credential-file",
+            credentials_file,
+            "--git-credential-host",
+            host,
         ]
 
     def _openai_account_payload(self) -> dict[str, Any]:
@@ -1839,31 +2687,31 @@ class HubState:
         }
 
     def github_auth_status(self) -> dict[str, Any]:
-        connected = self.github_ssh_private_key_file.exists()
-        key_updated_at = ""
-        key_hint = ""
-        if connected:
+        installation = self._github_connected_installation()
+        app_configured = self.github_app_settings is not None and not self.github_app_settings_error
+        updated_at = ""
+        if self.github_app_installation_file.exists():
             try:
-                key_updated_at = _iso_from_timestamp(self.github_ssh_private_key_file.stat().st_mtime)
+                updated_at = _iso_from_timestamp(self.github_app_installation_file.stat().st_mtime)
             except OSError:
-                key_updated_at = ""
-            key_hint = _private_file_fingerprint(self.github_ssh_private_key_file)
-
-        known_hosts_text = _read_text_if_exists(self.github_ssh_known_hosts_file)
-        known_hosts_updated_at = ""
-        if self.github_ssh_known_hosts_file.exists():
-            try:
-                known_hosts_updated_at = _iso_from_timestamp(self.github_ssh_known_hosts_file.stat().st_mtime)
-            except OSError:
-                known_hosts_updated_at = ""
-
+                updated_at = ""
+        installation_id = int(installation.get("installation_id") or 0) if installation else 0
+        account_login = str(installation.get("account_login") or "") if installation else ""
+        account_type = str(installation.get("account_type") or "") if installation else ""
+        repository_selection = str(installation.get("repository_selection") or "") if installation else ""
         return {
             "provider": "github",
-            "connected": connected,
-            "key_hint": key_hint,
-            "updated_at": key_updated_at,
-            "known_hosts_entries": _known_hosts_entry_count(known_hosts_text),
-            "known_hosts_updated_at": known_hosts_updated_at,
+            "connection_mode": "github_app",
+            "app_configured": app_configured,
+            "app_slug": self.github_app_settings.app_slug if self.github_app_settings else "",
+            "install_url": self._github_install_url(),
+            "connected": bool(installation and installation_id > 0 and app_configured),
+            "installation_id": installation_id,
+            "installation_account_login": account_login,
+            "installation_account_type": account_type,
+            "repository_selection": repository_selection,
+            "updated_at": updated_at,
+            "error": str(self.github_app_settings_error or ""),
         }
 
     def _chat_title_generation_auth(self) -> tuple[str, str]:
@@ -1998,33 +2846,117 @@ class HubState:
         LOGGER.debug("OpenAI API key disconnected.")
         return status
 
-    def connect_github_ssh(self, private_key: Any, known_hosts: Any = None) -> dict[str, Any]:
-        normalized_key = _normalize_github_ssh_private_key(private_key)
-
-        if known_hosts is None:
-            known_hosts_text = _read_text_if_exists(self.github_ssh_known_hosts_file)
-        else:
-            known_hosts_text = _normalize_github_known_hosts(known_hosts)
-
-        _write_private_env_file(self.github_ssh_private_key_file, normalized_key)
-        _write_private_env_file(self.github_ssh_known_hosts_file, known_hosts_text)
-
+    def list_github_app_installations(self) -> dict[str, Any]:
         status = self.github_auth_status()
-        self._emit_auth_changed(reason="github_ssh_connected")
-        LOGGER.debug("GitHub SSH credentials connected.")
+        if not status.get("app_configured"):
+            return {
+                "app_configured": False,
+                "app_slug": status.get("app_slug") or "",
+                "install_url": status.get("install_url") or "",
+                "installations": [],
+                "connected_installation_id": int(status.get("installation_id") or 0),
+                "error": str(status.get("error") or ""),
+            }
+
+        _response_status, payload_text = self._github_api_request(
+            "GET",
+            "/app/installations?per_page=100",
+            auth_mode="app",
+        )
+        try:
+            raw_payload = json.loads(payload_text) if payload_text else []
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="GitHub API returned invalid installation list payload.") from exc
+        if not isinstance(raw_payload, list):
+            raise HTTPException(status_code=502, detail="GitHub API returned invalid installation list payload.")
+
+        installations: list[dict[str, Any]] = []
+        for item in raw_payload:
+            if not isinstance(item, dict):
+                continue
+            installation_id = item.get("id")
+            if not isinstance(installation_id, int) or installation_id <= 0:
+                continue
+            account = item.get("account")
+            account_login = ""
+            account_type = ""
+            if isinstance(account, dict):
+                account_login = str(account.get("login") or "")
+                account_type = str(account.get("type") or "")
+            installations.append(
+                {
+                    "id": installation_id,
+                    "account_login": account_login,
+                    "account_type": account_type,
+                    "repository_selection": str(item.get("repository_selection") or ""),
+                    "updated_at": str(item.get("updated_at") or ""),
+                    "suspended_at": str(item.get("suspended_at") or ""),
+                }
+            )
+
+        return {
+            "app_configured": True,
+            "app_slug": status.get("app_slug") or "",
+            "install_url": status.get("install_url") or "",
+            "installations": installations,
+            "connected_installation_id": int(status.get("installation_id") or 0),
+            "error": "",
+        }
+
+    def connect_github_app(self, installation_id: Any) -> dict[str, Any]:
+        status = self.github_auth_status()
+        if not status.get("app_configured"):
+            detail = str(status.get("error") or "GitHub App is not configured on this server.")
+            raise HTTPException(status_code=400, detail=detail)
+
+        normalized_id = _normalize_github_installation_id(installation_id)
+        _response_status, installation_payload_text = self._github_api_request(
+            "GET",
+            f"/app/installations/{normalized_id}",
+            auth_mode="app",
+        )
+        try:
+            installation_payload = json.loads(installation_payload_text) if installation_payload_text else {}
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail="GitHub API returned invalid installation payload.") from exc
+        if not isinstance(installation_payload, dict):
+            raise HTTPException(status_code=502, detail="GitHub API returned invalid installation payload.")
+
+        account = installation_payload.get("account")
+        account_login = ""
+        account_type = ""
+        if isinstance(account, dict):
+            account_login = str(account.get("login") or "")
+            account_type = str(account.get("type") or "")
+        repository_selection = str(installation_payload.get("repository_selection") or "")
+
+        self._refresh_github_git_credentials(normalized_id, self._github_provider_host())
+        record = {
+            "installation_id": normalized_id,
+            "account_login": account_login,
+            "account_type": account_type,
+            "repository_selection": repository_selection,
+            "connected_at": _iso_now(),
+        }
+        _write_private_env_file(self.github_app_installation_file, json.dumps(record, indent=2) + "\n")
+        status = self.github_auth_status()
+        self._emit_auth_changed(reason="github_app_connected")
+        LOGGER.debug("GitHub App installation connected: id=%s account=%s", normalized_id, account_login)
         return status
 
-    def disconnect_github_ssh(self) -> dict[str, Any]:
-        for path in [self.github_ssh_private_key_file, self.github_ssh_known_hosts_file]:
+    def disconnect_github_app(self) -> dict[str, Any]:
+        for path in [self.github_app_installation_file, self.github_git_credentials_file]:
             if not path.exists():
                 continue
             try:
                 path.unlink()
             except OSError as exc:
-                raise HTTPException(status_code=500, detail="Failed to remove stored GitHub SSH credentials.") from exc
+                raise HTTPException(status_code=500, detail="Failed to remove stored GitHub App credentials.") from exc
+        with self._github_token_lock:
+            self._github_token_cache = {}
         status = self.github_auth_status()
-        self._emit_auth_changed(reason="github_ssh_disconnected")
-        LOGGER.debug("GitHub SSH credentials disconnected.")
+        self._emit_auth_changed(reason="github_app_disconnected")
+        LOGGER.debug("GitHub App disconnected.")
         return status
 
     def disconnect_openai_account(self) -> dict[str, Any]:
@@ -2372,7 +3304,7 @@ class HubState:
         return self.log_dir / f"project-{project_id}.log"
 
     def _chat_artifact_publish_url(self, chat_id: str) -> str:
-        return f"http://host.docker.internal:{self.hub_port}/api/chats/{chat_id}/artifacts/publish"
+        return f"{self.artifact_publish_base_url}/api/chats/{chat_id}/artifacts/publish"
 
     @staticmethod
     def _chat_artifact_download_url(chat_id: str, artifact_id: str) -> str:
@@ -2575,6 +3507,10 @@ class HubState:
         state = self.load()
         project_id = uuid.uuid4().hex
         project_name = name or _extract_repo_name(repo_url)
+        resolved_default_branch = str(default_branch or "").strip()
+        if not resolved_default_branch:
+            git_env = self._github_git_env_for_repo(repo_url)
+            resolved_default_branch = _detect_default_branch(repo_url, env=git_env)
         project = {
             "id": project_id,
             "name": project_name,
@@ -2585,7 +3521,7 @@ class HubState:
             "default_ro_mounts": default_ro_mounts or [],
             "default_rw_mounts": default_rw_mounts or [],
             "default_env_vars": default_env_vars or [],
-            "default_branch": default_branch or _detect_default_branch(repo_url),
+            "default_branch": resolved_default_branch,
             "created_at": _iso_now(),
             "updated_at": _iso_now(),
             "setup_snapshot_image": "",
@@ -3392,7 +4328,8 @@ class HubState:
             workspace = Path(str(chat.get("workspace") or self.chat_dir / chat["id"]))
 
         workspace.mkdir(parents=True, exist_ok=True)
-        _run(["git", "clone", project["repo_url"], str(workspace)], check=True)
+        git_env = self._github_git_env_for_repo(str(project.get("repo_url") or ""))
+        _run(["git", "clone", project["repo_url"], str(workspace)], check=True, env=git_env)
         return workspace
 
     def _ensure_project_clone(self, project: dict[str, Any]) -> Path:
@@ -3403,11 +4340,13 @@ class HubState:
                 return workspace
             self._delete_path(workspace)
         workspace.parent.mkdir(parents=True, exist_ok=True)
-        _run(["git", "clone", project["repo_url"], str(workspace)], check=True)
+        git_env = self._github_git_env_for_repo(str(project.get("repo_url") or ""))
+        _run(["git", "clone", project["repo_url"], str(workspace)], check=True, env=git_env)
         return workspace
 
     def _sync_checkout_to_remote(self, workspace: Path, project: dict[str, Any]) -> None:
-        _run_for_repo(["fetch", "--all", "--prune"], workspace, check=True)
+        git_env = self._github_git_env_for_repo(str(project.get("repo_url") or ""))
+        _run_for_repo(["fetch", "--all", "--prune"], workspace, check=True, env=git_env)
         branch = project.get("default_branch") or "master"
         remote_default = _git_default_remote_branch(workspace)
         if remote_default:
@@ -3517,7 +4456,7 @@ class HubState:
             "--no-alt-screen",
         ]
         cmd.extend(self._openai_credentials_arg())
-        cmd.extend(self._github_ssh_args())
+        cmd.extend(self._github_git_args_for_repo(str(project.get("repo_url") or "")))
         self._append_project_base_args(cmd, workspace, project)
         for mount in project.get("default_ro_mounts") or []:
             cmd.extend(["--ro-mount", mount])
@@ -3735,7 +4674,7 @@ class HubState:
             "--no-alt-screen",
         ]
         cmd.extend(self._openai_credentials_arg())
-        cmd.extend(self._github_ssh_args())
+        cmd.extend(self._github_git_args_for_repo(str(project.get("repo_url") or "")))
         self._append_project_base_args(cmd, workspace, project)
         cmd.extend(["--snapshot-image-tag", snapshot_tag])
         for mount in chat.get("ro_mounts") or []:
@@ -4483,6 +5422,12 @@ def _html_page() -> str:
 @click.option("--config-file", default=str(_default_config_file()), show_default=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Agent config file to pass into every chat.")
 @click.option("--host", default=DEFAULT_HOST, show_default=True)
 @click.option("--port", default=DEFAULT_PORT, show_default=True, type=int)
+@click.option(
+    "--artifact-publish-base-url",
+    default="",
+    show_default=f"env {ARTIFACT_PUBLISH_BASE_URL_ENV} or auto (http://{DEFAULT_ARTIFACT_PUBLISH_HOST}:<port>)",
+    help="Base URL reachable from agent_cli containers for artifact publish requests.",
+)
 @click.option("--frontend-build/--no-frontend-build", default=True, show_default=True, help="Automatically build the React frontend before starting the server.")
 @click.option("--clean-start", is_flag=True, default=False, help="Clear hub chat artifacts and cached setup images before serving.")
 @click.option(
@@ -4498,6 +5443,7 @@ def main(
     config_file: Path,
     host: str,
     port: int,
+    artifact_publish_base_url: str,
     frontend_build: bool,
     clean_start: bool,
     log_level: str,
@@ -4511,7 +5457,17 @@ def main(
     if frontend_build:
         _ensure_frontend_built(data_dir)
 
-    state = HubState(data_dir=data_dir, config_file=config_file, hub_host=host, hub_port=port)
+    try:
+        state = HubState(
+            data_dir=data_dir,
+            config_file=config_file,
+            hub_host=host,
+            hub_port=port,
+            artifact_publish_base_url=artifact_publish_base_url,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    LOGGER.info("Artifact publish base URL: %s", state.artifact_publish_base_url)
     if clean_start:
         summary = state.clean_start()
         click.echo(
@@ -4619,16 +5575,69 @@ def main(
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        return {
-            "provider": state.connect_github_ssh(
-                payload.get("private_key"),
-                known_hosts=payload.get("known_hosts"),
+        return {"provider": state.connect_github_app(payload.get("installation_id"))}
+
+    @app.post("/api/settings/auth/github/app/setup/start")
+    async def api_start_github_app_setup(request: Request) -> dict[str, Any]:
+        origin = f"{request.url.scheme}://{request.url.netloc}"
+        raw_body = await request.body()
+        if raw_body:
+            try:
+                payload = json.loads(raw_body.decode("utf-8", errors="ignore"))
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+            if payload is not None and not isinstance(payload, dict):
+                raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+            if isinstance(payload, dict) and "origin" in payload:
+                origin = str(payload.get("origin") or "").strip()
+        return state.start_github_app_setup(origin=origin)
+
+    @app.get("/api/settings/auth/github/app/setup/session")
+    def api_github_app_setup_session() -> dict[str, Any]:
+        return state.github_app_setup_session_payload()
+
+    @app.get("/api/settings/auth/github/app/setup/callback", response_class=HTMLResponse)
+    def api_github_app_setup_callback(request: Request) -> HTMLResponse:
+        denied_error = str(request.query_params.get("error") or "").strip()
+        state_value = str(request.query_params.get("state") or "").strip()
+        if denied_error:
+            message = str(request.query_params.get("error_description") or denied_error).strip()
+            state.fail_github_app_setup(message=message or denied_error, state_value=state_value)
+            return HTMLResponse(
+                _github_app_setup_callback_page(
+                    success=False,
+                    message=message or "GitHub app setup was cancelled.",
+                ),
+                status_code=400,
             )
-        }
+
+        code = str(request.query_params.get("code") or "").strip()
+        try:
+            payload = state.complete_github_app_setup(code=code, state_value=state_value)
+            app_slug = str(payload.get("app_slug") or "")
+            return HTMLResponse(
+                _github_app_setup_callback_page(
+                    success=True,
+                    message="GitHub App setup completed. Return to Agent Hub and select the installation to connect.",
+                    app_slug=app_slug,
+                )
+            )
+        except HTTPException as exc:
+            return HTMLResponse(
+                _github_app_setup_callback_page(
+                    success=False,
+                    message=str(exc.detail or "GitHub app setup failed."),
+                ),
+                status_code=int(exc.status_code or 400),
+            )
 
     @app.post("/api/settings/auth/github/disconnect")
     def api_disconnect_github() -> dict[str, Any]:
-        return {"provider": state.disconnect_github_ssh()}
+        return {"provider": state.disconnect_github_app()}
+
+    @app.get("/api/settings/auth/github/installations")
+    def api_list_github_installations() -> dict[str, Any]:
+        return state.list_github_app_installations()
 
     @app.post("/api/settings/auth/openai/title-test")
     async def api_test_openai_chat_title_generation(request: Request) -> dict[str, Any]:

@@ -27,14 +27,24 @@ import agent_hub.server as hub_server
 import agent_cli.cli as image_cli
 
 
-TEST_GITHUB_PRIVATE_KEY = (
-    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
-    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAABAAACAQC7n7FQoZlFJdB4Y5Rmf+Pw\n"
-    "-----END OPENSSH PRIVATE KEY-----\n"
-)
-TEST_GITHUB_KNOWN_HOSTS = (
-    "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTestDataOnly0123456789AB\n"
-)
+TEST_GITHUB_INSTALLATION_ID = 424242
+TEST_GITHUB_INSTALLATION_PAYLOAD = {
+    "id": TEST_GITHUB_INSTALLATION_ID,
+    "account": {
+        "login": "acme-org",
+        "type": "Organization",
+    },
+    "repository_selection": "selected",
+}
+TEST_GITHUB_MANIFEST_CONVERSION_PAYLOAD = {
+    "id": 777777,
+    "slug": "agent-hub-configured-app",
+    "pem": (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDgManifestForTests\n"
+        "-----END PRIVATE KEY-----\n"
+    ),
+}
 
 
 class HubStateTests(unittest.TestCase):
@@ -43,6 +53,17 @@ class HubStateTests(unittest.TestCase):
         self.tmp_path = Path(self.tmp.name)
         self.config_file = self.tmp_path / "config.toml"
         self.config_file.write_text("model = 'test'\n", encoding="utf-8")
+        self.github_env_patcher = patch.dict(
+            os.environ,
+            {
+                hub_server.GITHUB_APP_ID_ENV: "",
+                hub_server.GITHUB_APP_SLUG_ENV: "",
+                hub_server.GITHUB_APP_PRIVATE_KEY_ENV: "",
+                hub_server.GITHUB_APP_PRIVATE_KEY_FILE_ENV: "",
+            },
+            clear=False,
+        )
+        self.github_env_patcher.start()
         self.snapshot_patcher = patch.object(
             hub_server.HubState,
             "_prepare_project_snapshot_for_project",
@@ -56,12 +77,51 @@ class HubStateTests(unittest.TestCase):
         )
         self.schedule_patcher.start()
         self.state = hub_server.HubState(self.tmp_path / "hub", self.config_file)
+        self.state.github_app_settings = hub_server.GithubAppSettings(
+            app_id="123456",
+            app_slug="agent-hub-tests",
+            private_key=(
+                "-----BEGIN PRIVATE KEY-----\n"
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDgFakeForTests\n"
+                "-----END PRIVATE KEY-----\n"
+            ),
+            web_base_url="https://github.com",
+            api_base_url="https://api.github.com",
+        )
+        self.state.github_app_settings_error = ""
         self.host_ro = self.tmp_path / "host_ro"
         self.host_rw = self.tmp_path / "host_rw"
         self.host_ro.mkdir(parents=True, exist_ok=True)
         self.host_rw.mkdir(parents=True, exist_ok=True)
 
+    def _connect_github_app(self) -> dict[str, object]:
+        with patch.object(
+            hub_server.HubState,
+            "_github_api_request",
+            return_value=(200, json.dumps(TEST_GITHUB_INSTALLATION_PAYLOAD)),
+        ), patch.object(
+            hub_server.HubState,
+            "_github_installation_token",
+            return_value=("ghs_test_installation_token", "2030-01-01T00:00:00Z"),
+        ):
+            status = self.state.connect_github_app(TEST_GITHUB_INSTALLATION_ID)
+        with self.state._github_token_lock:
+            self.state._github_token_cache = {
+                "installation_id": TEST_GITHUB_INSTALLATION_ID,
+                "token": "ghs_test_installation_token",
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+        return status
+
+    def _current_github_setup_state_token(self) -> str:
+        with self.state._github_setup_lock:
+            session = self.state._github_setup_session
+            self.assertIsNotNone(session)
+            assert session is not None
+            return str(session.state)
+
     def tearDown(self) -> None:
+        self.github_env_patcher.stop()
         self.snapshot_patcher.stop()
         self.schedule_patcher.stop()
         self.tmp.cleanup()
@@ -119,41 +179,143 @@ class HubStateTests(unittest.TestCase):
         verify_call.assert_not_called()
         self.assertTrue(saved["connected"])
 
-    def test_github_ssh_credentials_round_trip_status(self) -> None:
+    def test_github_app_credentials_round_trip_status(self) -> None:
         initial = self.state.github_auth_status()
         self.assertFalse(initial["connected"])
-        self.assertEqual(initial["key_hint"], "")
-        self.assertEqual(initial["known_hosts_entries"], 0)
+        self.assertTrue(initial["app_configured"])
+        self.assertEqual(initial["installation_id"], 0)
 
-        saved = self.state.connect_github_ssh(TEST_GITHUB_PRIVATE_KEY, known_hosts=TEST_GITHUB_KNOWN_HOSTS)
+        saved = self._connect_github_app()
         self.assertTrue(saved["connected"])
-        self.assertTrue(saved["key_hint"].startswith("sha256:"))
-        self.assertEqual(saved["known_hosts_entries"], 1)
+        self.assertEqual(saved["installation_id"], TEST_GITHUB_INSTALLATION_ID)
+        self.assertEqual(saved["installation_account_login"], "acme-org")
+        self.assertEqual(saved["installation_account_type"], "Organization")
+        self.assertEqual(saved["repository_selection"], "selected")
         self.assertTrue(saved["updated_at"])
-        self.assertTrue(saved["known_hosts_updated_at"])
-        self.assertTrue(self.state.github_ssh_private_key_file.exists())
-        self.assertTrue(self.state.github_ssh_known_hosts_file.exists())
+        self.assertTrue(self.state.github_app_installation_file.exists())
+        self.assertTrue(self.state.github_git_credentials_file.exists())
 
-        key_mode = self.state.github_ssh_private_key_file.stat().st_mode & 0o777
-        known_hosts_mode = self.state.github_ssh_known_hosts_file.stat().st_mode & 0o777
-        self.assertEqual(key_mode, 0o600)
-        self.assertEqual(known_hosts_mode, 0o600)
+        installation_mode = self.state.github_app_installation_file.stat().st_mode & 0o777
+        credentials_mode = self.state.github_git_credentials_file.stat().st_mode & 0o777
+        self.assertEqual(installation_mode, 0o600)
+        self.assertEqual(credentials_mode, 0o600)
 
         payload = self.state.auth_settings_payload()
         self.assertIn("providers", payload)
         self.assertIn("github", payload["providers"])
         self.assertTrue(payload["providers"]["github"]["connected"])
 
-        disconnected = self.state.disconnect_github_ssh()
+        disconnected = self.state.disconnect_github_app()
         self.assertFalse(disconnected["connected"])
-        self.assertFalse(self.state.github_ssh_private_key_file.exists())
-        self.assertFalse(self.state.github_ssh_known_hosts_file.exists())
+        self.assertFalse(self.state.github_app_installation_file.exists())
+        self.assertFalse(self.state.github_git_credentials_file.exists())
 
-    def test_connect_github_ssh_rejects_invalid_private_key(self) -> None:
+    def test_connect_github_app_rejects_invalid_installation_id(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
-            self.state.connect_github_ssh("invalid-key")
+            self.state.connect_github_app("invalid-installation")
         self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("private_key", str(ctx.exception.detail))
+        self.assertIn("installation_id", str(ctx.exception.detail))
+
+    def test_list_github_app_installations(self) -> None:
+        with patch.object(
+            hub_server.HubState,
+            "_github_api_request",
+            return_value=(200, json.dumps([TEST_GITHUB_INSTALLATION_PAYLOAD])),
+        ):
+            payload = self.state.list_github_app_installations()
+        self.assertTrue(payload["app_configured"])
+        self.assertEqual(payload["installations"][0]["id"], TEST_GITHUB_INSTALLATION_ID)
+        self.assertEqual(payload["installations"][0]["account_login"], "acme-org")
+
+    def test_reload_github_app_settings_reads_settings_file(self) -> None:
+        self.state.github_app_settings = None
+        self.state.github_app_settings_error = ""
+        self.state.github_app_settings_file.write_text(
+            json.dumps(
+                {
+                    "app_id": "999999",
+                    "app_slug": "agent-hub-file-config",
+                    "private_key": TEST_GITHUB_MANIFEST_CONVERSION_PAYLOAD["pem"],
+                    "web_base_url": "https://github.com",
+                    "api_base_url": "https://api.github.com",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.state._reload_github_app_settings()
+        self.assertIsNotNone(self.state.github_app_settings)
+        assert self.state.github_app_settings is not None
+        self.assertEqual(self.state.github_app_settings.app_id, "999999")
+        self.assertEqual(self.state.github_app_settings.app_slug, "agent-hub-file-config")
+        self.assertEqual(self.state.github_app_settings_error, "")
+
+    def test_start_github_app_setup_returns_manifest_payload(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                hub_server.GITHUB_APP_ID_ENV: "",
+                hub_server.GITHUB_APP_SLUG_ENV: "",
+                hub_server.GITHUB_APP_PRIVATE_KEY_ENV: "",
+                hub_server.GITHUB_APP_PRIVATE_KEY_FILE_ENV: "",
+            },
+            clear=False,
+        ):
+            payload = self.state.start_github_app_setup(origin="http://localhost:8765")
+        self.assertTrue(payload["active"])
+        self.assertEqual(payload["status"], "awaiting_user")
+        self.assertTrue(str(payload["form_action"]).startswith("https://github.com/settings/apps/new?state="))
+        self.assertEqual(payload["manifest"]["redirect_url"], "http://localhost:8765/api/settings/auth/github/app/setup/callback")
+        self.assertTrue(str(payload["manifest"]["name"]).startswith(hub_server.GITHUB_APP_DEFAULT_NAME))
+
+    def test_complete_github_app_setup_persists_settings(self) -> None:
+        self.state.start_github_app_setup(origin="http://localhost:8765")
+        state_token = self._current_github_setup_state_token()
+        with patch.object(
+            hub_server.HubState,
+            "_github_manifest_conversion_request",
+            return_value=TEST_GITHUB_MANIFEST_CONVERSION_PAYLOAD,
+        ):
+            payload = self.state.complete_github_app_setup(code="manifest-code-1", state_value=state_token)
+
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["app_slug"], "agent-hub-configured-app")
+        self.assertTrue(self.state.github_app_settings_file.exists())
+        stored = json.loads(self.state.github_app_settings_file.read_text(encoding="utf-8"))
+        self.assertEqual(stored["app_id"], "777777")
+        self.assertEqual(stored["app_slug"], "agent-hub-configured-app")
+        self.assertIn("configured_at", stored)
+        self.assertIsNotNone(self.state.github_app_settings)
+        assert self.state.github_app_settings is not None
+        self.assertEqual(self.state.github_app_settings.app_slug, "agent-hub-configured-app")
+        self.assertEqual(self.state.github_app_settings_error, "")
+
+    def test_complete_github_app_setup_rejects_invalid_state(self) -> None:
+        self.state.start_github_app_setup(origin="http://localhost:8765")
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.complete_github_app_setup(code="manifest-code-1", state_value="wrong-state")
+        self.assertEqual(ctx.exception.status_code, 400)
+        session_payload = self.state.github_app_setup_session_payload()
+        self.assertEqual(session_payload["status"], "failed")
+        self.assertIn("state", session_payload["error"])
+
+    def test_complete_github_app_setup_records_conversion_failure(self) -> None:
+        self.state.github_app_settings = None
+        self.state.github_app_settings_error = ""
+        self.state.start_github_app_setup(origin="http://localhost:8765")
+        state_token = self._current_github_setup_state_token()
+        with patch.object(
+            hub_server.HubState,
+            "_github_manifest_conversion_request",
+            side_effect=HTTPException(status_code=400, detail="Invalid manifest conversion code."),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                self.state.complete_github_app_setup(code="manifest-code-1", state_value=state_token)
+        self.assertEqual(ctx.exception.status_code, 400)
+        session_payload = self.state.github_app_setup_session_payload()
+        self.assertEqual(session_payload["status"], "failed")
+        self.assertIn("Invalid manifest conversion code.", session_payload["error"])
+        self.assertFalse(self.state.github_app_settings_file.exists())
+        self.assertIsNone(self.state.github_app_settings)
 
     def test_connect_openai_verify_failure_does_not_persist_key(self) -> None:
         with patch(
@@ -475,8 +637,58 @@ class HubStateTests(unittest.TestCase):
             hub_server._hash_artifact_publish_token("artifact-token-test"),
         )
 
-    def test_start_chat_passes_github_ssh_credentials_when_configured(self) -> None:
-        self.state.connect_github_ssh(TEST_GITHUB_PRIVATE_KEY, known_hosts=TEST_GITHUB_KNOWN_HOSTS)
+    def test_start_chat_passes_github_app_credentials_when_configured(self) -> None:
+        self._connect_github_app()
+        project = self.state.add_project(
+            repo_url="https://github.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertIn("--git-credential-file", cmd)
+        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        self.assertIn("--git-credential-host", cmd)
+        self.assertIn("github.com", cmd)
+    def test_start_chat_uses_configured_artifact_publish_base_url(self) -> None:
+        self.state.artifact_publish_base_url = "http://172.17.0.4:8765/hub"
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -520,11 +732,18 @@ class HubStateTests(unittest.TestCase):
         ):
             self.state.start_chat(chat["id"])
 
-        cmd = captured["cmd"]
-        self.assertIn("--git-ssh-key-file", cmd)
-        self.assertIn(str(self.state.github_ssh_private_key_file), cmd)
-        self.assertIn("--git-ssh-known-hosts-file", cmd)
-        self.assertIn(str(self.state.github_ssh_known_hosts_file), cmd)
+        self.assertIn(
+            f"AGENT_HUB_ARTIFACTS_URL=http://172.17.0.4:8765/hub/api/chats/{chat['id']}/artifacts/publish",
+            captured["cmd"],
+        )
+
+    def test_hub_state_rejects_invalid_artifact_publish_base_url(self) -> None:
+        with self.assertRaises(ValueError):
+            hub_server.HubState(
+                data_dir=self.tmp_path / "hub-invalid-artifacts-base",
+                config_file=self.config_file,
+                artifact_publish_base_url="host.docker.internal:8765",
+            )
 
     def test_start_chat_rejects_base_path_outside_workspace(self) -> None:
         project = self.state.add_project(
@@ -927,9 +1146,9 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("chat-snapshot", tags)
 
     def test_ensure_project_setup_snapshot_builds_once(self) -> None:
-        self.state.connect_github_ssh(TEST_GITHUB_PRIVATE_KEY, known_hosts=TEST_GITHUB_KNOWN_HOSTS)
+        self._connect_github_app()
         project = self.state.add_project(
-            repo_url="https://example.com/org/repo.git",
+            repo_url="https://github.com/org/repo.git",
             default_branch="main",
             setup_script="echo setup",
             base_image_mode="repo_path",
@@ -967,10 +1186,10 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--setup-script", cmd)
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
-        self.assertIn("--git-ssh-key-file", cmd)
-        self.assertIn(str(self.state.github_ssh_private_key_file), cmd)
-        self.assertIn("--git-ssh-known-hosts-file", cmd)
-        self.assertIn(str(self.state.github_ssh_known_hosts_file), cmd)
+        self.assertIn("--git-credential-file", cmd)
+        self.assertIn(str(self.state.github_git_credentials_file), cmd)
+        self.assertIn("--git-credential-host", cmd)
+        self.assertIn("github.com", cmd)
         self.assertIn("--no-alt-screen", cmd)
 
     def test_resize_terminal_sets_pty_size(self) -> None:
@@ -2560,17 +2779,18 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertNotIn(full_home_mount, run_cmd)
             self.assertIn(codex_mount, run_cmd)
 
-    def test_cli_mounts_git_ssh_credentials_and_sets_git_ssh_command(self) -> None:
+    def test_cli_mounts_git_credentials_and_sets_git_config_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
             project.mkdir(parents=True, exist_ok=True)
             config = tmp_path / "agent.config.toml"
             config.write_text("model = 'test'\n", encoding="utf-8")
-            key_file = tmp_path / "github_ssh_key"
-            known_hosts_file = tmp_path / "github_known_hosts"
-            key_file.write_text(TEST_GITHUB_PRIVATE_KEY, encoding="utf-8")
-            known_hosts_file.write_text(TEST_GITHUB_KNOWN_HOSTS, encoding="utf-8")
+            credential_file = tmp_path / "github_credentials"
+            credential_file.write_text(
+                "https://x-access-token:ghs_test_installation_token@github.com\n",
+                encoding="utf-8",
+            )
 
             commands: list[list[str]] = []
 
@@ -2593,10 +2813,10 @@ class CliEnvVarTests(unittest.TestCase):
                         str(project),
                         "--config-file",
                         str(config),
-                        "--git-ssh-key-file",
-                        str(key_file),
-                        "--git-ssh-known-hosts-file",
-                        str(known_hosts_file),
+                        "--git-credential-file",
+                        str(credential_file),
+                        "--git-credential-host",
+                        "github.com",
                     ],
                 )
 
@@ -2605,8 +2825,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
 
-            self.assertIn(f"{key_file.resolve()}:/tmp/agent_hub_git_ssh_key:ro", run_cmd)
-            self.assertIn(f"{known_hosts_file.resolve()}:/tmp/agent_hub_git_known_hosts", run_cmd)
+            self.assertIn(f"{credential_file.resolve()}:/tmp/agent_hub_git_credentials:ro", run_cmd)
 
             env_values = [
                 run_cmd[index + 1]
@@ -2614,14 +2833,13 @@ class CliEnvVarTests(unittest.TestCase):
                 if part == "--env"
             ]
             self.assertIn("GIT_TERMINAL_PROMPT=0", env_values)
-            git_ssh_command = next(
-                (entry for entry in env_values if entry.startswith("GIT_SSH_COMMAND=")),
-                "",
-            )
-            self.assertIn("-o IdentitiesOnly=yes", git_ssh_command)
-            self.assertIn("-o BatchMode=yes", git_ssh_command)
-            self.assertIn("-o StrictHostKeyChecking=yes", git_ssh_command)
-            self.assertIn("-o UserKnownHostsFile=/tmp/agent_hub_git_known_hosts", git_ssh_command)
+            self.assertIn("GIT_CONFIG_COUNT=3", env_values)
+            self.assertIn("GIT_CONFIG_KEY_0=credential.helper", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_0=store --file=/tmp/agent_hub_git_credentials", env_values)
+            self.assertIn("GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_1=git@github.com:", env_values)
+            self.assertIn("GIT_CONFIG_KEY_2=url.https://github.com/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@github.com/", env_values)
 
     def test_cli_mounts_docker_socket_into_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2793,6 +3011,35 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, msg=result.output)
             kwargs = uvicorn_run.call_args.kwargs
             self.assertEqual(kwargs.get("log_level"), "info")
+
+    def test_agent_hub_main_passes_artifact_publish_base_url_to_state(self) -> None:
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "hub"
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            with patch("agent_hub.server.HubState") as state_cls, patch(
+                "agent_hub.server.uvicorn.run",
+                return_value=None,
+            ):
+                result = runner.invoke(
+                    hub_server.main,
+                    [
+                        "--data-dir",
+                        str(data_dir),
+                        "--config-file",
+                        str(config),
+                        "--no-frontend-build",
+                        "--artifact-publish-base-url",
+                        "http://172.17.0.4:8765/hub",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            kwargs = state_cls.call_args.kwargs
+            self.assertEqual(kwargs.get("artifact_publish_base_url"), "http://172.17.0.4:8765/hub")
 
 
 if __name__ == "__main__":

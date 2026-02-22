@@ -899,10 +899,59 @@ function normalizeGithubProviderStatus(rawProvider) {
   return {
     provider: "github",
     connected: Boolean(rawProvider?.connected),
-    keyHint: String(rawProvider?.key_hint || ""),
+    appConfigured: Boolean(rawProvider?.app_configured),
+    appSlug: String(rawProvider?.app_slug || ""),
+    installUrl: String(rawProvider?.install_url || ""),
+    installationId: Number(rawProvider?.installation_id || 0) || 0,
+    installationAccountLogin: String(rawProvider?.installation_account_login || ""),
+    installationAccountType: String(rawProvider?.installation_account_type || ""),
+    repositorySelection: String(rawProvider?.repository_selection || ""),
     updatedAt: String(rawProvider?.updated_at || ""),
-    knownHostsEntries: Number(rawProvider?.known_hosts_entries || 0) || 0,
-    knownHostsUpdatedAt: String(rawProvider?.known_hosts_updated_at || "")
+    error: String(rawProvider?.error || "")
+  };
+}
+
+function normalizeGithubInstallation(rawInstallation) {
+  return {
+    id: Number(rawInstallation?.id || 0) || 0,
+    accountLogin: String(rawInstallation?.account_login || ""),
+    accountType: String(rawInstallation?.account_type || ""),
+    repositorySelection: String(rawInstallation?.repository_selection || ""),
+    updatedAt: String(rawInstallation?.updated_at || ""),
+    suspendedAt: String(rawInstallation?.suspended_at || "")
+  };
+}
+
+function normalizeGithubAppSetupSession(rawSession) {
+  if (!rawSession || typeof rawSession !== "object") {
+    return {
+      active: false,
+      id: "",
+      status: "idle",
+      formAction: "",
+      manifest: null,
+      startedAt: "",
+      expiresAt: "",
+      completedAt: "",
+      error: "",
+      appId: "",
+      appSlug: "",
+      callbackUrl: ""
+    };
+  }
+  return {
+    active: Boolean(rawSession.active),
+    id: String(rawSession.id || ""),
+    status: String(rawSession.status || (rawSession.active ? "awaiting_user" : "idle")),
+    formAction: String(rawSession.form_action || ""),
+    manifest: rawSession.manifest && typeof rawSession.manifest === "object" ? rawSession.manifest : null,
+    startedAt: String(rawSession.started_at || ""),
+    expiresAt: String(rawSession.expires_at || ""),
+    completedAt: String(rawSession.completed_at || ""),
+    error: String(rawSession.error || ""),
+    appId: String(rawSession.app_id || ""),
+    appSlug: String(rawSession.app_slug || ""),
+    callbackUrl: String(rawSession.callback_url || "")
   };
 }
 
@@ -1123,14 +1172,20 @@ function HubApp() {
     normalizeGithubProviderStatus(null)
   );
   const [githubCardExpanded, setGithubCardExpanded] = useState(true);
-  const [githubDraftPrivateKey, setGithubDraftPrivateKey] = useState("");
-  const [githubDraftKnownHosts, setGithubDraftKnownHosts] = useState("");
+  const [githubInstallations, setGithubInstallations] = useState([]);
+  const [githubSelectedInstallationId, setGithubSelectedInstallationId] = useState("");
+  const [githubAppSetupSession, setGithubAppSetupSession] = useState(() =>
+    normalizeGithubAppSetupSession(null)
+  );
+  const [githubAppSetupStarting, setGithubAppSetupStarting] = useState(false);
+  const [githubInstallationsLoading, setGithubInstallationsLoading] = useState(false);
   const [githubSaving, setGithubSaving] = useState(false);
   const [githubDisconnecting, setGithubDisconnecting] = useState(false);
   const stateRefreshInFlightRef = useRef(false);
   const stateRefreshQueuedRef = useRef(false);
   const authRefreshInFlightRef = useRef(false);
   const authRefreshQueuedRef = useRef(false);
+  const githubSetupResolutionRef = useRef("");
 
   const applyStatePayload = useCallback((payload) => {
     setHubState(payload);
@@ -1188,9 +1243,78 @@ function HubApp() {
     const openAiProvider = authPayload?.providers?.openai;
     const githubProvider = authPayload?.providers?.github;
     setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
-    setGithubProviderStatus(normalizeGithubProviderStatus(githubProvider));
+    const normalizedGithubProvider = normalizeGithubProviderStatus(githubProvider);
+    setGithubProviderStatus(normalizedGithubProvider);
+    setGithubSelectedInstallationId((prev) => {
+      const connectedId = Number(normalizedGithubProvider.installationId || 0) || 0;
+      if (connectedId > 0) {
+        return String(connectedId);
+      }
+      return prev;
+    });
     setOpenAiAccountSession(normalizeOpenAiAccountSession(sessionPayload?.session));
     setOpenAiAuthLoaded(true);
+  }, []);
+
+  const refreshGithubInstallations = useCallback(async () => {
+    setGithubInstallationsLoading(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/github/installations");
+      const installations = Array.isArray(payload?.installations)
+        ? payload.installations
+          .map((item) => normalizeGithubInstallation(item))
+          .filter((item) => item.id > 0)
+        : [];
+      setGithubInstallations(installations);
+      const connectedInstallationId = Number(payload?.connected_installation_id || 0) || 0;
+      setGithubSelectedInstallationId((prev) => {
+        if (connectedInstallationId > 0) {
+          return String(connectedInstallationId);
+        }
+        const previousId = Number(prev || 0) || 0;
+        if (previousId > 0 && installations.some((item) => item.id === previousId)) {
+          return String(previousId);
+        }
+        return installations.length > 0 ? String(installations[0].id) : "";
+      });
+    } finally {
+      setGithubInstallationsLoading(false);
+    }
+  }, []);
+
+  const refreshGithubAppSetupSession = useCallback(async () => {
+    const payload = await fetchJson("/api/settings/auth/github/app/setup/session");
+    const normalized = normalizeGithubAppSetupSession(payload);
+    setGithubAppSetupSession(normalized);
+    return normalized;
+  }, []);
+
+  const submitGithubAppSetupForm = useCallback((session) => {
+    const formAction = String(session?.formAction || "").trim();
+    const manifest = session?.manifest;
+    if (!formAction || !manifest || typeof manifest !== "object") {
+      throw new Error("GitHub app setup session did not include a manifest form payload.");
+    }
+
+    const popupName = `github-app-setup-${session.id || Date.now()}`;
+    const popup = window.open("", popupName, "popup=yes,width=980,height=860");
+    const target = popup ? popupName : "_self";
+
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = formAction;
+    form.target = target;
+    form.style.display = "none";
+
+    const manifestInput = document.createElement("input");
+    manifestInput.type = "hidden";
+    manifestInput.name = "manifest";
+    manifestInput.value = JSON.stringify(manifest);
+    form.appendChild(manifestInput);
+
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
   }, []);
 
   const queueStateRefresh = useCallback(() => {
@@ -1323,7 +1447,15 @@ function HubApp() {
       const openAiProvider = authPayload?.providers?.openai;
       const githubProvider = authPayload?.providers?.github;
       setOpenAiProviderStatus(normalizeOpenAiProviderStatus(openAiProvider));
-      setGithubProviderStatus(normalizeGithubProviderStatus(githubProvider));
+      const normalizedGithubProvider = normalizeGithubProviderStatus(githubProvider);
+      setGithubProviderStatus(normalizedGithubProvider);
+      setGithubSelectedInstallationId((prev) => {
+        const connectedId = Number(normalizedGithubProvider.installationId || 0) || 0;
+        if (connectedId > 0) {
+          return String(connectedId);
+        }
+        return prev;
+      });
       setOpenAiAuthLoaded(true);
     };
 
@@ -1904,26 +2036,25 @@ function HubApp() {
     }
   }
 
-  async function handleConnectGithubSsh(event) {
+  async function handleConnectGithubApp(event) {
     event.preventDefault();
-    const privateKey = String(githubDraftPrivateKey || "").trim();
-    if (!privateKey) {
-      setError("GitHub SSH private key is required.");
+    const installationId = Number(githubSelectedInstallationId || 0) || 0;
+    if (installationId <= 0) {
+      setError("Choose a GitHub App installation first.");
       return;
     }
 
     setGithubSaving(true);
     try {
-      const knownHosts = String(githubDraftKnownHosts || "").trim();
       const payload = await fetchJson("/api/settings/auth/github/connect", {
         method: "POST",
         body: JSON.stringify({
-          private_key: privateKey,
-          ...(knownHosts ? { known_hosts: knownHosts } : {})
+          installation_id: installationId
         })
       });
       setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
-      setGithubDraftPrivateKey("");
+      setGithubSelectedInstallationId(String(installationId));
+      refreshGithubInstallations().catch(() => {});
       setError("");
     } catch (err) {
       setError(err.message || String(err));
@@ -1932,15 +2063,33 @@ function HubApp() {
     }
   }
 
-  async function handleDisconnectGithubSsh() {
+  async function handleStartGithubAppSetup() {
+    setGithubAppSetupStarting(true);
+    try {
+      const payload = await fetchJson("/api/settings/auth/github/app/setup/start", {
+        method: "POST",
+        body: JSON.stringify({ origin: window.location.origin })
+      });
+      const session = normalizeGithubAppSetupSession(payload);
+      setGithubAppSetupSession(session);
+      submitGithubAppSetupForm(session);
+      setGithubCardExpanded(true);
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setGithubAppSetupStarting(false);
+    }
+  }
+
+  async function handleDisconnectGithubApp() {
     setGithubDisconnecting(true);
     try {
       const payload = await fetchJson("/api/settings/auth/github/disconnect", {
         method: "POST"
       });
       setGithubProviderStatus(normalizeGithubProviderStatus(payload?.provider));
-      setGithubDraftPrivateKey("");
-      setGithubDraftKnownHosts("");
+      refreshGithubInstallations().catch(() => {});
       setGithubCardExpanded(true);
       setError("");
     } catch (err) {
@@ -2111,10 +2260,42 @@ function HubApp() {
       : openAiProviderStatus.connected
         ? "Connected with API key."
         : "Not connected yet. Expand this section and choose one login method.";
+  const githubAppConfigured = githubProviderStatus.appConfigured;
   const githubConnected = githubProviderStatus.connected;
-  const githubConnectionSummary = githubConnected
-    ? "SSH credentials are configured and will be mounted into chat containers."
-    : "Not connected yet. Add a GitHub SSH private key to enable git+ssh inside containers.";
+  const githubAppSetupStatus = githubAppSetupSession.status;
+  const githubAppSetupInFlight = githubAppSetupSession.active &&
+    ["awaiting_user", "converting"].includes(githubAppSetupStatus);
+  const githubAppSetupDone = githubAppSetupStatus === "completed";
+  const githubAppSetupError = githubAppSetupSession.error;
+  const githubAppSetupStatusLabel = githubAppSetupStatus === "awaiting_user"
+    ? "waiting for GitHub approval"
+    : githubAppSetupStatus === "converting"
+      ? "finishing setup"
+      : githubAppSetupStatus === "completed"
+        ? "completed"
+        : githubAppSetupStatus === "expired"
+          ? "expired"
+          : githubAppSetupStatus === "failed"
+            ? "failed"
+            : "idle";
+  const githubConnectionSummary = !githubAppConfigured
+    ? githubAppSetupInFlight
+      ? "GitHub App setup in progress. Complete the GitHub authorization window to continue."
+      : githubAppSetupDone
+        ? "GitHub App setup completed. Select an installation below to connect."
+        : githubProviderStatus.error || "GitHub App is not configured on this server."
+    : githubConnected
+      ? githubProviderStatus.installationAccountLogin
+        ? `Connected to installation #${githubProviderStatus.installationId} (${githubProviderStatus.installationAccountLogin}).`
+        : `Connected to installation #${githubProviderStatus.installationId}.`
+      : "Not connected yet. Install the app and select an installation to enable in-container git access.";
+  const selectedGithubInstallation = useMemo(() => {
+    const selectedId = Number(githubSelectedInstallationId || 0) || 0;
+    if (selectedId <= 0) {
+      return null;
+    }
+    return githubInstallations.find((item) => item.id === selectedId) || null;
+  }, [githubInstallations, githubSelectedInstallationId]);
 
   useEffect(() => {
     if (!openAiAuthLoaded || openAiCardExpansionInitialized) {
@@ -2129,6 +2310,77 @@ function HubApp() {
       setOpenAiCardExpanded(true);
     }
   }, [openAiAccountLoginInFlight]);
+
+  useEffect(() => {
+    if (!openAiAuthLoaded || !githubCardExpanded) {
+      return;
+    }
+    Promise.all([
+      refreshGithubInstallations(),
+      refreshGithubAppSetupSession()
+    ]).catch((err) => {
+      setError(err.message || String(err));
+    });
+  }, [openAiAuthLoaded, githubCardExpanded, refreshGithubInstallations, refreshGithubAppSetupSession]);
+
+  useEffect(() => {
+    if (!githubAppSetupInFlight) {
+      return undefined;
+    }
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const session = await refreshGithubAppSetupSession();
+        if (cancelled) {
+          return;
+        }
+        if (!session.active) {
+          return;
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err.message || String(err));
+        }
+      }
+    };
+
+    poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [githubAppSetupInFlight, refreshGithubAppSetupSession]);
+
+  useEffect(() => {
+    const resolutionKey = `${githubAppSetupSession.id}:${githubAppSetupStatus}:${githubAppSetupSession.completedAt}`;
+    if (!githubAppSetupSession.id || githubSetupResolutionRef.current === resolutionKey) {
+      return;
+    }
+    if (!["completed", "failed", "expired"].includes(githubAppSetupStatus)) {
+      return;
+    }
+    githubSetupResolutionRef.current = resolutionKey;
+
+    if (githubAppSetupStatus === "completed") {
+      refreshAuthSettings().catch(() => {});
+      refreshGithubInstallations().catch(() => {});
+      setError("");
+      return;
+    }
+
+    if (githubAppSetupError) {
+      setError(githubAppSetupError);
+    }
+  }, [
+    githubAppSetupSession.id,
+    githubAppSetupSession.completedAt,
+    githubAppSetupError,
+    githubAppSetupStatus,
+    refreshAuthSettings,
+    refreshGithubInstallations
+  ]);
 
   useEffect(() => {
     const normalized = normalizeThemePreference(themePreference);
@@ -3344,62 +3596,152 @@ function HubApp() {
               {githubCardExpanded ? (
                 <>
                   <p className="meta">
-                    Configure a dedicated GitHub SSH key for in-container git operations. These credentials are mounted only
-                    into chat and project setup containers.
+                    Connect with a GitHub App installation. Agent Hub mints short-lived installation tokens and injects git
+                    credentials for project sync plus in-container git commands.
                   </p>
-                  <div className="settings-auth-block">
-                    <h4>Connect with SSH key</h4>
-                    <ol className="settings-auth-help-list">
-                      <li>Create a dedicated GitHub deploy key or machine-user SSH key.</li>
-                      <li>Paste the private key below.</li>
-                      <li>
-                        Optional: paste known-host entries for strict host pinning. Leave blank to allow first-use host key
-                        trust with persistence.
-                      </li>
-                    </ol>
-                    <div className="meta">Saved key fingerprint: {githubProviderStatus.keyHint || "none"}</div>
-                    <div className="meta">Last updated: {formatTimestamp(githubProviderStatus.updatedAt)}</div>
-                    <div className="meta">
-                      Known hosts: {githubProviderStatus.knownHostsEntries} entr{githubProviderStatus.knownHostsEntries === 1 ? "y" : "ies"}
+                  {githubAppConfigured ? (
+                    <div className="settings-auth-block">
+                      <h4>Connect with GitHub App</h4>
+                      <div className="actions">
+                        {githubProviderStatus.installUrl ? (
+                          <a
+                            className="btn-secondary"
+                            href={githubProviderStatus.installUrl}
+                            target="_blank"
+                            rel="noreferrer noopener"
+                          >
+                            Open install page
+                          </a>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          disabled={githubInstallationsLoading || githubSaving || githubDisconnecting}
+                          onClick={() => {
+                            refreshGithubInstallations().catch((err) => {
+                              setError(err.message || String(err));
+                            });
+                          }}
+                        >
+                          {githubInstallationsLoading ? <SpinnerLabel text="Refreshing..." /> : "Refresh installations"}
+                        </button>
+                      </div>
+                      <form className="stack compact" onSubmit={handleConnectGithubApp}>
+                        <label htmlFor="github-installation-select" className="meta">Installation</label>
+                        <select
+                          id="github-installation-select"
+                          value={githubSelectedInstallationId}
+                          onChange={(event) => setGithubSelectedInstallationId(event.target.value)}
+                          disabled={githubInstallationsLoading || githubSaving || githubDisconnecting}
+                        >
+                          <option value="">
+                            {githubInstallationsLoading ? "Loading installations..." : "Select a GitHub App installation"}
+                          </option>
+                          {githubInstallations.map((installation) => (
+                            <option key={`github-installation-${installation.id}`} value={String(installation.id)}>
+                              {`#${installation.id} ${installation.accountLogin ? `- ${installation.accountLogin}` : ""}${
+                                installation.accountType ? ` (${installation.accountType})` : ""
+                              }`}
+                            </option>
+                          ))}
+                        </select>
+                        {selectedGithubInstallation ? (
+                          <div className="stack compact">
+                            <div className="meta">
+                              Selected account: {selectedGithubInstallation.accountLogin || "unknown"}
+                              {selectedGithubInstallation.accountType ? ` (${selectedGithubInstallation.accountType})` : ""}
+                            </div>
+                            <div className="meta">
+                              Repository scope: {selectedGithubInstallation.repositorySelection || "unknown"}
+                            </div>
+                            <div className="meta">
+                              Installation updated: {formatTimestamp(selectedGithubInstallation.updatedAt)}
+                            </div>
+                            {selectedGithubInstallation.suspendedAt ? (
+                              <div className="meta build-error">
+                                Suspended at: {formatTimestamp(selectedGithubInstallation.suspendedAt)}
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        <div className="actions">
+                          <button
+                            type="submit"
+                            className="btn-primary"
+                            disabled={
+                              !githubSelectedInstallationId || githubSaving || githubDisconnecting || githubInstallationsLoading
+                            }
+                          >
+                            {githubSaving ? <SpinnerLabel text="Connecting..." /> : "Connect installation"}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            disabled={!githubProviderStatus.connected || githubSaving || githubDisconnecting}
+                            onClick={handleDisconnectGithubApp}
+                          >
+                            {githubDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect"}
+                          </button>
+                        </div>
+                      </form>
+                      <div className="meta">
+                        Connected installation: {githubProviderStatus.installationId ? `#${githubProviderStatus.installationId}` : "none"}
+                        {githubProviderStatus.installationAccountLogin ? ` (${githubProviderStatus.installationAccountLogin})` : ""}
+                      </div>
+                      <div className="meta">Connection updated: {formatTimestamp(githubProviderStatus.updatedAt)}</div>
+                      <div className="meta">
+                        Repository scope: {githubProviderStatus.repositorySelection || "unknown"}
+                      </div>
                     </div>
-                    <div className="meta">Known hosts updated: {formatTimestamp(githubProviderStatus.knownHostsUpdatedAt)}</div>
-                    <form className="stack compact" onSubmit={handleConnectGithubSsh}>
-                      <textarea
-                        className="script-input settings-secret-textarea"
-                        value={githubDraftPrivateKey}
-                        onChange={(event) => setGithubDraftPrivateKey(event.target.value)}
-                        placeholder={"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"}
-                        spellCheck={false}
-                      />
-                      <textarea
-                        className="script-input settings-secret-textarea"
-                        value={githubDraftKnownHosts}
-                        onChange={(event) => setGithubDraftKnownHosts(event.target.value)}
-                        placeholder={"Optional known_hosts lines (example)\ngithub.com ssh-ed25519 AAAA..."}
-                        spellCheck={false}
-                      />
+                  ) : (
+                    <div className="settings-auth-block">
+                      <h4>Create and connect GitHub App</h4>
+                      <p className="meta">
+                        Click <strong>Connect to GitHub</strong>. Agent Hub creates a GitHub App via manifest flow and
+                        stores the credentials locally. No manual environment variables are required.
+                      </p>
                       <div className="actions">
                         <button
-                          type="submit"
+                          type="button"
                           className="btn-primary"
-                          disabled={githubSaving || githubDisconnecting}
+                          onClick={handleStartGithubAppSetup}
+                          disabled={githubAppSetupStarting || githubAppSetupInFlight}
                         >
-                          {githubSaving ? <SpinnerLabel text="Saving..." /> : "Connect SSH key"}
+                          {githubAppSetupStarting ? <SpinnerLabel text="Preparing..." /> : "Connect to GitHub"}
                         </button>
                         <button
                           type="button"
                           className="btn-secondary"
-                          disabled={!githubProviderStatus.connected || githubSaving || githubDisconnecting}
-                          onClick={handleDisconnectGithubSsh}
+                          onClick={() => {
+                            refreshGithubAppSetupSession().catch((err) => {
+                              setError(err.message || String(err));
+                            });
+                          }}
+                          disabled={githubAppSetupStarting}
                         >
-                          {githubDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect SSH key"}
+                          Refresh setup status
                         </button>
                       </div>
-                    </form>
-                  </div>
+                      <div className="meta">Setup status: {githubAppSetupStatusLabel}</div>
+                      {githubAppSetupSession.startedAt ? (
+                        <div className="meta">Setup started: {formatTimestamp(githubAppSetupSession.startedAt)}</div>
+                      ) : null}
+                      {githubAppSetupSession.expiresAt ? (
+                        <div className="meta">Setup expires: {formatTimestamp(githubAppSetupSession.expiresAt)}</div>
+                      ) : null}
+                      {githubAppSetupSession.appSlug ? (
+                        <div className="meta">Configured app: <code>{githubAppSetupSession.appSlug}</code></div>
+                      ) : null}
+                      {githubAppSetupError ? (
+                        <div className="meta build-error">{githubAppSetupError}</div>
+                      ) : null}
+                      {githubProviderStatus.error ? (
+                        <div className="meta build-error">{githubProviderStatus.error}</div>
+                      ) : null}
+                    </div>
+                  )}
                   <p className="meta settings-auth-note">
-                    SSH private keys are stored only on this machine with restricted permissions and are never returned by the
-                    API after save.
+                    GitHub access uses short-lived installation tokens. Agent Hub no longer requires manual SSH key entry.
                   </p>
                 </>
               ) : null}
