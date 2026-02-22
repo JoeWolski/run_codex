@@ -32,6 +32,8 @@ Do not bundle multiple files into zip/tar archives by default; publish original 
 Only publish archive files when the user explicitly requests an archive.
 Never push to the default branch unless the user explicitly asks in the current conversation.
 You may create, commit, and push feature branches as needed.
+Before creating a new branch, examine recent local branch history to identify established naming patterns.
+Name new branches to match the repository's existing branch naming practices.
 When presenting a completed feature, open a pull request and provide the pull request link.
 Pull request bodies must be valid markdown with these non-empty sections in this exact order:
 ## Summary
