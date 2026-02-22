@@ -1450,6 +1450,14 @@ button:focus-visible {
   margin-top: 4px;
 }
 
+.settings-auth-token-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  display: grid;
+  gap: 6px;
+}
+
 .settings-secret-textarea {
   min-height: 164px;
 }

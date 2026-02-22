@@ -28,7 +28,9 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
+from string import Template
 from threading import Lock, Thread, current_thread
 from typing import Any, Callable
 
@@ -64,6 +66,8 @@ GITHUB_APP_DEFAULT_NAME = "Agent Hub"
 GITHUB_CONNECTION_MODE_GITHUB_APP = "github_app"
 GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN = "personal_access_token"
 GITHUB_PERSONAL_ACCESS_TOKEN_MIN_CHARS = 20
+GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS = 120
+GITHUB_OWNER_SCOPE_MAX_ITEMS = 64
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_HUB_ARTIFACT_BASE_URL"
@@ -110,6 +114,11 @@ AUTO_CONFIG_NOT_CONNECTED_ERROR = (
 AUTO_CONFIG_MISSING_OUTPUT_ERROR = "Temporary auto-config chat did not return a JSON recommendation."
 AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid JSON."
 AUTO_CONFIG_NOTES_MAX_CHARS = 400
+PROMPTS_DIR_NAME = "prompts"
+PROMPT_CHAT_TITLE_OPENAI_SYSTEM_FILE = "chat_title_openai_system.md"
+PROMPT_CHAT_TITLE_OPENAI_USER_FILE = "chat_title_openai_user.md"
+PROMPT_CHAT_TITLE_CODEX_REQUEST_FILE = "chat_title_codex_request.md"
+PROMPT_AUTO_CONFIGURE_PROJECT_FILE = "auto_configure_project.md"
 ANSI_ESCAPE_RE = re.compile(
     r"\x1B(?:"
     r"[@-Z\\-_]"
@@ -209,6 +218,37 @@ def _repo_root() -> Path:
         if (parent / "pyproject.toml").exists():
             return parent
     return Path(__file__).resolve().parents[3]
+
+
+def _prompts_dir() -> Path:
+    return Path(__file__).resolve().parent / PROMPTS_DIR_NAME
+
+
+@lru_cache(maxsize=16)
+def _load_prompt_template(prompt_file_name: str) -> str:
+    file_name = str(prompt_file_name or "").strip()
+    if not file_name:
+        raise RuntimeError("Prompt template filename is required.")
+    path = _prompts_dir() / file_name
+    try:
+        template_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Prompt template not found: {path}") from exc
+    normalized = template_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        raise RuntimeError(f"Prompt template is empty: {path}")
+    return normalized
+
+
+def _render_prompt_template(prompt_file_name: str, **values: Any) -> str:
+    template = Template(_load_prompt_template(prompt_file_name))
+    try:
+        return template.substitute({key: str(value) for key, value in values.items()})
+    except KeyError as exc:
+        placeholder = str(exc.args[0] if exc.args else "")
+        raise RuntimeError(
+            f"Prompt template '{prompt_file_name}' is missing value for placeholder '{placeholder}'."
+        ) from exc
 
 
 def _default_data_dir() -> Path:
@@ -802,6 +842,42 @@ def _normalize_github_personal_access_token(raw_value: Any) -> str:
     return token
 
 
+def _normalize_github_owner_scope(raw_value: Any, field_name: str = "owner_scope") -> str:
+    value = str(raw_value or "").strip().lower()
+    if value.startswith("@"):
+        value = value[1:].strip().lower()
+    if not value:
+        raise HTTPException(status_code=400, detail=f"{field_name} must not be empty.")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", value):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+    return value
+
+
+def _normalize_github_owner_scopes(raw_value: Any, field_name: str = "owner_scopes") -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        candidates = re.split(r"[\s,]+", raw_value.strip())
+    elif isinstance(raw_value, list):
+        candidates = [str(item or "").strip() for item in raw_value]
+    else:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a string or array.")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        owner = _normalize_github_owner_scope(candidate, field_name=field_name)
+        if owner in seen:
+            continue
+        normalized.append(owner)
+        seen.add(owner)
+        if len(normalized) >= GITHUB_OWNER_SCOPE_MAX_ITEMS:
+            break
+    return normalized
+
+
 def _base64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
@@ -904,6 +980,35 @@ def _git_repo_host(repo_url: str) -> str:
         return ssh_match.group(1).lower().strip()
 
     return ""
+
+
+def _git_repo_owner(repo_url: str) -> str:
+    candidate = str(repo_url or "").strip()
+    if not candidate:
+        return ""
+
+    parsed = urllib.parse.urlsplit(candidate)
+    repo_path = ""
+    if parsed.hostname:
+        repo_path = str(parsed.path or "").strip()
+    else:
+        scp_match = re.match(r"^[^@]+@[^:]+:(.+)$", candidate)
+        if scp_match:
+            repo_path = str(scp_match.group(1) or "").strip()
+        else:
+            ssh_match = re.match(r"^ssh://[^@]+@[^/]+/(.+)$", candidate)
+            if ssh_match:
+                repo_path = str(ssh_match.group(1) or "").strip()
+    if not repo_path:
+        return ""
+
+    parts = [part for part in repo_path.split("/") if part]
+    if len(parts) < 2:
+        return ""
+    owner = str(parts[0] or "").strip().lower()
+    if not owner:
+        return ""
+    return owner
 
 
 def _openai_error_message(body_text: str) -> str:
@@ -1407,15 +1512,16 @@ def _openai_generate_chat_title(
     except ImportError as exc:
         raise RuntimeError("OpenAI Python SDK is not installed. Add dependency 'openai>=1.0'.") from exc
 
-    instructions = (
-        "You create a concise chat title for an engineering workstream.\n"
-        "Use the full user prompt history to infer the overarching purpose and goal of the chat.\n"
-        "Synthesize recurring objectives and refinements across prompts instead of parroting only the latest prompt.\n"
-        "Return a single plain-text title only. No quotes, no markdown, no prefix.\n"
-        f"Maximum length: {max_chars} characters.\n"
-        "Aim for the most informative task-focused title possible."
+    instructions = _render_prompt_template(
+        PROMPT_CHAT_TITLE_OPENAI_SYSTEM_FILE,
+        max_chars=max_chars,
     )
     prompt_lines = "\n".join(f"{index + 1}. {value}" for index, value in enumerate(prompts))
+    user_prompt = _render_prompt_template(
+        PROMPT_CHAT_TITLE_OPENAI_USER_FILE,
+        prompt_lines=prompt_lines,
+        max_chars=max_chars,
+    )
     try:
         client = OpenAI(api_key=api_key, timeout=timeout_seconds)
         completion = client.chat.completions.create(
@@ -1426,11 +1532,7 @@ def _openai_generate_chat_title(
                 {"role": "system", "content": instructions},
                 {
                     "role": "user",
-                    "content": (
-                        "User prompts listed oldest to newest:\n"
-                        f"{prompt_lines}\n\n"
-                        f"Generate one title (<= {max_chars} chars)."
-                    ),
+                    "content": user_prompt,
                 },
             ],
         )
@@ -1498,14 +1600,10 @@ def _codex_generate_chat_title(
 
     codex_exec = _resolve_codex_executable(host_codex_dir)
     prompt_lines = "\n".join(f"{index + 1}. {value}" for index, value in enumerate(prompts))
-    request_prompt = (
-        "Return exactly one concise title for an engineering chat.\n"
-        "Use the full user prompt history to summarize the overall purpose and goal of the chat.\n"
-        "Synthesize repeated objectives and refinements across prompts instead of echoing only the latest prompt.\n"
-        f"Maximum length: {max_chars} characters.\n"
-        "Return plain text only. No quotes. No markdown. No prefix.\n\n"
-        "User prompts listed oldest to newest:\n"
-        f"{prompt_lines}"
+    request_prompt = _render_prompt_template(
+        PROMPT_CHAT_TITLE_CODEX_REQUEST_FILE,
+        max_chars=max_chars,
+        prompt_lines=prompt_lines,
     )
     output_file = host_codex_dir / f"title-summary-{uuid.uuid4().hex}.txt"
 
@@ -2598,33 +2696,157 @@ class HubState:
             return payload
         return None
 
-    def _github_connected_personal_access_token(self) -> dict[str, Any] | None:
-        payload = _read_json_if_exists(self.github_personal_access_token_file)
-        if payload is None:
+    def _normalize_github_personal_access_token_record(
+        self,
+        raw_record: dict[str, Any],
+        default_host: str,
+        record_index: int,
+    ) -> dict[str, Any] | None:
+        token = str(raw_record.get("personal_access_token") or "").strip()
+        account_login = str(raw_record.get("account_login") or "").strip()
+        if not token or not account_login:
             return None
-        token = str(payload.get("personal_access_token") or "").strip()
-        account_login = str(payload.get("account_login") or "").strip()
-        host_value = payload.get("host") or self._github_provider_host()
+
+        host_value = raw_record.get("host") or default_host
         try:
             host = _normalize_github_credential_host(host_value, field_name="host")
         except HTTPException:
             return None
-        if not token or not account_login:
-            return None
-        account_name = str(payload.get("account_name") or account_login).strip() or account_login
-        account_email = str(payload.get("account_email") or "").strip()
+
+        account_name = str(raw_record.get("account_name") or account_login).strip() or account_login
+        account_email = str(raw_record.get("account_email") or "").strip()
         if not account_email:
             account_email = f"{account_login}@users.noreply.github.com"
-        git_user_name = str(payload.get("git_user_name") or account_name).strip() or account_name
-        git_user_email = str(payload.get("git_user_email") or account_email).strip() or account_email
-        payload["personal_access_token"] = token
-        payload["host"] = host
-        payload["account_login"] = account_login
-        payload["account_name"] = account_name
-        payload["account_email"] = account_email
-        payload["git_user_name"] = git_user_name
-        payload["git_user_email"] = git_user_email
-        return payload
+        git_user_name = str(raw_record.get("git_user_name") or account_name).strip() or account_name
+        git_user_email = str(raw_record.get("git_user_email") or account_email).strip() or account_email
+        account_id = str(raw_record.get("account_id") or "").strip()
+        token_scopes = str(raw_record.get("token_scopes") or "").strip()
+        verified_at = str(raw_record.get("verified_at") or "").strip()
+        connected_at = str(raw_record.get("connected_at") or "").strip()
+
+        owner_scopes_raw = raw_record.get("owner_scopes")
+        if owner_scopes_raw is None:
+            owner_scopes_raw = raw_record.get("owners")
+        try:
+            owner_scopes = _normalize_github_owner_scopes(owner_scopes_raw, field_name="owner_scopes")
+        except HTTPException:
+            owner_scopes = []
+
+        token_id = str(raw_record.get("token_id") or raw_record.get("id") or "").strip()
+        if token_id:
+            token_id = token_id[:GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS]
+        if not token_id:
+            token_seed = f"{host}|{account_login.lower()}|{','.join(owner_scopes)}|{record_index}"
+            token_id = hashlib.sha256(token_seed.encode("utf-8")).hexdigest()[:32]
+
+        return {
+            "token_id": token_id,
+            "host": host,
+            "personal_access_token": token,
+            "account_login": account_login,
+            "account_name": account_name,
+            "account_email": account_email,
+            "account_id": account_id,
+            "git_user_name": git_user_name,
+            "git_user_email": git_user_email,
+            "token_scopes": token_scopes,
+            "verified_at": verified_at,
+            "connected_at": connected_at,
+            "owner_scopes": owner_scopes,
+        }
+
+    def _github_connected_personal_access_tokens(self) -> list[dict[str, Any]]:
+        payload = _read_json_if_exists(self.github_personal_access_token_file)
+        if payload is None:
+            return []
+
+        raw_records: list[dict[str, Any]] = []
+        if isinstance(payload.get("tokens"), list):
+            raw_records = [item for item in payload["tokens"] if isinstance(item, dict)]
+        elif isinstance(payload, dict):
+            raw_records = [payload]
+
+        if not raw_records:
+            return []
+
+        default_host = self._github_provider_host()
+        records: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for index, raw_record in enumerate(raw_records):
+            normalized = self._normalize_github_personal_access_token_record(raw_record, default_host, index)
+            if normalized is None:
+                continue
+            token_id = str(normalized.get("token_id") or "").strip()
+            if token_id in seen_ids:
+                token_id = hashlib.sha256(f"{token_id}|{index}".encode("utf-8")).hexdigest()[:32]
+                normalized["token_id"] = token_id
+            seen_ids.add(token_id)
+            records.append(normalized)
+        return records
+
+    def _persist_github_personal_access_tokens(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            if self.github_personal_access_token_file.exists():
+                try:
+                    self.github_personal_access_token_file.unlink()
+                except OSError as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to clear stored GitHub personal access token credentials.",
+                    ) from exc
+            return
+
+        payload_records: list[dict[str, Any]] = []
+        for record in records:
+            payload_records.append(
+                {
+                    "token_id": str(record.get("token_id") or "").strip(),
+                    "host": str(record.get("host") or "").strip(),
+                    "personal_access_token": str(record.get("personal_access_token") or "").strip(),
+                    "account_login": str(record.get("account_login") or "").strip(),
+                    "account_name": str(record.get("account_name") or "").strip(),
+                    "account_email": str(record.get("account_email") or "").strip(),
+                    "account_id": str(record.get("account_id") or "").strip(),
+                    "git_user_name": str(record.get("git_user_name") or "").strip(),
+                    "git_user_email": str(record.get("git_user_email") or "").strip(),
+                    "token_scopes": str(record.get("token_scopes") or "").strip(),
+                    "verified_at": str(record.get("verified_at") or "").strip(),
+                    "connected_at": str(record.get("connected_at") or "").strip(),
+                    "owner_scopes": _normalize_github_owner_scopes(record.get("owner_scopes"), field_name="owner_scopes"),
+                }
+            )
+        payload = {"tokens": payload_records, "updated_at": _iso_now()}
+        _write_private_env_file(self.github_personal_access_token_file, json.dumps(payload, indent=2) + "\n")
+
+    def _github_connected_personal_access_token(self) -> dict[str, Any] | None:
+        tokens = self._github_connected_personal_access_tokens()
+        if not tokens:
+            return None
+        return dict(tokens[0])
+
+    def _github_personal_access_token_for_repo(self, repo_url: str) -> dict[str, Any] | None:
+        repo_host = _git_repo_host(repo_url)
+        if not repo_host:
+            return None
+        repo_owner = _git_repo_owner(repo_url)
+        matching_host = [
+            token
+            for token in self._github_connected_personal_access_tokens()
+            if str(token.get("host") or "").strip().lower() == repo_host
+        ]
+        if not matching_host:
+            return None
+
+        if repo_owner:
+            for token in matching_host:
+                owner_scopes = [str(item or "").strip().lower() for item in _empty_list(token.get("owner_scopes"))]
+                if repo_owner in owner_scopes:
+                    return token
+        for token in matching_host:
+            owner_scopes = [str(item or "").strip().lower() for item in _empty_list(token.get("owner_scopes"))]
+            if not owner_scopes:
+                return token
+        return matching_host[0]
 
     def _github_api_base_url_for_host(self, host: str) -> str:
         normalized_host = _normalize_github_credential_host(host, field_name="host")
@@ -2866,7 +3088,7 @@ class HubState:
         if not repo_host:
             return None
 
-        personal_access = self._github_connected_personal_access_token()
+        personal_access = self._github_personal_access_token_for_repo(repo_url)
         if personal_access is not None:
             pat_host = str(personal_access.get("host") or "")
             if pat_host and repo_host == pat_host:
@@ -2991,7 +3213,8 @@ class HubState:
 
     def github_auth_status(self) -> dict[str, Any]:
         installation = self._github_connected_installation()
-        personal_access = self._github_connected_personal_access_token()
+        personal_access_tokens = self._github_connected_personal_access_tokens()
+        personal_access = personal_access_tokens[0] if personal_access_tokens else None
         app_configured = self.github_app_settings is not None and not self.github_app_settings_error
 
         installation_id = int(installation.get("installation_id") or 0) if installation else 0
@@ -3010,7 +3233,7 @@ class HubState:
         personal_access_verified_at = str(personal_access.get("verified_at") or "") if personal_access else ""
 
         connected_via_app = bool(installation and installation_id > 0 and app_configured)
-        connected_via_pat = bool(personal_access_token and personal_access_host and personal_access_login)
+        connected_via_pat = bool(personal_access_tokens)
         connection_mode = ""
         connection_host = ""
         if connected_via_pat:
@@ -3037,6 +3260,27 @@ class HubState:
             except OSError:
                 updated_at = ""
 
+        personal_access_entries: list[dict[str, Any]] = []
+        for token_record in personal_access_tokens:
+            token_value = str(token_record.get("personal_access_token") or "").strip()
+            personal_access_entries.append(
+                {
+                    "token_id": str(token_record.get("token_id") or "").strip(),
+                    "token_hint": _mask_secret(token_value) if token_value else "",
+                    "host": str(token_record.get("host") or "").strip(),
+                    "account_login": str(token_record.get("account_login") or "").strip(),
+                    "account_name": str(token_record.get("account_name") or "").strip(),
+                    "account_email": str(token_record.get("account_email") or "").strip(),
+                    "account_id": str(token_record.get("account_id") or "").strip(),
+                    "git_user_name": str(token_record.get("git_user_name") or "").strip(),
+                    "git_user_email": str(token_record.get("git_user_email") or "").strip(),
+                    "token_scopes": str(token_record.get("token_scopes") or "").strip(),
+                    "verified_at": str(token_record.get("verified_at") or "").strip(),
+                    "connected_at": str(token_record.get("connected_at") or "").strip(),
+                    "owner_scopes": _empty_list(token_record.get("owner_scopes")),
+                }
+            )
+
         return {
             "provider": "github",
             "connection_mode": connection_mode,
@@ -3059,6 +3303,9 @@ class HubState:
             "personal_access_token_git_user_email": personal_access_git_user_email,
             "personal_access_token_scopes": personal_access_scopes,
             "personal_access_token_verified_at": personal_access_verified_at,
+            "personal_access_token_owner_scopes": _empty_list(personal_access.get("owner_scopes")) if personal_access else [],
+            "personal_access_token_count": len(personal_access_entries),
+            "personal_access_tokens": personal_access_entries,
             "updated_at": updated_at,
             "error": str(self.github_app_settings_error or ""),
         }
@@ -3187,39 +3434,12 @@ class HubState:
         container_home = f"/home/{self.local_user}"
         ccache_mount = f"{Path.home().resolve() / '.ccache'}:{container_home}/.ccache"
         sccache_mount = f"{Path.home().resolve() / '.cache' / 'sccache'}:{container_home}/.cache/sccache"
-        return (
-            "You are running in a temporary Agent Hub analysis chat for project bootstrap configuration.\n"
-            "Inspect the checked-out repository and recommend the exact project setup inputs Agent Hub needs.\n"
-            "Prioritize project-provided development containers and CI Docker definitions over custom setup.\n\n"
-            "Agent Hub project configuration semantics:\n"
-            "- base_image_mode: 'tag' or 'repo_path'\n"
-            "  - 'tag': base_image_value is a Docker image tag.\n"
-            "  - 'repo_path': base_image_value is a repository-relative path to a Dockerfile or a directory containing Dockerfile.\n"
-            "- setup_script: newline-delimited shell commands run in project root during snapshot build (`set -e` is already enabled).\n"
-            "- default_ro_mounts/default_rw_mounts: host:container mounts used for snapshot prep and all new chats.\n"
-            "- default_env_vars: KEY=VALUE entries; do not set OPENAI_API_KEY, AGENT_HUB_GIT_USER_NAME, AGENT_HUB_GIT_USER_EMAIL.\n\n"
-            "Requirements:\n"
-            "1) Prefer existing devcontainer/docker-compose/CI Dockerfiles from the repo.\n"
-            "2) If existing container is missing packages needed for development, include only minimal additional setup commands.\n"
-            "3) If no development container is provided, include only the minimal packages needed to fully develop the project.\n"
-            "4) If setup installs apt packages, include `apt-get update` before apt installs unless an existing project container explicitly preserves apt lists and already includes the required packages.\n"
-            "5) Inspect build tooling for deferred toolchain downloads and include the smallest build/bootstrap commands to fetch toolchains.\n"
-            "6) If ccache/sccache (or equivalent compiler cache) is used, include shared cache mounts.\n"
-            f"   - ccache mount: {ccache_mount}\n"
-            f"   - sccache mount: {sccache_mount}\n\n"
-            "Return exactly one JSON object (no markdown fences, no prose) with this schema:\n"
-            "{\n"
-            '  "base_image_mode": "tag|repo_path",\n'
-            '  "base_image_value": "string",\n'
-            '  "setup_script": "string",\n'
-            '  "default_ro_mounts": ["host:container"],\n'
-            '  "default_rw_mounts": ["host:container"],\n'
-            '  "default_env_vars": ["KEY=VALUE"],\n'
-            '  "notes": "short rationale"\n'
-            "}\n"
-            "Use empty strings/arrays when appropriate. Keep recommendations minimal and deterministic.\n\n"
-            f"Repository URL: {repo_url}\n"
-            f"Checked out branch: {branch}\n"
+        return _render_prompt_template(
+            PROMPT_AUTO_CONFIGURE_PROJECT_FILE,
+            ccache_mount=ccache_mount,
+            sccache_mount=sccache_mount,
+            repo_url=repo_url,
+            branch=branch,
         )
 
     def _repo_mentions_any_token(self, workspace: Path, tokens: set[str]) -> bool:
@@ -3833,17 +4053,22 @@ class HubState:
         LOGGER.debug("GitHub App installation connected: id=%s account=%s", normalized_id, account_login)
         return status
 
-    def connect_github_personal_access_token(self, personal_access_token: Any, host: Any = "") -> dict[str, Any]:
+    def connect_github_personal_access_token(
+        self,
+        personal_access_token: Any,
+        host: Any = "",
+        owner_scopes: Any = None,
+    ) -> dict[str, Any]:
         normalized_token = _normalize_github_personal_access_token(personal_access_token)
         host_candidate = str(host or "").strip()
         if not host_candidate:
             host_candidate = self._github_provider_host()
         normalized_host = _normalize_github_credential_host(host_candidate, field_name="host")
+        normalized_owner_scopes = _normalize_github_owner_scopes(owner_scopes, field_name="owner_scopes")
         verification = self._verify_github_personal_access_token(normalized_token, normalized_host)
         account_login = verification["account_login"]
 
         self._clear_github_installation_state(remove_credentials=True)
-        self._clear_github_personal_access_token_state(remove_credentials=False)
         self._refresh_github_git_credentials_for_personal_access_token(
             token=normalized_token,
             host=normalized_host,
@@ -3852,7 +4077,9 @@ class HubState:
         account_name = str(verification.get("account_name") or account_login).strip() or account_login
         account_email = str(verification.get("account_email") or "").strip()
         account_id = str(verification.get("account_id") or "").strip()
+        connected_at = _iso_now()
         record = {
+            "token_id": uuid.uuid4().hex,
             "host": normalized_host,
             "personal_access_token": normalized_token,
             "account_login": account_login,
@@ -3862,16 +4089,74 @@ class HubState:
             "git_user_name": account_name,
             "git_user_email": account_email,
             "token_scopes": verification.get("token_scopes") or "",
-            "verified_at": _iso_now(),
-            "connected_at": _iso_now(),
+            "verified_at": connected_at,
+            "connected_at": connected_at,
+            "owner_scopes": normalized_owner_scopes,
         }
-        _write_private_env_file(self.github_personal_access_token_file, json.dumps(record, indent=2) + "\n")
+
+        existing = self._github_connected_personal_access_tokens()
+        filtered_existing: list[dict[str, Any]] = []
+        for existing_record in existing:
+            existing_host = str(existing_record.get("host") or "").strip().lower()
+            existing_login = str(existing_record.get("account_login") or "").strip().lower()
+            existing_owner_scopes = _normalize_github_owner_scopes(
+                existing_record.get("owner_scopes"),
+                field_name="owner_scopes",
+            )
+            if (
+                existing_host == normalized_host
+                and existing_login == account_login.lower()
+                and existing_owner_scopes == normalized_owner_scopes
+            ):
+                continue
+            filtered_existing.append(existing_record)
+
+        self._persist_github_personal_access_tokens([record, *filtered_existing])
         status = self.github_auth_status()
         self._emit_auth_changed(reason="github_personal_access_token_connected")
         LOGGER.debug(
-            "GitHub personal access token connected: host=%s account=%s",
+            "GitHub personal access token connected: host=%s account=%s owner_scopes=%s",
             normalized_host,
             account_login,
+            ",".join(normalized_owner_scopes),
+        )
+        return status
+
+    def disconnect_github_personal_access_token(self, token_id: Any) -> dict[str, Any]:
+        normalized_token_id = str(token_id or "").strip()
+        if not normalized_token_id:
+            raise HTTPException(status_code=400, detail="token_id is required.")
+        if len(normalized_token_id) > GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS:
+            raise HTTPException(status_code=400, detail="token_id is invalid.")
+
+        existing = self._github_connected_personal_access_tokens()
+        remaining = [record for record in existing if str(record.get("token_id") or "").strip() != normalized_token_id]
+        if len(remaining) == len(existing):
+            raise HTTPException(status_code=404, detail="GitHub personal access token not found.")
+
+        if remaining:
+            self._persist_github_personal_access_tokens(remaining)
+            primary = remaining[0]
+            token = str(primary.get("personal_access_token") or "").strip()
+            host = str(primary.get("host") or "").strip()
+            account_login = str(primary.get("account_login") or "").strip()
+            if token and host and account_login:
+                self._refresh_github_git_credentials_for_personal_access_token(
+                    token=token,
+                    host=host,
+                    account_login=account_login,
+                )
+            else:
+                self._clear_github_personal_access_token_state(remove_credentials=True)
+        else:
+            self._clear_github_personal_access_token_state(remove_credentials=True)
+
+        status = self.github_auth_status()
+        self._emit_auth_changed(reason="github_personal_access_token_disconnected")
+        LOGGER.debug(
+            "GitHub personal access token disconnected: token_id=%s remaining=%s",
+            normalized_token_id,
+            len(remaining),
         )
         return status
 
@@ -6549,6 +6834,7 @@ def main(
             provider = state.connect_github_personal_access_token(
                 payload.get("personal_access_token"),
                 host=payload.get("host"),
+                owner_scopes=payload.get("owner_scopes"),
             )
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported GitHub connection mode: {connection_mode}")
@@ -6611,6 +6897,10 @@ def main(
     @app.post("/api/settings/auth/github/disconnect")
     def api_disconnect_github() -> dict[str, Any]:
         return {"provider": state.disconnect_github_app()}
+
+    @app.delete("/api/settings/auth/github/personal-access-tokens/{token_id}")
+    def api_disconnect_github_personal_access_token(token_id: str) -> dict[str, Any]:
+        return {"provider": state.disconnect_github_personal_access_token(token_id)}
 
     @app.get("/api/settings/auth/github/installations")
     def api_list_github_installations() -> dict[str, Any]:

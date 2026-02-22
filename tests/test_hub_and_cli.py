@@ -48,6 +48,7 @@ TEST_GITHUB_MANIFEST_CONVERSION_PAYLOAD = {
     ),
 }
 TEST_GITHUB_PERSONAL_ACCESS_TOKEN = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890"
+TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND = "github_pat_abcdefghijklmnopqrstuvwxyz0987654321"
 TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION = {
     "account_login": "joew",
     "account_name": "Joe W",
@@ -123,7 +124,7 @@ class HubStateTests(unittest.TestCase):
             }
         return status
 
-    def _connect_github_pat(self, host: str = "github.com") -> dict[str, object]:
+    def _connect_github_pat(self, host: str = "github.com", owner_scopes: list[str] | None = None) -> dict[str, object]:
         with patch.object(
             hub_server.HubState,
             "_verify_github_personal_access_token",
@@ -132,6 +133,7 @@ class HubStateTests(unittest.TestCase):
             status = self.state.connect_github_personal_access_token(
                 TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
                 host=host,
+                owner_scopes=owner_scopes,
             )
         return status
 
@@ -245,6 +247,10 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(saved["personal_access_token_git_user_name"], "Joe W")
         self.assertEqual(saved["personal_access_token_git_user_email"], "joew@example.com")
         self.assertEqual(saved["personal_access_token_host"], "github.com")
+        self.assertEqual(saved["personal_access_token_count"], 1)
+        self.assertEqual(len(saved["personal_access_tokens"]), 1)
+        self.assertEqual(saved["personal_access_tokens"][0]["host"], "github.com")
+        self.assertEqual(saved["personal_access_tokens"][0]["owner_scopes"], [])
         self.assertTrue(saved["updated_at"])
         self.assertTrue(self.state.github_personal_access_token_file.exists())
         self.assertTrue(self.state.github_git_credentials_file.exists())
@@ -292,6 +298,118 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(status["connection_mode"], "personal_access_token")
         self.assertTrue(self.state.github_personal_access_token_file.exists())
         self.assertFalse(self.state.github_app_installation_file.exists())
+
+    def test_github_auth_status_migrates_legacy_personal_access_token_record(self) -> None:
+        legacy_payload = {
+            "host": "github.com",
+            "personal_access_token": TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+            "account_login": "legacy-user",
+            "account_name": "Legacy User",
+            "account_email": "legacy@example.com",
+            "account_id": "999",
+            "git_user_name": "Legacy User",
+            "git_user_email": "legacy@example.com",
+            "token_scopes": "repo",
+            "verified_at": "2030-01-01T00:00:00Z",
+            "connected_at": "2030-01-01T00:00:00Z",
+        }
+        self.state.github_personal_access_token_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state.github_personal_access_token_file.write_text(
+            json.dumps(legacy_payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        status = self.state.github_auth_status()
+        self.assertTrue(status["connected"])
+        self.assertEqual(status["connection_mode"], "personal_access_token")
+        self.assertEqual(status["personal_access_token_count"], 1)
+        self.assertEqual(len(status["personal_access_tokens"]), 1)
+        self.assertEqual(status["personal_access_tokens"][0]["account_login"], "legacy-user")
+        self.assertEqual(status["personal_access_tokens"][0]["owner_scopes"], [])
+
+    def test_github_repo_auth_context_prefers_owner_scoped_personal_access_token(self) -> None:
+        first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        first_verification["account_login"] = "fallback-user"
+        first_verification["account_name"] = "Fallback User"
+        first_verification["account_email"] = "fallback@example.com"
+        first_verification["account_id"] = "111"
+        second_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        second_verification["account_login"] = "scoped-user"
+        second_verification["account_name"] = "Scoped User"
+        second_verification["account_email"] = "scoped@example.com"
+        second_verification["account_id"] = "222"
+
+        with patch.object(
+            hub_server.HubState,
+            "_verify_github_personal_access_token",
+            side_effect=[first_verification, second_verification],
+        ):
+            self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+                host="github.com",
+                owner_scopes=[],
+            )
+            self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND,
+                host="github.com",
+                owner_scopes=["acme-org"],
+            )
+
+        context = self.state._github_repo_auth_context("https://github.com/acme-org/repo.git")
+        self.assertIsNotNone(context)
+        assert context is not None
+        mode, host, payload = context
+        self.assertEqual(mode, "personal_access_token")
+        self.assertEqual(host, "github.com")
+        self.assertEqual(payload["account_login"], "scoped-user")
+        self.assertEqual(payload["personal_access_token"], TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND)
+
+        fallback_context = self.state._github_repo_auth_context("https://github.com/other-org/repo.git")
+        self.assertIsNotNone(fallback_context)
+        assert fallback_context is not None
+        fallback_mode, fallback_host, fallback_payload = fallback_context
+        self.assertEqual(fallback_mode, "personal_access_token")
+        self.assertEqual(fallback_host, "github.com")
+        self.assertEqual(fallback_payload["account_login"], "fallback-user")
+        self.assertEqual(fallback_payload["personal_access_token"], TEST_GITHUB_PERSONAL_ACCESS_TOKEN)
+
+    def test_disconnect_github_personal_access_token_removes_only_selected_token(self) -> None:
+        first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        first_verification["account_login"] = "fallback-user"
+        second_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        second_verification["account_login"] = "scoped-user"
+
+        with patch.object(
+            hub_server.HubState,
+            "_verify_github_personal_access_token",
+            side_effect=[first_verification, second_verification],
+        ):
+            self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+                host="github.com",
+                owner_scopes=[],
+            )
+            connected = self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND,
+                host="github.com",
+                owner_scopes=["acme-org"],
+            )
+
+        self.assertEqual(connected["personal_access_token_count"], 2)
+        first_token_id = str(connected["personal_access_tokens"][0]["token_id"])
+        second_token_id = str(connected["personal_access_tokens"][1]["token_id"])
+        self.assertTrue(first_token_id)
+        self.assertTrue(second_token_id)
+
+        after_first_disconnect = self.state.disconnect_github_personal_access_token(first_token_id)
+        self.assertEqual(after_first_disconnect["personal_access_token_count"], 1)
+        self.assertEqual(after_first_disconnect["personal_access_tokens"][0]["token_id"], second_token_id)
+        self.assertTrue(self.state.github_personal_access_token_file.exists())
+
+        after_second_disconnect = self.state.disconnect_github_personal_access_token(second_token_id)
+        self.assertEqual(after_second_disconnect["personal_access_token_count"], 0)
+        self.assertFalse(after_second_disconnect["connected"])
+        self.assertFalse(self.state.github_personal_access_token_file.exists())
 
     def test_connect_github_app_rejects_invalid_installation_id(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
@@ -467,6 +585,34 @@ class HubStateTests(unittest.TestCase):
         prompts = [f"prompt {index}" for index in range(1, 200)]
         normalized = hub_server._normalize_chat_prompt_history(prompts)
         self.assertEqual(normalized, prompts)
+
+    def test_prompt_templates_are_loadable(self) -> None:
+        system_prompt = hub_server._render_prompt_template(
+            hub_server.PROMPT_CHAT_TITLE_OPENAI_SYSTEM_FILE,
+            max_chars=72,
+        )
+        user_prompt = hub_server._render_prompt_template(
+            hub_server.PROMPT_CHAT_TITLE_OPENAI_USER_FILE,
+            prompt_lines="1. test prompt",
+            max_chars=72,
+        )
+        codex_prompt = hub_server._render_prompt_template(
+            hub_server.PROMPT_CHAT_TITLE_CODEX_REQUEST_FILE,
+            prompt_lines="1. test prompt",
+            max_chars=72,
+        )
+        auto_config_prompt = hub_server._render_prompt_template(
+            hub_server.PROMPT_AUTO_CONFIGURE_PROJECT_FILE,
+            ccache_mount="/tmp/ccache:/home/user/.ccache",
+            sccache_mount="/tmp/sccache:/home/user/.cache/sccache",
+            repo_url="https://github.com/acme/demo.git",
+            branch="main",
+        )
+        self.assertIn("Maximum length: 72 characters.", system_prompt)
+        self.assertIn("1. test prompt", user_prompt)
+        self.assertIn("1. test prompt", codex_prompt)
+        self.assertIn("Repository URL: https://github.com/acme/demo.git", auto_config_prompt)
+        self.assertIn("Checked out branch: main", auto_config_prompt)
 
     def test_first_url_in_text_trims_trailing_punctuation(self) -> None:
         value = hub_server._first_url_in_text(
