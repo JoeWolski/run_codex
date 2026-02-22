@@ -35,3 +35,4 @@
 - Never modify git history.
 - Never use `--force` with git commands.
 - Prefer forward-only commits and standard (non-force) pushes.
+- Never commit non-operational files (for example: generated media, temporary exports, logs, screenshots, or local debug artifacts). Commit only files required for runtime/build/test behavior (source/config/dependency metadata) unless the user explicitly asks to include non-operational files.
