@@ -846,6 +846,8 @@ class HubStateTests(unittest.TestCase):
         self.assertIn(str(workspace / "docker" / "base"), cmd)
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
+        self.assertIn("--agent-home-path", cmd)
+        self.assertIn(str(self.state.host_agent_home), cmd)
         self.assertIn("--agent-command", cmd)
         self.assertIn("codex", cmd)
         self.assertIn("--no-alt-screen", cmd)
@@ -1559,6 +1561,8 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--prepare-snapshot-only", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn("--setup-script", cmd)
+        self.assertIn("--agent-home-path", cmd)
+        self.assertIn(str(self.state.host_agent_home), cmd)
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
         self.assertIn("--git-credential-file", cmd)
@@ -3285,6 +3289,10 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             self.assertIn("codex", run_cmd)
             codex_index = run_cmd.index("codex")
+            self.assertIn("--ask-for-approval", run_cmd[codex_index + 1 :])
+            self.assertIn("never", run_cmd[codex_index + 1 :])
+            self.assertIn("--sandbox", run_cmd[codex_index + 1 :])
+            self.assertIn("danger-full-access", run_cmd[codex_index + 1 :])
             self.assertIn("--no-alt-screen", run_cmd[codex_index + 1 :])
 
     def test_claude_agent_command_uses_claude_runtime_image(self) -> None:
@@ -3328,6 +3336,104 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn(image_cli.CLAUDE_RUNTIME_IMAGE, run_cmd)
             image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
             self.assertEqual(run_cmd[image_index + 1], "claude")
+            self.assertIn("--permission-mode", run_cmd[image_index + 2 :])
+            self.assertIn("bypassPermissions", run_cmd[image_index + 2 :])
+
+    def test_codex_runtime_flags_respect_explicit_cli_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--",
+                        "--ask-for-approval",
+                        "on-request",
+                        "--sandbox",
+                        "workspace-write",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            codex_index = run_cmd.index("codex")
+            codex_args = run_cmd[codex_index + 1 :]
+            self.assertIn("--ask-for-approval", codex_args)
+            self.assertIn("on-request", codex_args)
+            self.assertIn("--sandbox", codex_args)
+            self.assertIn("workspace-write", codex_args)
+            self.assertNotIn("danger-full-access", codex_args)
+
+    def test_claude_runtime_flags_respect_explicit_permission_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--agent-command",
+                        "claude",
+                        "--",
+                        "--permission-mode",
+                        "acceptEdits",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            image_index = run_cmd.index(image_cli.CLAUDE_RUNTIME_IMAGE)
+            claude_args = run_cmd[image_index + 2 :]
+            self.assertIn("--permission-mode", claude_args)
+            self.assertIn("acceptEdits", claude_args)
+            self.assertNotIn("bypassPermissions", claude_args)
 
     def test_snapshot_reuses_shared_setup_image_and_builds_provider_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3427,8 +3533,8 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(run_cmd[image_index + 1], "bash")
             self.assertEqual(run_cmd[image_index + 2], "-lc")
             resume_script = run_cmd[image_index + 3]
-            self.assertIn("codex resume --last", resume_script)
-            self.assertIn("exec codex", resume_script)
+            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access resume --last", resume_script)
+            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access", resume_script)
 
     def test_resume_with_no_alt_screen_passes_flag_to_resume_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3470,8 +3576,14 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             image_index = run_cmd.index(image_cli.DEFAULT_RUNTIME_IMAGE)
             resume_script = run_cmd[image_index + 3]
-            self.assertIn("codex --no-alt-screen resume --last", resume_script)
-            self.assertIn("exec codex --no-alt-screen", resume_script)
+            self.assertIn(
+                "codex --ask-for-approval never --sandbox danger-full-access --no-alt-screen resume --last",
+                resume_script,
+            )
+            self.assertIn(
+                "exec codex --ask-for-approval never --sandbox danger-full-access --no-alt-screen",
+                resume_script,
+            )
 
     def test_resume_rejects_non_codex_agent_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3549,9 +3661,13 @@ class CliEnvVarTests(unittest.TestCase):
             full_home_mount = f"{agent_home.resolve()}:{container_home}"
             codex_mount = f"{(agent_home / '.codex').resolve()}:{container_home}/.codex"
             claude_mount = f"{(agent_home / '.claude').resolve()}:{container_home}/.claude"
+            claude_json_mount = f"{(agent_home / '.claude.json').resolve()}:{container_home}/.claude.json"
+            claude_config_mount = f"{(agent_home / '.config' / 'claude').resolve()}:{container_home}/.config/claude"
             self.assertNotIn(full_home_mount, run_cmd)
             self.assertIn(codex_mount, run_cmd)
             self.assertIn(claude_mount, run_cmd)
+            self.assertIn(claude_json_mount, run_cmd)
+            self.assertIn(claude_config_mount, run_cmd)
 
     def test_cli_mounts_git_credentials_and_sets_git_config_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

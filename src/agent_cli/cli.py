@@ -21,16 +21,62 @@ DEFAULT_AGENT_COMMAND = "codex"
 AGENT_PROVIDER_NONE = "none"
 AGENT_PROVIDER_CODEX = "codex"
 AGENT_PROVIDER_CLAUDE = "claude"
+DEFAULT_CODEX_APPROVAL_POLICY = "never"
+DEFAULT_CODEX_SANDBOX_MODE = "danger-full-access"
+DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 
 
-def _resume_shell_command(*, no_alt_screen: bool, agent_command: str) -> str:
+def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
+    if arg == long_option or arg.startswith(f"{long_option}="):
+        return True
+    if short_option and (arg == short_option or arg.startswith(f"{short_option}=")):
+        return True
+    return False
+
+
+def _has_cli_option(args: Iterable[str], *, long_option: str, short_option: str | None = None) -> bool:
+    return any(_cli_arg_matches_option(arg, long_option=long_option, short_option=short_option) for arg in args)
+
+
+def _codex_default_runtime_flags(*, no_alt_screen: bool, explicit_args: Iterable[str]) -> list[str]:
+    parsed_args = [str(arg) for arg in explicit_args]
+    flags: list[str] = []
+    bypass_all = _has_cli_option(
+        parsed_args,
+        long_option="--dangerously-bypass-approvals-and-sandbox",
+    )
+    if not bypass_all:
+        if not _has_cli_option(parsed_args, long_option="--ask-for-approval", short_option="-a"):
+            flags.extend(["--ask-for-approval", DEFAULT_CODEX_APPROVAL_POLICY])
+        if not _has_cli_option(parsed_args, long_option="--sandbox", short_option="-s"):
+            flags.extend(["--sandbox", DEFAULT_CODEX_SANDBOX_MODE])
+
+    if no_alt_screen:
+        flags.append("--no-alt-screen")
+    return flags
+
+
+def _claude_default_runtime_flags(explicit_args: Iterable[str]) -> list[str]:
+    parsed_args = [str(arg) for arg in explicit_args]
+    if _has_cli_option(parsed_args, long_option="--dangerously-skip-permissions"):
+        return []
+    if _has_cli_option(parsed_args, long_option="--permission-mode"):
+        return []
+    return ["--permission-mode", DEFAULT_CLAUDE_PERMISSION_MODE]
+
+
+def _resume_shell_command(*, no_alt_screen: bool, agent_command: str, codex_runtime_flags: Iterable[str] = ()) -> str:
     resolved_command = str(agent_command or DEFAULT_AGENT_COMMAND).strip() or DEFAULT_AGENT_COMMAND
-    if no_alt_screen and resolved_command == DEFAULT_AGENT_COMMAND:
-        resolved_command = f"{resolved_command} --no-alt-screen"
-    return f"if {resolved_command} resume --last; then :; else exec {resolved_command}; fi"
+    command_parts = [resolved_command]
+    if resolved_command == DEFAULT_AGENT_COMMAND:
+        command_parts.extend(str(flag) for flag in codex_runtime_flags)
+    elif no_alt_screen:
+        command_parts.append("--no-alt-screen")
+    resolved = " ".join(command_parts)
+    return f"if {resolved} resume --last; then :; else exec {resolved}; fi"
 
 
 def _repo_root() -> Path:
@@ -466,8 +512,12 @@ def main(
     host_agent_home = Path(agent_home_path or (Path.home() / ".agent-home" / user)).resolve()
     host_codex_dir = host_agent_home / ".codex"
     host_claude_dir = host_agent_home / ".claude"
+    host_claude_json_file = host_agent_home / ".claude.json"
+    host_claude_config_dir = host_agent_home / ".config" / "claude"
     host_codex_dir.mkdir(parents=True, exist_ok=True)
     host_claude_dir.mkdir(parents=True, exist_ok=True)
+    host_claude_json_file.touch(exist_ok=True)
+    host_claude_config_dir.mkdir(parents=True, exist_ok=True)
     (host_agent_home / "projects").mkdir(parents=True, exist_ok=True)
     selected_agent_command = _normalize_agent_command(agent_command)
 
@@ -532,11 +582,20 @@ def main(
     for entry in env_vars:
         parsed_env_vars.append(_parse_env_var(entry, "--env-var"))
 
+    explicit_container_args = [str(arg) for arg in container_args]
+    codex_runtime_flags = _codex_default_runtime_flags(
+        no_alt_screen=no_alt_screen,
+        explicit_args=explicit_container_args,
+    )
+
     command = [selected_agent_command]
-    if no_alt_screen and selected_agent_command == DEFAULT_AGENT_COMMAND:
-        command.append("--no-alt-screen")
+    if selected_agent_command == DEFAULT_AGENT_COMMAND:
+        command.extend(codex_runtime_flags)
+    elif selected_agent_command == AGENT_PROVIDER_CLAUDE:
+        command.extend(_claude_default_runtime_flags(explicit_container_args))
+
     if container_args:
-        command.extend(container_args)
+        command.extend(explicit_container_args)
     elif resume:
         if selected_agent_command != DEFAULT_AGENT_COMMAND:
             raise click.ClickException("--resume is currently only supported when --agent-command is codex.")
@@ -546,6 +605,7 @@ def main(
             _resume_shell_command(
                 no_alt_screen=no_alt_screen,
                 agent_command=selected_agent_command,
+                codex_runtime_flags=codex_runtime_flags,
             ),
         ]
 
@@ -563,6 +623,10 @@ def main(
         f"{host_codex_dir}:{container_home_path}/.codex",
         "--volume",
         f"{host_claude_dir}:{container_home_path}/.claude",
+        "--volume",
+        f"{host_claude_json_file}:{container_home_path}/.claude.json",
+        "--volume",
+        f"{host_claude_config_dir}:{container_home_path}/.config/claude",
         "--volume",
         f"{config_path}:{container_home_path}/.codex/config.toml:ro",
         "--env",

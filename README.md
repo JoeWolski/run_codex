@@ -130,8 +130,11 @@ Behavior highlights:
 - Mounts your project into `/home/<user>/projects/<project-name>`.
 - Mounts Docker socket (`/var/run/docker.sock`) so runtime tools can access Docker when available.
 - Mounts config file to `~/.codex/config.toml` in the container.
+- Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, and `~/.config/claude`.
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
+- Applies permissive in-container defaults unless you explicitly override them with trailing agent args:
+  Codex uses `--ask-for-approval never --sandbox danger-full-access`; Claude uses `--permission-mode bypassPermissions`.
 
 Key argument groups:
 
