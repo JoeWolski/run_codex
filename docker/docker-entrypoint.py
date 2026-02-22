@@ -6,6 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 import sys
+import urllib.parse
 
 
 def _run(command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -57,6 +58,76 @@ def _configure_git_identity(local_user: str) -> None:
 
     _run(["gosu", local_user, "git", "config", "--global", "user.name", git_user_name])
     _run(["gosu", local_user, "git", "config", "--global", "user.email", git_user_email])
+
+
+def _read_git_credential_secret(credentials_path: Path, host: str) -> str | None:
+    normalized_host = str(host or "").strip().lower()
+    if not normalized_host or not credentials_path.is_file():
+        return None
+    try:
+        lines = credentials_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parsed = urllib.parse.urlparse(line)
+        if parsed.scheme != "https":
+            continue
+        if str(parsed.hostname or "").strip().lower() != normalized_host:
+            continue
+        if parsed.password is None:
+            continue
+        secret = urllib.parse.unquote(parsed.password).strip()
+        if secret:
+            return secret
+    return None
+
+
+def _prepare_git_credentials(local_uid: int, local_gid: int) -> None:
+    source_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_SOURCE", "").strip()
+    target_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_FILE", "").strip()
+    host_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIAL_HOST", "").strip()
+    if not source_raw:
+        if os.environ.get("GH_TOKEN") and not os.environ.get("GITHUB_TOKEN"):
+            os.environ["GITHUB_TOKEN"] = str(os.environ["GH_TOKEN"])
+        return
+
+    source_path = Path(source_raw)
+    target_path = Path(target_raw or "/tmp/agent_hub_git_credentials")
+    if source_path.is_file():
+        try:
+            credential_bytes = source_path.read_bytes()
+        except OSError:
+            credential_bytes = b""
+        if credential_bytes:
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            try:
+                should_write = True
+                if target_path.exists():
+                    should_write = target_path.read_bytes() != credential_bytes
+                if should_write:
+                    target_path.write_bytes(credential_bytes)
+                target_path.chmod(0o600)
+                _ensure_path_owner(target_path, local_uid, local_gid)
+            except OSError:
+                pass
+
+        if not os.environ.get("GH_TOKEN"):
+            secret = _read_git_credential_secret(source_path, host_raw)
+            if secret:
+                os.environ["GH_TOKEN"] = secret
+
+    if os.environ.get("GH_TOKEN") and not os.environ.get("GITHUB_TOKEN"):
+        os.environ["GITHUB_TOKEN"] = str(os.environ["GH_TOKEN"])
+    normalized_host = host_raw.strip().lower()
+    if normalized_host and normalized_host != "github.com" and not os.environ.get("GH_HOST"):
+        os.environ["GH_HOST"] = normalized_host
 
 
 def _ensure_user_and_groups() -> None:
@@ -162,6 +233,7 @@ def _ensure_user_and_groups() -> None:
         sudoers_file.chmod(0o440)
 
     _ensure_runtime_home_paths(local_home, local_uid, local_gid)
+    _prepare_git_credentials(local_uid, local_gid)
     _configure_git_identity(local_user)
 
     os.execvp("gosu", ["gosu", local_user, *command])

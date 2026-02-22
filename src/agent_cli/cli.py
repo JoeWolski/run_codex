@@ -22,6 +22,8 @@ AGENT_PROVIDER_NONE = "none"
 AGENT_PROVIDER_CODEX = "codex"
 AGENT_PROVIDER_CLAUDE = "claude"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
+GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 
 
 def _resume_shell_command(*, no_alt_screen: bool, agent_command: str) -> str:
@@ -600,13 +602,15 @@ def main(
         run_args.extend(["--env", f"OPENAI_API_KEY={api_key}"])
 
     if git_credential_path is not None and git_credential_host_value:
-        container_git_credentials_path = "/tmp/agent_hub_git_credentials"
         https_prefix = f"https://{git_credential_host_value}/"
-        run_args.extend(["--volume", f"{git_credential_path}:{container_git_credentials_path}:ro"])
+        run_args.extend(["--volume", f"{git_credential_path}:{GIT_CREDENTIALS_SOURCE_PATH}:ro"])
         run_args.extend(["--env", "GIT_TERMINAL_PROMPT=0"])
+        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIALS_SOURCE={GIT_CREDENTIALS_SOURCE_PATH}"])
+        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIALS_FILE={GIT_CREDENTIALS_FILE_PATH}"])
+        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIAL_HOST={git_credential_host_value}"])
         run_args.extend(["--env", "GIT_CONFIG_COUNT=3"])
         run_args.extend(["--env", "GIT_CONFIG_KEY_0=credential.helper"])
-        run_args.extend(["--env", f"GIT_CONFIG_VALUE_0=store --file={container_git_credentials_path}"])
+        run_args.extend(["--env", f"GIT_CONFIG_VALUE_0=store --file={GIT_CREDENTIALS_FILE_PATH}"])
         run_args.extend(["--env", f"GIT_CONFIG_KEY_1=url.{https_prefix}.insteadOf"])
         run_args.extend(["--env", f"GIT_CONFIG_VALUE_1=git@{git_credential_host_value}:"])
         run_args.extend(["--env", f"GIT_CONFIG_KEY_2=url.{https_prefix}.insteadOf"])
@@ -646,6 +650,10 @@ def main(
                 (
                     "set -e\n"
                     "git config --system --add safe.directory '*' || true\n"
+                    'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ] && [ -f "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" ]; then\n'
+                    '  cp "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" "${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}" || true\n'
+                    '  chmod 600 "${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}" || true\n'
+                    "fi\n"
                     + script
                     + "\n"
                     + 'chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true\n'

@@ -2882,6 +2882,8 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("bash", setup_cmd)
             setup_script = setup_cmd[-1]
             self.assertIn("git config --system --add safe.directory '*'", setup_script)
+            self.assertIn('AGENT_HUB_GIT_CREDENTIALS_SOURCE', setup_script)
+            self.assertIn('AGENT_HUB_GIT_CREDENTIALS_FILE', setup_script)
             self.assertIn('chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true', setup_script)
             commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
             self.assertIsNotNone(commit_cmd)
@@ -3281,7 +3283,10 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
 
-            self.assertIn(f"{credential_file.resolve()}:/tmp/agent_hub_git_credentials:ro", run_cmd)
+            self.assertIn(
+                f"{credential_file.resolve()}:{image_cli.GIT_CREDENTIALS_SOURCE_PATH}:ro",
+                run_cmd,
+            )
 
             env_values = [
                 run_cmd[index + 1]
@@ -3289,9 +3294,21 @@ class CliEnvVarTests(unittest.TestCase):
                 if part == "--env"
             ]
             self.assertIn("GIT_TERMINAL_PROMPT=0", env_values)
+            self.assertIn(
+                f"AGENT_HUB_GIT_CREDENTIALS_SOURCE={image_cli.GIT_CREDENTIALS_SOURCE_PATH}",
+                env_values,
+            )
+            self.assertIn(
+                f"AGENT_HUB_GIT_CREDENTIALS_FILE={image_cli.GIT_CREDENTIALS_FILE_PATH}",
+                env_values,
+            )
+            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=github.com", env_values)
             self.assertIn("GIT_CONFIG_COUNT=3", env_values)
             self.assertIn("GIT_CONFIG_KEY_0=credential.helper", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_0=store --file=/tmp/agent_hub_git_credentials", env_values)
+            self.assertIn(
+                f"GIT_CONFIG_VALUE_0=store --file={image_cli.GIT_CREDENTIALS_FILE_PATH}",
+                env_values,
+            )
             self.assertIn("GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf", env_values)
             self.assertIn("GIT_CONFIG_VALUE_1=git@github.com:", env_values)
             self.assertIn("GIT_CONFIG_KEY_2=url.https://github.com/.insteadOf", env_values)
@@ -3540,6 +3557,93 @@ class DockerEntrypointTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 module._configure_git_identity("agent")
+
+    def test_prepare_git_credentials_copies_source_and_sets_gh_token(self) -> None:
+        module = self._load_entrypoint_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_path = tmp_path / "source-credentials"
+            target_path = tmp_path / "target-credentials"
+            source_path.write_text(
+                "https://joew:ghp_test_token_123@github.com\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENT_HUB_GIT_CREDENTIALS_SOURCE": str(source_path),
+                    "AGENT_HUB_GIT_CREDENTIALS_FILE": str(target_path),
+                    "AGENT_HUB_GIT_CREDENTIAL_HOST": "github.com",
+                    "GH_TOKEN": "",
+                    "GITHUB_TOKEN": "",
+                },
+                clear=False,
+            ):
+                module._prepare_git_credentials(os.getuid(), os.getgid())
+                self.assertEqual(os.environ.get("GH_TOKEN"), "ghp_test_token_123")
+                self.assertEqual(os.environ.get("GITHUB_TOKEN"), "ghp_test_token_123")
+
+            self.assertTrue(target_path.exists())
+            self.assertEqual(
+                target_path.read_text(encoding="utf-8"),
+                source_path.read_text(encoding="utf-8"),
+            )
+            target_mode = target_path.stat().st_mode & 0o777
+            self.assertEqual(target_mode, 0o600)
+
+    def test_prepare_git_credentials_keeps_existing_gh_token(self) -> None:
+        module = self._load_entrypoint_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_path = tmp_path / "source-credentials"
+            target_path = tmp_path / "target-credentials"
+            source_path.write_text(
+                "https://joew:ghp_different_value@github.com\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENT_HUB_GIT_CREDENTIALS_SOURCE": str(source_path),
+                    "AGENT_HUB_GIT_CREDENTIALS_FILE": str(target_path),
+                    "AGENT_HUB_GIT_CREDENTIAL_HOST": "github.com",
+                    "GH_TOKEN": "already-set-token",
+                    "GITHUB_TOKEN": "",
+                },
+                clear=False,
+            ):
+                module._prepare_git_credentials(os.getuid(), os.getgid())
+                self.assertEqual(os.environ.get("GH_TOKEN"), "already-set-token")
+                self.assertEqual(os.environ.get("GITHUB_TOKEN"), "already-set-token")
+
+    def test_prepare_git_credentials_sets_gh_host_for_enterprise(self) -> None:
+        module = self._load_entrypoint_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_path = tmp_path / "source-credentials"
+            target_path = tmp_path / "target-credentials"
+            source_path.write_text(
+                "https://joew:ghp_enterprise_token@github.enterprise.local\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENT_HUB_GIT_CREDENTIALS_SOURCE": str(source_path),
+                    "AGENT_HUB_GIT_CREDENTIALS_FILE": str(target_path),
+                    "AGENT_HUB_GIT_CREDENTIAL_HOST": "github.enterprise.local",
+                    "GH_TOKEN": "",
+                    "GITHUB_TOKEN": "",
+                    "GH_HOST": "",
+                },
+                clear=False,
+            ):
+                module._prepare_git_credentials(os.getuid(), os.getgid())
+                self.assertEqual(os.environ.get("GH_TOKEN"), "ghp_enterprise_token")
+                self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
 
 
 if __name__ == "__main__":
