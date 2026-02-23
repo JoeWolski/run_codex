@@ -34,10 +34,13 @@
 - Favor state-driven rendering over ad hoc DOM behavior.
 - Keep async flows cancellation-safe and shutdown-safe.
 - Validate changes with appropriate build/test checks before handoff.
+- When updating, fixing, or adding features for a specific agent, verify the changes do not break or degrade behavior for any other supported agent.
 
 ## Git safety
 
-- Never modify git history.
-- Never use `--force` with git commands.
-- Prefer forward-only commits and standard (non-force) pushes.
+- This repository uses a rebase-based workflow.
+- Keep each branch as a single commit at all times; amend or squash instead of stacking multiple commits.
+- If you find a feature branch contains multiple commits, collapse it to a single effective commit and use a sensible commit message that describes the resulting change.
+- Never use merges for branch updates or integration; rebase onto the latest default remote branch instead.
+- `git push --force` is allowed on updated feature branches.
 - Never commit non-operational files (for example: generated media, temporary exports, logs, screenshots, or local debug artifacts). Commit only files required for runtime/build/test behavior (source/config/dependency metadata) unless the user explicitly asks to include non-operational files.

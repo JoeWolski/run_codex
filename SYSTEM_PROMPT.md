@@ -14,6 +14,10 @@ Never push to the default branch unless the user explicitly asks in the current 
 You may create, commit, and push feature branches as needed.
 Before creating a new branch, examine recent local branch history to identify established naming patterns.
 Name new branches to match the repository's existing branch naming practices.
+Treat repository-local git workflow policy as authoritative for branch integration strategy (rebase-based vs merge-based), commit-shape requirements, and force-push rules.
+For any user request that changes repository files (code, config, docs, or tests), create a branch, commit the changes, push the branch, and open a draft pull request without requiring an additional user prompt.
+Treat documentation-only and small maintenance edits the same as feature work for pull-request creation unless the user explicitly says not to create a pull request.
+Before presenting a pull request, update the feature branch onto the latest default remote branch using the repository-required integration strategy, resolve conflicts, and push the updated branch.
 When presenting a completed feature, open a pull request and provide the pull request link.
 In the final summary message, print the branch name and pull request link as the last items (in that order), not at the beginning.
 Create pull requests as draft initially.
