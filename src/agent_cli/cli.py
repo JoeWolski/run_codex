@@ -714,9 +714,6 @@ def main(
     if not api_key:
         api_key = _read_openai_api_key(_to_absolute(credentials_file, cwd))
 
-    if not api_key:
-        click.echo("OPENAI_API_KEY not set. Starting without API key.", err=True)
-
     selected_agent_provider = _agent_provider_for_command(selected_agent_command)
     snapshot_tag = (snapshot_image_tag or "").strip()
     cached_snapshot_exists = bool(snapshot_tag) and _docker_image_exists(snapshot_tag)

@@ -4940,8 +4940,6 @@ class DockerEntrypointTests(unittest.TestCase):
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
-            module, "_ensure_runtime_home_paths", return_value=None
-        ) as ensure_paths, patch.object(
             module, "_prepare_git_credentials", return_value=None
         ) as prepare_credentials, patch.object(
             module, "_configure_git_identity", return_value=None
@@ -4951,13 +4949,13 @@ class DockerEntrypointTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 module._entrypoint_main()
 
-        ensure_paths.assert_called_once_with("/tmp/entrypoint-home")
         prepare_credentials.assert_called_once_with()
         configure_git.assert_called_once_with()
         execvp.assert_called_once_with("codex", ["codex"])
 
     def test_entrypoint_main_execs_requested_command(self) -> None:
         module = self._load_entrypoint_module()
+        observed_home = ""
         with patch.dict(
             os.environ,
             {
@@ -4967,8 +4965,6 @@ class DockerEntrypointTests(unittest.TestCase):
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "bash", "-lc", "echo ok"]), patch.object(
-            module, "_ensure_runtime_home_paths", return_value=None
-        ) as ensure_paths, patch.object(
             module, "_prepare_git_credentials", return_value=None
         ), patch.object(
             module, "_configure_git_identity", return_value=None
@@ -4977,9 +4973,9 @@ class DockerEntrypointTests(unittest.TestCase):
         ) as execvp:
             with self.assertRaises(SystemExit):
                 module._entrypoint_main()
+            observed_home = str(os.environ.get("HOME") or "")
 
-        ensure_paths.assert_called_once_with("/tmp/entrypoint-local-home")
-        self.assertEqual(os.environ.get("HOME"), "/tmp/entrypoint-local-home")
+        self.assertEqual(observed_home, "/tmp/entrypoint-local-home")
         execvp.assert_called_once_with("bash", ["bash", "-lc", "echo ok"])
 
 

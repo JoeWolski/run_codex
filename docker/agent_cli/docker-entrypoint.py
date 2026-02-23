@@ -13,18 +13,6 @@ def _run(command: list[str], check: bool = True) -> subprocess.CompletedProcess[
     return subprocess.run(command, check=check, text=True, capture_output=True)
 
 
-def _ensure_runtime_home_paths(local_home: str) -> None:
-    home_path = Path(local_home)
-    cache_dir = home_path / ".cache"
-    uv_cache_dir = cache_dir / "uv"
-
-    for path in (home_path, cache_dir, uv_cache_dir):
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise RuntimeError(f"Unable to initialize runtime path '{path}': {exc}") from exc
-
-
 def _configure_git_identity() -> None:
     git_user_name = os.environ.get("AGENT_HUB_GIT_USER_NAME", "").strip()
     git_user_email = os.environ.get("AGENT_HUB_GIT_USER_EMAIL", "").strip()
@@ -121,7 +109,6 @@ def _entrypoint_main() -> None:
         os.environ["HOME"] = local_home
 
     _set_umask()
-    _ensure_runtime_home_paths(local_home)
     _prepare_git_credentials()
     _configure_git_identity()
 
