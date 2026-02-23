@@ -1318,23 +1318,6 @@ function resolveTitleGenerationAuthMode(providerStatus) {
   return "none";
 }
 
-function buildProxiedOpenAiLoginUrl(loginUrl) {
-  const raw = String(loginUrl || "").trim();
-  if (!raw) {
-    return "";
-  }
-  try {
-    const parsed = new URL(raw);
-    if (!parsed.searchParams.has("redirect_uri")) {
-      return raw;
-    }
-    parsed.searchParams.set("redirect_uri", `${window.location.origin}/openai-auth/callback`);
-    return parsed.toString();
-  } catch {
-    return raw;
-  }
-}
-
 function extractCallbackQuery(value) {
   const raw = String(value || "").trim();
   if (!raw) {
@@ -2871,12 +2854,7 @@ function HubApp() {
     return { byProject, orphanChats };
   }, [hubState.projects, visibleChats]);
 
-  const openAiAccountProxyLoginUrl = useMemo(
-    () => buildProxiedOpenAiLoginUrl(openAiAccountSession?.loginUrl),
-    [openAiAccountSession?.loginUrl]
-  );
-  const openAiAccountDirectLoginUrl = String(openAiAccountSession?.loginUrl || "").trim();
-  const openAiAccountLoginUrl = openAiAccountProxyLoginUrl || openAiAccountDirectLoginUrl;
+  const openAiAccountLoginUrl = String(openAiAccountSession?.loginUrl || "").trim();
   const openAiAccountSessionMethod = String(openAiAccountSession?.method || "");
   const openAiAccountLoginInFlight = Boolean(
     openAiAccountSession &&
@@ -4177,10 +4155,6 @@ function HubApp() {
               <p className="meta">{openAiConnectionSummary}</p>
               {openAiCardExpanded && openAiCardCanExpand ? (
                 <>
-                  <p className="meta">
-                    Connect your OpenAI account here when you need the Settings login helper for Codex in Docker or remote
-                    environments.
-                  </p>
                   {openAiAccountLoginInFlight ? (
                     <div className="actions">
                       <button
