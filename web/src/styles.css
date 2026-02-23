@@ -678,7 +678,7 @@ button:focus-visible {
 .widget-row {
   display: grid;
   gap: var(--space-1);
-  align-items: center;
+  align-items: start;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-surface);
@@ -687,11 +687,74 @@ button:focus-visible {
 
 .widget-row.volume,
 .widget-row.env {
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  column-gap: 6px;
+  align-items: stretch;
 }
 
 .widget-row .btn-small {
   justify-self: start;
+}
+
+.icon-button.widget-row-remove {
+  grid-column: 2;
+  grid-row: 1 / -1;
+  align-self: stretch;
+  justify-self: stretch;
+  width: 24px;
+  min-width: 24px;
+  height: auto;
+  border-radius: var(--radius-sm);
+  border-color: var(--border);
+  background: var(--bg-surface-muted);
+  color: var(--text-secondary);
+  padding: 0;
+}
+
+.icon-button.widget-row-remove svg {
+  width: 11px;
+  height: 11px;
+}
+
+.widget-row-fields {
+  grid-column: 1;
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.icon-button.widget-row-remove:hover {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+}
+
+.icon-button.widget-row-remove:focus-visible {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
+.volume-mode-control {
+  position: relative;
+}
+
+.volume-mode-control::after {
+  content: "▾";
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  pointer-events: none;
+}
+
+.volume-mode-select {
+  appearance: none;
+  cursor: pointer;
+  padding-right: 34px;
 }
 
 .empty {
@@ -1852,20 +1915,6 @@ button:focus-visible {
   .settings-auth-input-row {
     grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
-  }
-}
-
-@media (min-width: 860px) {
-  .widget-row.volume {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 140px auto;
-  }
-
-  .widget-row.env {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
-  }
-
-  .widget-row .btn-small {
-    justify-self: stretch;
   }
 }
 

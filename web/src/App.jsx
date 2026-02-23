@@ -273,7 +273,7 @@ function applyThemePreference(preference) {
 }
 
 function emptyVolume() {
-  return { host: "", container: "", mode: "rw" };
+  return { host: "", container: "", mode: "ro" };
 }
 
 function emptyEnvVar() {
@@ -1069,22 +1069,36 @@ function VolumeEditor({ rows, onChange }) {
     <div className="widget-block">
       {rows.map((row, index) => (
         <div className="widget-row volume" key={`volume-${index}`}>
-          <input
-            value={row.host}
-            onChange={(event) => updateRow(index, { host: event.target.value })}
-            placeholder="Local path (e.g. /data/datasets)"
-          />
-          <input
-            value={row.container}
-            onChange={(event) => updateRow(index, { container: event.target.value })}
-            placeholder="Container path (e.g. /workspace/data)"
-          />
-          <select value={row.mode} onChange={(event) => updateRow(index, { mode: event.target.value })}>
-            <option value="rw">Read-write</option>
-            <option value="ro">Read-only</option>
-          </select>
-          <button type="button" className="btn-secondary btn-small" onClick={() => removeRow(index)}>
-            Remove
+          <div className="widget-row-fields">
+            <input
+              value={row.host}
+              onChange={(event) => updateRow(index, { host: event.target.value })}
+              placeholder="Local path (e.g. /data/datasets)"
+            />
+            <input
+              value={row.container}
+              onChange={(event) => updateRow(index, { container: event.target.value })}
+              placeholder="Container path (e.g. /workspace/data)"
+            />
+            <div className="volume-mode-control">
+              <select
+                className="volume-mode-select"
+                value={row.mode}
+                onChange={(event) => updateRow(index, { mode: event.target.value })}
+                aria-label="Volume mode"
+              >
+                <option value="ro">Read-only</option>
+                <option value="rw">Read-write</option>
+              </select>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="icon-button widget-row-remove"
+            onClick={() => removeRow(index)}
+            aria-label="Remove volume"
+          >
+            <CloseIcon />
           </button>
         </div>
       ))}
@@ -1114,18 +1128,25 @@ function EnvVarEditor({ rows, onChange }) {
     <div className="widget-block">
       {rows.map((row, index) => (
         <div className="widget-row env" key={`env-${index}`}>
-          <input
-            value={row.key}
-            onChange={(event) => updateRow(index, { key: event.target.value })}
-            placeholder="KEY"
-          />
-          <input
-            value={row.value}
-            onChange={(event) => updateRow(index, { value: event.target.value })}
-            placeholder="VALUE"
-          />
-          <button type="button" className="btn-secondary btn-small" onClick={() => removeRow(index)}>
-            Remove
+          <div className="widget-row-fields">
+            <input
+              value={row.key}
+              onChange={(event) => updateRow(index, { key: event.target.value })}
+              placeholder="KEY"
+            />
+            <input
+              value={row.value}
+              onChange={(event) => updateRow(index, { value: event.target.value })}
+              placeholder="VALUE"
+            />
+          </div>
+          <button
+            type="button"
+            className="icon-button widget-row-remove"
+            onClick={() => removeRow(index)}
+            aria-label="Remove environment variable"
+          >
+            <CloseIcon />
           </button>
         </div>
       ))}
