@@ -226,6 +226,12 @@ AUTO_CONFIG_CACHE_SIGNAL_FILENAMES = {
     "sconstruct",
     "sconscript",
 }
+SNAPSHOT_AGENT_CLI_RUNTIME_INPUT_FILES = (
+    "docker/agent_cli/Dockerfile",
+    "docker/agent_cli/docker-entrypoint.py",
+    "docker/agent_cli/hub_artifact",
+    "src/agent_cli/cli.py",
+)
 AUTO_CONFIG_CACHE_SIGNAL_SUFFIXES = {
     ".cmake",
     ".mk",
@@ -383,6 +389,34 @@ def _repo_root() -> Path:
         if (parent / "pyproject.toml").exists():
             return parent
     return Path(__file__).resolve().parents[3]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _agent_cli_runtime_inputs_fingerprint() -> str:
+    repo_root = _repo_root()
+    fingerprint_items: list[dict[str, str]] = []
+    for relative_path in SNAPSHOT_AGENT_CLI_RUNTIME_INPUT_FILES:
+        input_path = repo_root / relative_path
+        file_hash = "missing"
+        if input_path.is_file():
+            try:
+                file_hash = _sha256_file(input_path)
+            except OSError as exc:
+                file_hash = f"read-error:{exc.__class__.__name__}"
+        fingerprint_items.append({"path": relative_path, "sha256": file_hash})
+
+    payload = json.dumps(fingerprint_items, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _prompts_dir() -> Path:
@@ -2547,7 +2581,7 @@ def _read_codex_auth(path: Path) -> tuple[bool, str]:
 
 
 def _snapshot_schema_version() -> int:
-    return 3
+    return 4
 
 
 def _docker_remove_images(prefixes: tuple[str, ...], explicit_tags: set[str]) -> None:
@@ -2837,6 +2871,49 @@ class HubState:
             pass
         self._reload_github_app_settings()
         self._load_agent_capabilities_cache()
+        self._reconcile_project_build_state()
+
+    def _reconcile_project_build_state(self) -> None:
+        state = self.load()
+        rebuild_project_ids: list[str] = []
+        changed = False
+
+        for project_id, project in state["projects"].items():
+            if not isinstance(project, dict):
+                continue
+
+            build_status = str(project.get("build_status") or "")
+            if build_status in {"pending", "building"}:
+                rebuild_project_ids.append(project_id)
+                continue
+            if build_status != "ready":
+                continue
+
+            expected_snapshot_tag = self._project_setup_snapshot_tag(project)
+            snapshot_tag = str(project.get("setup_snapshot_image") or "").strip()
+            snapshot_ready = (
+                bool(snapshot_tag)
+                and snapshot_tag == expected_snapshot_tag
+                and _docker_image_exists(snapshot_tag)
+            )
+            if snapshot_ready:
+                continue
+
+            project["setup_snapshot_image"] = ""
+            project.pop("snapshot_updated_at", None)
+            project["build_status"] = "pending"
+            project["build_error"] = ""
+            project["build_started_at"] = ""
+            project["build_finished_at"] = ""
+            project["updated_at"] = _iso_now()
+            state["projects"][project_id] = project
+            changed = True
+            rebuild_project_ids.append(project_id)
+
+        if changed:
+            self.save(state, reason="project_build_reconcile")
+        for project_id in rebuild_project_ids:
+            self._schedule_project_build(project_id)
 
     def load(self) -> dict[str, Any]:
         with self._lock:
@@ -6815,6 +6892,7 @@ class HubState:
                 "default_ro_mounts": list(project.get("default_ro_mounts") or []),
                 "default_rw_mounts": list(project.get("default_rw_mounts") or []),
                 "default_env_vars": list(project.get("default_env_vars") or []),
+                "agent_cli_runtime_inputs_fingerprint": _agent_cli_runtime_inputs_fingerprint(),
             },
             sort_keys=True,
         )

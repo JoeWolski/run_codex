@@ -177,6 +177,20 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
         self.assertEqual(loaded["build_status"], "ready")
 
+    def test_project_setup_snapshot_tag_includes_runtime_input_fingerprint(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+
+        with patch("agent_hub.server._agent_cli_runtime_inputs_fingerprint", return_value="runtime-fingerprint-a"):
+            tag_a = self.state._project_setup_snapshot_tag(project)
+        with patch("agent_hub.server._agent_cli_runtime_inputs_fingerprint", return_value="runtime-fingerprint-b"):
+            tag_b = self.state._project_setup_snapshot_tag(project)
+
+        self.assertNotEqual(tag_a, tag_b)
+
     def test_state_payload_reports_project_build_log_availability(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -1969,6 +1983,50 @@ Gemini CLI
         ):
             with self.assertRaises(HTTPException):
                 self.state.start_chat(chat["id"])
+
+    def test_init_requeues_ready_project_when_snapshot_is_stale(self) -> None:
+        data_dir = self.tmp_path / "hub-reconcile"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        state_payload = hub_server._new_state()
+        project_id = "project-stale"
+        now = hub_server._iso_now()
+        state_payload["projects"][project_id] = {
+            "id": project_id,
+            "name": "demo",
+            "repo_url": "https://example.com/org/repo.git",
+            "setup_script": "echo setup",
+            "base_image_mode": "tag",
+            "base_image_value": "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04",
+            "default_ro_mounts": [],
+            "default_rw_mounts": [],
+            "default_env_vars": [],
+            "default_branch": "main",
+            "created_at": now,
+            "updated_at": now,
+            "setup_snapshot_image": "stale-snapshot-tag",
+            "build_status": "ready",
+            "build_error": "",
+            "build_started_at": now,
+            "build_finished_at": now,
+        }
+        (data_dir / hub_server.STATE_FILE_NAME).write_text(json.dumps(state_payload), encoding="utf-8")
+
+        scheduled: list[str] = []
+
+        def fake_schedule(_: hub_server.HubState, project_id: str) -> None:
+            scheduled.append(project_id)
+
+        with patch.object(hub_server.HubState, "_schedule_project_build", fake_schedule):
+            reloaded = hub_server.HubState(data_dir, self.config_file)
+
+        reloaded_state = reloaded.load()
+        project = reloaded_state["projects"][project_id]
+        self.assertEqual(project["build_status"], "pending")
+        self.assertEqual(project["setup_snapshot_image"], "")
+        self.assertEqual(project["build_error"], "")
+        self.assertEqual(project["build_started_at"], "")
+        self.assertEqual(project["build_finished_at"], "")
+        self.assertEqual(scheduled, [project_id])
 
     def test_clean_start_clears_chat_artifacts_and_preserves_projects(self) -> None:
         project = self.state.add_project(
