@@ -8,6 +8,17 @@ function safeTimestampMs(value) {
   return parsed;
 }
 
+export function isChatStarting(status, isRunning, isPendingStart) {
+  if (Boolean(isRunning)) {
+    return false;
+  }
+  const normalizedStatus = String(status || "").toLowerCase();
+  if (normalizedStatus === "starting") {
+    return true;
+  }
+  return Boolean(isPendingStart);
+}
+
 export function reconcilePendingSessions(previousSessions, serverChatsById, nowMs = Date.now()) {
   const sessions = Array.isArray(previousSessions) ? previousSessions : [];
   const serverMap = serverChatsById instanceof Map ? serverChatsById : new Map();
