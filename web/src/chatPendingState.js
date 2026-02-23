@@ -100,6 +100,11 @@ export function reconcilePendingChatStarts(previousPendingChatStarts, serverChat
       continue;
     }
 
+    const normalizedStatus = String(serverChat.status || "").toLowerCase();
+    if (normalizedStatus === "failed") {
+      continue;
+    }
+
     const isRunning = Boolean(serverChat.is_running);
     if (!isRunning) {
       next[chatId] = startTimestampMs;

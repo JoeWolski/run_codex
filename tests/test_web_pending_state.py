@@ -76,13 +76,15 @@ class WebPendingStateTests(unittest.TestCase):
                 "chat-starting": baseTimeMs,
                 "chat-stopped": baseTimeMs,
                 "chat-running": baseTimeMs,
+                "chat-failed": baseTimeMs,
                 "chat-missing": baseTimeMs,
                 "chat-falsey": false
               },
               new Map([
                 ["chat-starting", { status: "starting", is_running: false }],
                 ["chat-stopped", { status: "stopped", is_running: false }],
-                ["chat-running", { status: "running", is_running: true }]
+                ["chat-running", { status: "running", is_running: true }],
+                ["chat-failed", { status: "failed", is_running: false }]
               ]),
               baseTimeMs + 5_000
             );

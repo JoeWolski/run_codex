@@ -1774,11 +1774,12 @@ function HubApp() {
       );
       if (matchedServerChat) {
         mappedServerIds.add(matchedServerChat.id);
+        const matchedStatus = String(matchedServerChat.status || "").toLowerCase();
         merged.push({
           ...matchedServerChat,
           id: session.ui_id,
           server_chat_id: matchedServerChat.id,
-          is_pending_start: true
+          is_pending_start: matchedStatus === "starting"
         });
         continue;
       }
@@ -3264,6 +3265,17 @@ function HubApp() {
     const containerRefreshTooltip = isContainerRefreshInFlight
       ? "Refreshing container with latest snapshot..."
       : containerOutdatedReason || "Running on an out-of-date container. Refresh to restart on latest snapshot.";
+    const isFailed = normalizedStatus === "failed";
+    const statusClassName = isRunning ? "running" : isStarting ? "starting" : isFailed ? "failed" : "stopped";
+    const statusLabel = isRunning
+      ? "running"
+      : isStarting
+        ? "starting"
+        : isFailed
+          ? "failed"
+          : (normalizedStatus === "running" ? "stopped" : (normalizedStatus || "stopped"));
+    const statusReason = String(chat.status_reason || "").trim();
+    const startError = String(chat.start_error || "").trim();
     const titleStatus = String(chat.title_status || "idle").toLowerCase();
     const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
     const envCount = (chat.env_vars || []).length;
@@ -3327,6 +3339,8 @@ function HubApp() {
     const titleStateLabel = titleStatus === "error" ? "Title error" : "";
     const rowSubtitle = isStarting
       ? "Starting chat and preparing terminal..."
+      : isFailed && startError
+        ? startError
       : chat.display_subtitle || "No recent assistant summary yet.";
 
     const buildArtifactRenderInfo = (artifact) => {
@@ -3593,10 +3607,15 @@ function HubApp() {
               <section className="chat-details">
                 <div className="meta">
                   Status:{" "}
-                  <span className={`status ${isRunning ? "running" : isStarting ? "starting" : "stopped"}`}>
-                    {isRunning ? chat.status : isStarting ? "starting" : chat.status}
+                  <span className={`status ${statusClassName}`}>
+                    {statusLabel}
                   </span>
                 </div>
+                {statusReason ? <div className="meta">Status reason: {statusReason}</div> : null}
+                {startError ? <div className="meta build-error">Start error: {startError}</div> : null}
+                {chat.last_exit_code !== null && chat.last_exit_code !== undefined
+                  ? <div className="meta">Last exit code: {chat.last_exit_code}</div>
+                  : null}
                 <div className="meta">Title status: {titleStatus || "idle"}</div>
                 {chat.title_error ? <div className="meta build-error">Title generation error: {chat.title_error}</div> : null}
                 <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
@@ -3648,14 +3667,17 @@ function HubApp() {
               />
             ) : chatHasServer ? (
               <div className="stack compact">
-                <div className="meta chat-terminal-stopped">Chat is stopped. Start it to reconnect the terminal.</div>
+                <div className="meta chat-terminal-stopped">
+                  {isFailed ? "Chat failed. Review the error and retry." : "Chat is stopped. Start it to reconnect the terminal."}
+                </div>
+                {isFailed && startError ? <div className="meta build-error">{startError}</div> : null}
                 <div className="actions chat-actions">
                   <button
                     type="button"
                     className="btn-primary chat-primary-action"
                     onClick={() => handleStartChat(resolvedChatId)}
                   >
-                    Start chat
+                    {isFailed ? "Retry chat" : "Start chat"}
                   </button>
                 </div>
               </div>

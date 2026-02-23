@@ -1828,6 +1828,10 @@ Gemini CLI
         ):
             with self.assertRaises(HTTPException):
                 self.state.start_chat(chat["id"])
+        failed_chat = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(failed_chat["status"], "failed")
+        self.assertEqual(failed_chat["status_reason"], "chat_start_failed")
+        self.assertIn("Base path must be inside the checked-out project", failed_chat["start_error"])
 
     def test_publish_chat_artifact_registers_download_metadata(self) -> None:
         project = self.state.add_project(
@@ -2123,6 +2127,28 @@ Gemini CLI
         self.assertEqual(captured["agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
         self.assertEqual(captured["started_chat_id"], "chat-created")
         self.assertEqual(result["id"], "chat-created")
+
+    def test_create_and_start_chat_preserves_failed_chat_when_start_raises(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+
+        with patch.object(
+            hub_server.HubState,
+            "start_chat",
+            side_effect=HTTPException(status_code=500, detail="synthetic start failure"),
+        ):
+            result = self.state.create_and_start_chat(project["id"])
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status_reason"], "chat_start_failed_during_create")
+        self.assertEqual(result["start_error"], "synthetic start failure")
+        reloaded = self.state.load()["chats"][result["id"]]
+        self.assertEqual(reloaded["status"], "failed")
+        self.assertEqual(reloaded["status_reason"], "chat_start_failed_during_create")
+        self.assertEqual(reloaded["start_error"], "synthetic start failure")
 
     def test_create_and_start_chat_passes_agent_type(self) -> None:
         project = self.state.add_project(
@@ -2616,7 +2642,7 @@ Gemini CLI
         self.assertTrue((workspace / "sentinel.txt").exists())
         self.assertIn(chat["id"], self.state.load()["chats"])
 
-    def test_state_payload_prunes_finished_chats(self) -> None:
+    def test_state_payload_marks_finished_running_chat_failed(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
@@ -2639,8 +2665,46 @@ Gemini CLI
         ):
             payload = self.state.state_payload()
 
-        self.assertEqual(payload["chats"], [])
-        self.assertNotIn(chat["id"], self.state.load()["chats"])
+        self.assertEqual(len(payload["chats"]), 1)
+        self.assertEqual(payload["chats"][0]["id"], chat["id"])
+        self.assertEqual(payload["chats"][0]["status"], "failed")
+        self.assertTrue(payload["chats"][0]["start_error"])
+        reloaded = self.state.load()["chats"][chat["id"]]
+        self.assertEqual(reloaded["status"], "failed")
+        self.assertEqual(reloaded["status_reason"], "chat_process_not_running_during_state_refresh")
+        self.assertEqual(reloaded["pid"], None)
+
+    def test_state_transition_logging_includes_reason(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 12345
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=False), self.assertLogs(
+            "agent_hub",
+            level="INFO",
+        ) as captured:
+            self.state.state_payload()
+
+        self.assertTrue(
+            any(
+                "from=running to=failed reason=chat_process_not_running_during_state_refresh" in line
+                for line in captured.output
+            ),
+            msg="\n".join(captured.output),
+        )
 
     def test_state_payload_keeps_new_stopped_chat(self) -> None:
         project = self.state.add_project(

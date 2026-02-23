@@ -1036,6 +1036,7 @@ button:focus-visible {
   border-color: #d1d5db;
 }
 
+.status.failed,
 .project-build-state.failed {
   color: #7f1d1d;
   background: var(--danger-soft);
@@ -1848,6 +1849,7 @@ button:focus-visible {
     border-color: rgba(148, 163, 184, 0.3);
   }
 
+  .status.failed,
   .project-build-state.failed {
     color: #fca5a5;
     background: rgba(239, 68, 68, 0.18);
