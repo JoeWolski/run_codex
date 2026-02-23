@@ -3755,8 +3755,8 @@ function HubApp() {
               {openAiCardExpanded ? (
                 <>
                   <p className="meta">
-                    Connect with either your OpenAI account or an API key. New chat instances and project setup runs will use
-                    whichever credential is available.
+                    Connect your OpenAI account here when you need the Settings login helper for Codex in Docker or remote
+                    environments.
                   </p>
                   <div className="actions">
                     <button
@@ -3796,6 +3796,17 @@ function HubApp() {
 
                   <div className="settings-auth-block">
                     <h4>Login with OpenAI account (browser)</h4>
+                    <div className="settings-auth-help">
+                      <p className="meta settings-auth-help-title">When to use this helper</p>
+                      <p className="meta">
+                        This account login method exists as a convenience helper because OpenAI&apos;s webhook-based auth callback
+                        does not work from Docker containers or remote machines.
+                      </p>
+                      <p className="meta">
+                        Any other Codex auth method, or auth for any other agent, should be done once in the first chat launched
+                        with that agent.
+                      </p>
+                    </div>
                     <ol className="settings-auth-help-list">
                       <li>Click <strong>Start browser login</strong>.</li>
                       <li>Click <strong>Open auth page</strong> and complete sign-in and consent.</li>
@@ -3872,119 +3883,6 @@ function HubApp() {
                     ) : null}
                   </div>
 
-                  <div className="settings-auth-block">
-                    <h4>Login with OpenAI account (device code)</h4>
-                    <ol className="settings-auth-help-list">
-                      <li>Click <strong>Start device code login</strong>.</li>
-                      <li>Click <strong>Open device auth page</strong>.</li>
-                      <li>Enter the one-time code shown below, then approve access.</li>
-                    </ol>
-                    <div className="actions">
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        onClick={() => handleStartOpenAiAccountLogin("device_auth")}
-                        disabled={
-                          openAiAccountStarting ||
-                          openAiAccountCancelling ||
-                          openAiAccountDisconnecting ||
-                          openAiDeviceAuthInFlight
-                        }
-                      >
-                        {openAiAccountStarting
-                          ? <SpinnerLabel text="Starting login..." />
-                          : openAiDeviceAuthInFlight
-                            ? "Device login running"
-                            : "Start device code login"}
-                      </button>
-                      {openAiAccountDirectLoginUrl && openAiAccountSessionMethod === "device_auth" ? (
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => window.open(openAiAccountDirectLoginUrl, "_blank", "noopener,noreferrer")}
-                        >
-                          Open device auth page
-                        </button>
-                      ) : null}
-                    </div>
-                    {openAiAccountSessionMethod === "device_auth" && openAiAccountSession?.deviceCode ? (
-                      <p className="meta">
-                        Enter one-time code: <code>{openAiAccountSession.deviceCode}</code>
-                      </p>
-                    ) : null}
-                  </div>
-
-                  <div className="settings-auth-block">
-                    <h4>Login with API key</h4>
-                    <div className="settings-auth-help">
-                      <p className="meta settings-auth-help-title">How to get an OpenAI API key</p>
-                      <ol className="settings-auth-help-list">
-                        <li>
-                          Open{" "}
-                          <a
-                            href="https://platform.openai.com/api-keys"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                          >
-                            https://platform.openai.com/api-keys
-                          </a>
-                          {" "}and sign in.
-                        </li>
-                        <li>Create a new secret key.</li>
-                        <li>Copy the key immediately (it may only be shown once).</li>
-                        <li>Paste it here and keep &quot;Verify with OpenAI before saving&quot; enabled.</li>
-                      </ol>
-                    </div>
-                    <div className="meta">Saved key: {openAiProviderStatus.keyHint || "none"}</div>
-                    <div className="meta">Last updated: {formatTimestamp(openAiProviderStatus.updatedAt)}</div>
-
-                    <form className="stack compact" onSubmit={handleConnectOpenAi}>
-                      <div className="settings-auth-input-row">
-                        <input
-                          type={showOpenAiDraftKey ? "text" : "password"}
-                          value={openAiDraftKey}
-                          onChange={(event) => setOpenAiDraftKey(event.target.value)}
-                          placeholder="Paste OpenAI API key (sk-...)"
-                          autoComplete="off"
-                          spellCheck={false}
-                        />
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          onClick={() => setShowOpenAiDraftKey((prev) => !prev)}
-                        >
-                          {showOpenAiDraftKey ? "Hide" : "Show"}
-                        </button>
-                      </div>
-                      <label className="settings-checkbox-row">
-                        <input
-                          type="checkbox"
-                          checked={verifyOpenAiOnSave}
-                          onChange={(event) => setVerifyOpenAiOnSave(event.target.checked)}
-                        />
-                        <span>Verify with OpenAI before saving</span>
-                      </label>
-                      <div className="actions">
-                        <button
-                          type="submit"
-                          className="btn-primary"
-                          disabled={openAiSaving || openAiDisconnecting}
-                        >
-                          {openAiSaving
-                            ? <SpinnerLabel text={verifyOpenAiOnSave ? "Verifying..." : "Saving..."} />
-                            : "Connect API key"}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          disabled={!openAiProviderStatus.connected || openAiSaving || openAiDisconnecting}
-                          onClick={handleDisconnectOpenAi}
-                        >
-                          {openAiDisconnecting ? <SpinnerLabel text="Disconnecting..." /> : "Disconnect API key"}
-                        </button>
-                      </div>
-                    </form>
-                  </div>
                   <div className="settings-auth-block">
                     <h4>Test Chat Title Generation</h4>
                     <p className="meta">
