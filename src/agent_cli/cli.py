@@ -4,8 +4,10 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Iterable, Tuple
@@ -35,6 +37,7 @@ GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
+RW_MOUNT_SCAN_LIMIT = 2048
 
 
 def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
@@ -372,6 +375,145 @@ def _parse_mount(spec: str, label: str) -> Tuple[str, str]:
         raise click.ClickException(f"Host path in {label} does not exist: {host}")
 
     return str(host_path), container
+
+
+def _path_metadata(path: Path) -> str:
+    try:
+        info = path.stat()
+    except OSError as exc:
+        return f"stat_error={exc}"
+    permissions = stat.S_IMODE(info.st_mode)
+    return f"uid={info.st_uid} gid={info.st_gid} mode=0o{permissions:03o}"
+
+
+def _rw_mount_preflight_error(*, host_path: Path, container_path: str, reason: str, failing_path: Path | None = None) -> None:
+    runtime_uid = os.getuid()
+    runtime_gid = os.getgid()
+    offending = failing_path or host_path
+    raise click.ClickException(
+        "RW mount preflight failed for "
+        f"{host_path} -> {container_path}: {reason}. "
+        f"offending_path={offending} ({_path_metadata(offending)}); "
+        f"mount_root={host_path} ({_path_metadata(host_path)}); "
+        f"runtime_uid_gid={runtime_uid}:{runtime_gid}"
+    )
+
+
+def _probe_rw_directory(root: Path, container_path: str) -> None:
+    if not os.access(root, os.W_OK | os.X_OK):
+        _rw_mount_preflight_error(
+            host_path=root,
+            container_path=container_path,
+            reason="mount root directory is not writable/executable by current runtime user",
+            failing_path=root,
+        )
+    try:
+        fd, probe_path = tempfile.mkstemp(prefix=".agent_cli_rw_probe_", dir=str(root))
+        os.close(fd)
+        os.unlink(probe_path)
+    except OSError as exc:
+        _rw_mount_preflight_error(
+            host_path=root,
+            container_path=container_path,
+            reason=f"cannot create and remove probe file in mount root ({exc})",
+            failing_path=root,
+        )
+
+
+def _scan_rw_directory_tree(root: Path) -> tuple[Path | None, str]:
+    scanned = 0
+    for current_root, dirs, files in os.walk(root):
+        current = Path(current_root)
+        scanned += 1
+        if not os.access(current, os.W_OK | os.X_OK):
+            return current, "directory is not writable/executable"
+        if scanned >= RW_MOUNT_SCAN_LIMIT:
+            return None, ""
+        for dirname in dirs:
+            candidate = current / dirname
+            scanned += 1
+            if not os.access(candidate, os.W_OK | os.X_OK):
+                return candidate, "directory is not writable/executable"
+            if scanned >= RW_MOUNT_SCAN_LIMIT:
+                return None, ""
+        for filename in files:
+            candidate = current / filename
+            scanned += 1
+            if not os.access(candidate, os.W_OK):
+                return candidate, "file is not writable"
+            if scanned >= RW_MOUNT_SCAN_LIMIT:
+                return None, ""
+    return None, ""
+
+
+def _validate_rw_mount(host_path: Path, container_path: str) -> None:
+    if not host_path.exists():
+        _rw_mount_preflight_error(
+            host_path=host_path,
+            container_path=container_path,
+            reason="host path does not exist",
+            failing_path=host_path,
+        )
+    if host_path.is_dir():
+        _probe_rw_directory(host_path, container_path)
+        unwritable_path, reason = _scan_rw_directory_tree(host_path)
+        if unwritable_path is not None:
+            _rw_mount_preflight_error(
+                host_path=host_path,
+                container_path=container_path,
+                reason=reason,
+                failing_path=unwritable_path,
+            )
+        return
+    if host_path.is_file():
+        if not os.access(host_path, os.W_OK):
+            _rw_mount_preflight_error(
+                host_path=host_path,
+                container_path=container_path,
+                reason="file mount path is not writable",
+                failing_path=host_path,
+            )
+        try:
+            with host_path.open("ab"):
+                pass
+        except OSError as exc:
+            _rw_mount_preflight_error(
+                host_path=host_path,
+                container_path=container_path,
+                reason=f"cannot open file in append mode ({exc})",
+                failing_path=host_path,
+            )
+        return
+    _rw_mount_preflight_error(
+        host_path=host_path,
+        container_path=container_path,
+        reason="mount path must be a regular file or directory",
+        failing_path=host_path,
+    )
+
+
+def _build_snapshot_setup_shell_script(setup_script: str) -> str:
+    normalized_script = (setup_script or "").strip() or ":"
+    return (
+        "set -e\n"
+        "set -o pipefail\n"
+        "printf '%s\\n' '[agent_cli] snapshot bootstrap: configuring git safe.directory'\n"
+        "git config --global --add safe.directory '*'\n"
+        'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ]; then\n'
+        '  if [ ! -f "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" ]; then\n'
+        "    printf '%s\\n' '[agent_cli] snapshot bootstrap failed: AGENT_HUB_GIT_CREDENTIALS_SOURCE is set but file is missing' >&2\n"
+        "    printf '%s\\n' \"[agent_cli] missing path: ${AGENT_HUB_GIT_CREDENTIALS_SOURCE}\" >&2\n"
+        "    exit 96\n"
+        "  fi\n"
+        '  credential_target="${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}"\n'
+        "  printf '%s\\n' \"[agent_cli] snapshot bootstrap: copying git credentials to ${credential_target}\"\n"
+        '  cp "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" "${credential_target}"\n'
+        '  chmod 600 "${credential_target}"\n'
+        "fi\n"
+        "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'\n"
+        + normalized_script
+        + "\n"
+    )
 
 
 def _parse_env_var(spec: str, label: str) -> str:
@@ -755,6 +897,7 @@ def main(
 
     ro_mount_flags: list[str] = []
     rw_mount_flags: list[str] = []
+    rw_mount_specs: list[tuple[Path, str]] = []
 
     for mount in ro_mounts:
         host, container = _parse_mount(mount, "--ro-mount")
@@ -763,6 +906,7 @@ def main(
     for mount in rw_mounts:
         host, container = _parse_mount(mount, "--rw-mount")
         rw_mount_flags.append(f"{host}:{container}")
+        rw_mount_specs.append((Path(host), container))
 
     parsed_env_vars: list[str] = []
     for entry in env_vars:
@@ -888,12 +1032,19 @@ def main(
     if snapshot_tag:
         should_build_snapshot = not cached_snapshot_exists
         if should_build_snapshot:
+            click.echo(
+                f"Running RW mount preflight checks for setup snapshot '{snapshot_tag}'",
+                err=True,
+            )
+            for host_path, container_path in rw_mount_specs:
+                _validate_rw_mount(host_path, container_path)
             _build_runtime_image(
                 base_image=ensure_selected_base_image(),
                 target_image=DEFAULT_SETUP_RUNTIME_IMAGE,
                 agent_provider=AGENT_PROVIDER_NONE,
             )
             script = (setup_script or "").strip() or ":"
+            setup_bootstrap_script = _build_snapshot_setup_shell_script(script)
             click.echo(f"Building setup snapshot image '{snapshot_tag}'")
             container_name = (
                 f"agent-setup-{_sanitize_tag_component(project_path.name)}-"
@@ -909,16 +1060,7 @@ def main(
                 *run_args,
                 DEFAULT_SETUP_RUNTIME_IMAGE,
                 "-lc",
-                (
-                    "set -e\n"
-                    "git config --system --add safe.directory '*' || true\n"
-                    'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ] && [ -f "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" ]; then\n'
-                    '  cp "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" "${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}" || true\n'
-                    '  chmod 600 "${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}" || true\n'
-                    "fi\n"
-                    + script
-                    + "\n"
-                ),
+                setup_bootstrap_script,
             ]
             _docker_rm_force(container_name)
             try:

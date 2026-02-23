@@ -3464,6 +3464,12 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertNotIn("\ninstructions = \"\"\"\n", content)
         self.assertIn("hub_artifact publish <path> [<path> ...]", content)
         self.assertIn("If the user asks for a file", content)
+        self.assertIn(
+            "Do not introduce fallback implementation paths unless the user explicitly requests fallback behavior",
+            content,
+        )
+        self.assertIn("When a requested implementation fails, fail fast with a hard error.", content)
+        self.assertIn("Do not swallow, mask, or ignore errors with permissive operators", content)
 
     def test_parse_env_var_valid(self) -> None:
         self.assertEqual(image_cli._parse_env_var("FOO=bar", "--env-var"), "FOO=bar")
@@ -3519,9 +3525,12 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--entrypoint", setup_cmd)
             self.assertIn("bash", setup_cmd)
             setup_script = setup_cmd[-1]
-            self.assertIn("git config --system --add safe.directory '*'", setup_script)
+            self.assertIn("set -o pipefail", setup_script)
+            self.assertIn("git config --global --add safe.directory '*'", setup_script)
             self.assertIn('AGENT_HUB_GIT_CREDENTIALS_SOURCE', setup_script)
             self.assertIn('AGENT_HUB_GIT_CREDENTIALS_FILE', setup_script)
+            self.assertNotIn("git config --system", setup_script)
+            self.assertNotIn("|| true", setup_script)
             self.assertNotIn("chown -R", setup_script)
             commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
             self.assertIsNotNone(commit_cmd)
@@ -3568,6 +3577,59 @@ class CliEnvVarTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
+            self.assertEqual(commands, [])
+
+    def test_snapshot_preflight_fails_on_unwritable_rw_mount_before_docker_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            rw_mount = tmp_path / "rw-mount"
+            locked_dir = rw_mount / "x86_64-linux" / "packages"
+            locked_dir.mkdir(parents=True, exist_ok=True)
+            locked_dir.chmod(0o500)
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            try:
+                with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                    "agent_cli.cli._read_openai_api_key", return_value=None
+                ), patch(
+                    "agent_cli.cli._docker_image_exists", return_value=False
+                ), patch(
+                    "agent_cli.cli._docker_rm_force", return_value=None
+                ), patch(
+                    "agent_cli.cli._run", side_effect=fake_run
+                ):
+                    result = runner.invoke(
+                        image_cli.main,
+                        [
+                            "--project",
+                            str(project),
+                            "--config-file",
+                            str(config),
+                            "--rw-mount",
+                            f"{rw_mount}:/workspace/.ark_toolchain_cache",
+                            "--snapshot-image-tag",
+                            "snapshot:test",
+                            "--setup-script",
+                            "echo hello",
+                            "--prepare-snapshot-only",
+                        ],
+                    )
+            finally:
+                locked_dir.chmod(0o700)
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("RW mount preflight failed", result.output)
+            self.assertIn(str(locked_dir), result.output)
             self.assertEqual(commands, [])
 
     def test_no_alt_screen_flag_passes_through_to_codex_command(self) -> None:
