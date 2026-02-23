@@ -57,12 +57,14 @@ RUN chmod +x \
       /opt/agent_hub/bin/agent_cli \
       /opt/agent_hub/bin/agent_hub \
       /opt/agent_hub/docker/agent_cli/hub_artifact \
+      /opt/agent_hub/docker/development/verify-demo-tooling.sh \
  && UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev \
  && cd /opt/agent_hub/web \
  && corepack yarn install --frozen-lockfile \
  && cd /opt/agent_hub/tools/demo \
  && npm ci \
- && npx playwright install --with-deps firefox
+ && npx playwright install --with-deps firefox \
+ && /opt/agent_hub/docker/development/verify-demo-tooling.sh
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]

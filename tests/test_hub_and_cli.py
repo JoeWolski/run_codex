@@ -27,6 +27,7 @@ DOCKER_ENTRYPOINT = ROOT / "docker" / "agent_cli" / "docker-entrypoint.py"
 AGENT_CLI_DOCKERFILE = ROOT / "docker" / "agent_cli" / "Dockerfile"
 AGENT_HUB_DOCKERFILE = ROOT / "docker" / "agent_hub" / "Dockerfile"
 DEVELOPMENT_DOCKERFILE = ROOT / "docker" / "development" / "Dockerfile"
+DEVELOPMENT_VERIFY_SCRIPT = ROOT / "docker" / "development" / "verify-demo-tooling.sh"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -4031,6 +4032,30 @@ class CliEnvVarTests(unittest.TestCase):
 
         self.assertEqual(exported_lines, [])
         self.assertIn("UV_PROJECT_ENVIRONMENT=/opt/agent_hub/.venv uv sync --frozen --no-dev", content)
+
+    def test_development_dockerfile_runs_demo_tooling_verification_script(self) -> None:
+        content = DEVELOPMENT_DOCKERFILE.read_text(encoding="utf-8")
+        verify_call = "&& /opt/agent_hub/docker/development/verify-demo-tooling.sh"
+
+        self.assertIn("/opt/agent_hub/docker/development/verify-demo-tooling.sh", content)
+        self.assertIn(verify_call, content)
+        self.assertLess(
+            content.index("npx playwright install --with-deps firefox"),
+            content.index(verify_call),
+        )
+
+    def test_development_verify_script_checks_recording_and_playwright_stack(self) -> None:
+        self.assertTrue(DEVELOPMENT_VERIFY_SCRIPT.is_file())
+        content = DEVELOPMENT_VERIFY_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("required_commands=(", content)
+        self.assertIn("ffmpeg", content)
+        self.assertIn("xdotool", content)
+        self.assertIn("xvfb-run", content)
+        self.assertIn("import { firefox } from \"playwright\";", content)
+        self.assertIn("headless: true", content)
+        self.assertIn("headless: false", content)
+        self.assertIn("ffmpeg -hide_banner -loglevel error -y", content)
 
     def test_ensure_claude_json_file_initializes_missing_file_with_valid_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
