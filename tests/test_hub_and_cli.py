@@ -176,6 +176,20 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
         self.assertEqual(loaded["build_status"], "ready")
 
+    def test_settings_default_agent_type_persists_and_is_exposed(self) -> None:
+        initial_settings = self.state.settings_payload()
+        self.assertEqual(initial_settings["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
+        initial_state_payload = self.state.state_payload()
+        self.assertEqual(initial_state_payload["settings"]["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
+
+        updated_settings = self.state.update_settings({"default_agent_type": "claude"})
+        self.assertEqual(updated_settings["default_agent_type"], "claude")
+
+        reloaded = self.state.load()
+        self.assertEqual(reloaded["settings"]["default_agent_type"], "claude")
+        updated_state_payload = self.state.state_payload()
+        self.assertEqual(updated_state_payload["settings"]["default_agent_type"], "claude")
+
     def test_agent_capabilities_cache_loads_on_startup(self) -> None:
         cache_payload = {
             "version": 1,
@@ -1836,6 +1850,36 @@ class HubStateTests(unittest.TestCase):
 
         self.assertEqual(captured["agent_type"], "claude")
         self.assertEqual(result["id"], "chat-created")
+
+    def test_create_and_start_chat_uses_configured_default_agent_type(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        self.state.update_settings({"default_agent_type": "gemini"})
+        captured: dict[str, object] = {}
+
+        def fake_create(
+            _: hub_server.HubState,
+            project_id: str,
+            profile: str | None,
+            ro_mounts: list[str],
+            rw_mounts: list[str],
+            env_vars: list[str],
+            agent_args: list[str] | None = None,
+            agent_type: str | None = None,
+        ) -> dict[str, str]:
+            del project_id, profile, ro_mounts, rw_mounts, env_vars, agent_args
+            captured["agent_type"] = agent_type
+            return {"id": "chat-created"}
+
+        with patch.object(hub_server.HubState, "create_chat", fake_create), patch.object(
+            hub_server.HubState, "start_chat", return_value={"id": "chat-created", "status": "running"}
+        ):
+            self.state.create_and_start_chat(project["id"])
+
+        self.assertEqual(captured["agent_type"], "gemini")
 
     def test_start_chat_rejects_when_stored_snapshot_tag_is_stale(self) -> None:
         project = self.state.add_project(
@@ -5641,6 +5685,57 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             agent_args=["--model", "gpt-5.3-codex"],
             agent_type="codex",
         )
+
+    def test_project_chat_start_route_uses_configured_default_agent_type_when_not_provided(self) -> None:
+        app = self._build_app()
+        chat = {"id": "chat-1", "status": "running"}
+
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ) as to_thread, patch.object(
+            hub_server.HubState,
+            "default_chat_agent_type",
+            return_value="claude",
+        ) as default_agent_type, patch.object(
+            hub_server.HubState,
+            "create_and_start_chat",
+            return_value=chat,
+        ) as start_chat:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/chats/start",
+                    json={"agent_args": ["--model", "sonnet"]},
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {"chat": chat})
+        to_thread.assert_awaited_once()
+        default_agent_type.assert_called_once_with()
+        start_chat.assert_called_once_with(
+            "project-1",
+            agent_args=["--model", "sonnet"],
+            agent_type="claude",
+        )
+
+    def test_settings_patch_route_updates_default_agent_type(self) -> None:
+        app = self._build_app()
+        updated_settings = {"default_agent_type": "gemini"}
+
+        with patch.object(
+            hub_server.HubState,
+            "update_settings",
+            return_value=updated_settings,
+        ) as update_settings:
+            with TestClient(app) as client:
+                response = client.patch(
+                    "/api/settings",
+                    json={"default_agent_type": "gemini"},
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {"settings": updated_settings})
+        update_settings.assert_called_once_with({"default_agent_type": "gemini"})
 
     def test_agent_capabilities_routes_return_cached_and_discovery_payloads(self) -> None:
         app = self._build_app()

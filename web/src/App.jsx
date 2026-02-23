@@ -25,6 +25,7 @@ import {
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY = "agent_hub_project_config_mode";
 const DEFAULT_AGENT_TYPE = "codex";
+const DEFAULT_HUB_SETTINGS = { defaultAgentType: DEFAULT_AGENT_TYPE };
 const DEFAULT_AGENT_CAPABILITIES = {
   version: 1,
   updatedAt: "",
@@ -59,6 +60,16 @@ const DEFAULT_AGENT_CAPABILITIES = {
   ]
 };
 
+function normalizeHubStatePayload(rawPayload) {
+  return {
+    projects: Array.isArray(rawPayload?.projects) ? rawPayload.projects : [],
+    chats: Array.isArray(rawPayload?.chats) ? rawPayload.chats : [],
+    settings: rawPayload?.settings && typeof rawPayload.settings === "object"
+      ? rawPayload.settings
+      : { default_agent_type: DEFAULT_HUB_SETTINGS.defaultAgentType }
+  };
+}
+
 function normalizeModeOptions(rawOptions, fallbackOptions) {
   const source = Array.isArray(rawOptions) ? rawOptions : fallbackOptions;
   const values = source.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
@@ -79,13 +90,22 @@ function normalizeModeOptions(rawOptions, fallbackOptions) {
 
 function normalizeAgentType(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
   const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized || normalized === "default") {
+    return DEFAULT_AGENT_TYPE;
+  }
   const knownTypes = (capabilities?.agents || [])
     .map((agent) => String(agent?.agentType || "").trim().toLowerCase())
-    .filter(Boolean);
+    .filter((agentType) => Boolean(agentType && agentType !== "default"));
   if (knownTypes.includes(normalized)) {
     return normalized;
   }
   return DEFAULT_AGENT_TYPE;
+}
+
+function normalizeHubSettings(rawSettings, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  return {
+    defaultAgentType: normalizeAgentType(rawSettings?.defaultAgentType || rawSettings?.default_agent_type, capabilities)
+  };
 }
 
 function normalizeAgentCapabilities(rawPayload) {
@@ -151,7 +171,7 @@ function agentTypeOptions(capabilities = DEFAULT_AGENT_CAPABILITIES) {
   return (capabilities?.agents || []).map((agent) => ({
     value: String(agent?.agentType || "").trim().toLowerCase(),
     label: String(agent?.label || agent?.agentType || "")
-  })).filter((agent) => Boolean(agent.value && agent.label));
+  })).filter((agent) => Boolean(agent.value && agent.label && agent.value !== "default"));
 }
 
 function agentTypeLabel(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
@@ -1412,7 +1432,7 @@ function OpenAiAuthCallbackPage() {
 }
 
 function HubApp() {
-  const [hubState, setHubState] = useState({ projects: [], chats: [] });
+  const [hubState, setHubState] = useState(() => normalizeHubStatePayload(null));
   const [agentCapabilities, setAgentCapabilities] = useState(() =>
     normalizeAgentCapabilities(DEFAULT_AGENT_CAPABILITIES)
   );
@@ -1437,6 +1457,7 @@ function HubApp() {
   const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
   const [pendingChatStarts, setPendingChatStarts] = useState({});
   const [themePreference, setThemePreference] = useState(() => loadThemePreference());
+  const [defaultAgentSettingSaving, setDefaultAgentSettingSaving] = useState(false);
   const [openAiProviderStatus, setOpenAiProviderStatus] = useState(() =>
     normalizeOpenAiProviderStatus(null)
   );
@@ -1481,15 +1502,20 @@ function HubApp() {
   const capabilitiesRefreshInFlightRef = useRef(false);
   const capabilitiesRefreshQueuedRef = useRef(false);
   const githubSetupResolutionRef = useRef("");
+  const hubSettings = useMemo(
+    () => normalizeHubSettings(hubState.settings, agentCapabilities),
+    [hubState.settings, agentCapabilities]
+  );
 
   const applyStatePayload = useCallback((payload) => {
-    setHubState(payload);
-    const serverChatMap = new Map((payload.chats || []).map((chat) => [chat.id, chat]));
+    const normalizedPayload = normalizeHubStatePayload(payload);
+    setHubState(normalizedPayload);
+    const serverChatMap = new Map((normalizedPayload.chats || []).map((chat) => [chat.id, chat]));
     setPendingSessions((prev) => reconcilePendingSessions(prev, serverChatMap));
     setPendingChatStarts((prev) => reconcilePendingChatStarts(prev, serverChatMap));
     setPendingProjectBuilds((prev) => {
       const next = {};
-      for (const project of payload.projects || []) {
+      for (const project of normalizedPayload.projects || []) {
         if (prev[project.id] && String(project.build_status || "") === "building") {
           next[project.id] = true;
         }
@@ -1999,12 +2025,12 @@ function HubApp() {
     setChatStartSettingsByProject((prev) => {
       const next = {};
       for (const project of hubState.projects) {
-        const current = prev[project.id] || { agentType: DEFAULT_AGENT_TYPE };
+        const current = prev[project.id] || { agentType: hubSettings.defaultAgentType };
         next[project.id] = normalizeChatStartSettings(current, agentCapabilities);
       }
       return next;
     });
-  }, [hubState.projects, agentCapabilities]);
+  }, [hubState.projects, agentCapabilities, hubSettings.defaultAgentType]);
 
   useEffect(() => {
     const activeProjectIds = new Set(
@@ -2045,6 +2071,13 @@ function HubApp() {
     }));
     return [...pendingRows, ...(hubState.projects || [])];
   }, [hubState.projects, pendingAutoConfigProjects]);
+  const settingsAgentOptions = useMemo(() => {
+    const options = agentTypeOptions(agentCapabilities);
+    if (options.length > 0) {
+      return options;
+    }
+    return [{ value: DEFAULT_HUB_SETTINGS.defaultAgentType, label: "Codex" }];
+  }, [agentCapabilities]);
   const createProjectManualMode = shouldShowManualProjectConfigInputs(createProjectConfigMode);
 
   function updateCreateForm(patch) {
@@ -2061,7 +2094,7 @@ function HubApp() {
   function updateProjectChatStartSettings(projectId, patch) {
     setChatStartSettingsByProject((prev) => {
       const current = normalizeChatStartSettings(
-        prev[projectId] || { agentType: DEFAULT_AGENT_TYPE },
+        prev[projectId] || { agentType: hubSettings.defaultAgentType },
         agentCapabilities
       );
       const candidate = {
@@ -2074,6 +2107,57 @@ function HubApp() {
         [projectId]: normalized
       };
     });
+  }
+
+  async function handleUpdateDefaultAgentSetting(rawAgentType) {
+    const previousDefaultAgentType = hubSettings.defaultAgentType;
+    const nextDefaultAgentType = normalizeAgentType(rawAgentType, agentCapabilities);
+    setHubState((prev) => ({
+      ...prev,
+      settings: { ...(prev.settings || {}), default_agent_type: nextDefaultAgentType }
+    }));
+    setChatStartSettingsByProject((prev) => {
+      const next = {};
+      for (const project of hubState.projects) {
+        const current = normalizeChatStartSettings(
+          prev[project.id] || { agentType: previousDefaultAgentType },
+          agentCapabilities
+        );
+        if (current.agentType !== previousDefaultAgentType) {
+          next[project.id] = current;
+          continue;
+        }
+        next[project.id] = normalizeChatStartSettings(
+          {
+            ...current,
+            agentType: nextDefaultAgentType,
+            model: "default",
+            reasoning: "default"
+          },
+          agentCapabilities
+        );
+      }
+      return next;
+    });
+    setDefaultAgentSettingSaving(true);
+    try {
+      const payload = await fetchJson("/api/settings", {
+        method: "PATCH",
+        body: JSON.stringify({ default_agent_type: nextDefaultAgentType })
+      });
+      setHubState((prev) => ({
+        ...prev,
+        settings: payload?.settings && typeof payload.settings === "object"
+          ? payload.settings
+          : { ...(prev.settings || {}), default_agent_type: nextDefaultAgentType }
+      }));
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+      refreshState().catch(() => {});
+    } finally {
+      setDefaultAgentSettingSaving(false);
+    }
   }
 
   function markProjectBuilding(projectId) {
@@ -2311,7 +2395,7 @@ function HubApp() {
     const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const project = projectsById.get(projectId);
     const selectedStartSettings = normalizeChatStartSettings(
-      startSettings || chatStartSettingsByProject[projectId] || { agentType: DEFAULT_AGENT_TYPE },
+      startSettings || chatStartSettingsByProject[projectId] || { agentType: hubSettings.defaultAgentType },
       agentCapabilities
     );
     const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings, agentCapabilities);
@@ -3881,7 +3965,7 @@ function HubApp() {
                 const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
                 const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
                 const projectStartSettings = normalizeChatStartSettings(
-                  chatStartSettingsByProject[project.id] || { agentType: DEFAULT_AGENT_TYPE },
+                  chatStartSettingsByProject[project.id] || { agentType: hubSettings.defaultAgentType },
                   agentCapabilities
                 );
                 const projectAgentOptions = agentTypeOptions(agentCapabilities);
@@ -4038,7 +4122,27 @@ function HubApp() {
                   <option value="dark">Dark</option>
                 </select>
               </label>
+              <label className="theme-control" htmlFor="default-agent-type-select">
+                <span>Default new-chat agent</span>
+                <select
+                  id="default-agent-type-select"
+                  value={hubSettings.defaultAgentType}
+                  onChange={(event) => handleUpdateDefaultAgentSetting(event.target.value)}
+                  disabled={defaultAgentSettingSaving}
+                >
+                  {settingsAgentOptions.map((option) => (
+                    <option key={`settings-default-agent-${option.value}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
+            <p className="meta settings-default-agent-note">
+              {defaultAgentSettingSaving
+                ? "Saving default agent..."
+                : "New chat controls start with this agent by default. You can still override per chat before launch."}
+            </p>
             <div className="settings-provider-list">
             <article className="card auth-provider-card">
               <div className="project-head">

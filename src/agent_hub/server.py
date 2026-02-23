@@ -768,7 +768,20 @@ def _iso_from_timestamp(timestamp: float) -> str:
 
 
 def _new_state() -> dict[str, Any]:
-    return {"version": 1, "projects": {}, "chats": {}}
+    return {
+        "version": 1,
+        "projects": {},
+        "chats": {},
+        "settings": {"default_agent_type": DEFAULT_CHAT_AGENT_TYPE},
+    }
+
+
+def _normalize_hub_settings_payload(raw_settings: Any) -> dict[str, Any]:
+    if not isinstance(raw_settings, dict):
+        raw_settings = {}
+    return {
+        "default_agent_type": _normalize_chat_agent_type(raw_settings.get("default_agent_type")),
+    }
 
 
 def _ordered_supported_agent_types() -> tuple[str, ...]:
@@ -2798,7 +2811,12 @@ class HubState:
             projects = {}
         if not isinstance(chats, dict):
             chats = {}
-        state = {"version": loaded.get("version", 1), "projects": projects, "chats": chats}
+        state = {
+            "version": loaded.get("version", 1),
+            "projects": projects,
+            "chats": chats,
+            "settings": _normalize_hub_settings_payload(loaded.get("settings")),
+        }
         for chat in state["chats"].values():
             if not isinstance(chat, dict):
                 continue
@@ -3133,6 +3151,26 @@ class HubState:
             with self.state_file.open("w", encoding="utf-8") as fp:
                 json.dump(state, fp, indent=2)
         self._emit_state_changed(reason=reason)
+
+    def settings_payload(self) -> dict[str, Any]:
+        state = self.load()
+        return _normalize_hub_settings_payload(state.get("settings"))
+
+    def default_chat_agent_type(self) -> str:
+        settings = self.settings_payload()
+        return str(settings.get("default_agent_type") or DEFAULT_CHAT_AGENT_TYPE)
+
+    def update_settings(self, update: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(update, dict):
+            raise HTTPException(status_code=400, detail="Invalid settings payload.")
+        if "default_agent_type" not in update:
+            raise HTTPException(status_code=400, detail="No settings values provided.")
+        state = self.load()
+        settings = _normalize_hub_settings_payload(state.get("settings"))
+        settings["default_agent_type"] = _normalize_chat_agent_type(update.get("default_agent_type"), strict=True)
+        state["settings"] = settings
+        self.save(state, reason="settings_updated")
+        return settings
 
     def _openai_credentials_arg(self) -> list[str]:
         return ["--credentials-file", str(self.openai_credentials_file)]
@@ -6070,6 +6108,11 @@ class HubState:
         if build_status != "ready":
             raise HTTPException(status_code=409, detail="Project image is still being built. Save settings and wait.")
         normalized_agent_args = [str(arg) for arg in (agent_args or []) if str(arg).strip()]
+        resolved_agent_type = (
+            self.default_chat_agent_type()
+            if agent_type is None
+            else _normalize_chat_agent_type(agent_type)
+        )
         chat = self.create_chat(
             project_id,
             profile="",
@@ -6077,7 +6120,7 @@ class HubState:
             rw_mounts=list(project.get("default_rw_mounts") or []),
             env_vars=list(project.get("default_env_vars") or []),
             agent_args=normalized_agent_args,
-            agent_type=_normalize_chat_agent_type(agent_type),
+            agent_type=resolved_agent_type,
         )
         return self.start_chat(chat["id"])
 
@@ -6994,6 +7037,7 @@ class HubState:
 
         state["chats"] = chats
         state["projects"] = list(project_map.values())
+        state["settings"] = _normalize_hub_settings_payload(state.get("settings"))
         return state
 
     def start_chat(self, chat_id: str) -> dict[str, Any]:
@@ -7946,6 +7990,18 @@ def main(
     def api_state() -> dict[str, Any]:
         return state.state_payload()
 
+    @app.get("/api/settings")
+    def api_settings() -> dict[str, Any]:
+        return {"settings": state.settings_payload()}
+
+    @app.patch("/api/settings")
+    async def api_update_settings(request: Request) -> dict[str, Any]:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        updated = state.update_settings(payload)
+        return {"settings": updated}
+
     @app.get("/api/agent-capabilities")
     def api_agent_capabilities() -> dict[str, Any]:
         return state.agent_capabilities_payload()
@@ -8225,7 +8281,7 @@ def main(
         agent_type = (
             _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
             if "agent_type" in payload
-            else DEFAULT_CHAT_AGENT_TYPE
+            else state.default_chat_agent_type()
         )
         chat = await asyncio.to_thread(
             state.create_and_start_chat,
@@ -8261,7 +8317,7 @@ def main(
         agent_type = (
             _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
             if "agent_type" in payload
-            else DEFAULT_CHAT_AGENT_TYPE
+            else state.default_chat_agent_type()
         )
         chat = await asyncio.to_thread(
             state.create_chat,
