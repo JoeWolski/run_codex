@@ -4021,6 +4021,15 @@ class CliEnvVarTests(unittest.TestCase):
             content.index("RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"),
         )
 
+    def test_agent_cli_dockerfile_precreates_workspace_config_dir_for_runtime_mounts(self) -> None:
+        content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn("/workspace/.config", content)
+        self.assertLess(
+            content.index("/workspace/.config"),
+            content.index("chmod -R 0777 /workspace"),
+        )
+
     def test_agent_hub_dockerfile_uses_build_only_uv_project_environment(self) -> None:
         content = AGENT_HUB_DOCKERFILE.read_text(encoding="utf-8")
         exported_lines = [line.strip() for line in content.splitlines() if line.strip().startswith("UV_PROJECT_ENVIRONMENT=")]

@@ -43,7 +43,7 @@ RUN if ! id -u agent >/dev/null 2>&1; then \
  && chown -R "agent:${agent_group}" /home/agent \
  && mkdir -p /tmp \
  && chmod 1777 /tmp \
- && mkdir -p /workspace/.cache/uv /workspace/.codex \
+ && mkdir -p /workspace/.cache/uv /workspace/.codex /workspace/.config \
  && chmod -R 0777 /workspace
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
