@@ -90,6 +90,27 @@ No manual artifact wiring is required for `agent_hub` chats:
 - `agent_cli` appends project-doc bootstrap hints (from `config/agent.config.toml`) to the same shared prompt context for all providers.
 - The default `SYSTEM_PROMPT.md` already includes instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
 
+### Optional: install launchers in `~/.local/bin`
+
+If you want `agent_cli` and `agent_hub` available directly on your PATH, run:
+
+```bash
+./bin/install [--add-path | --skip-add-path] <Update Method>
+```
+
+`<Update Method>` is required and must be one of:
+
+- `none`: run tools from your current local checkout.
+- `head`: before every run, fetch the latest commit on the repository default branch (`origin/HEAD`) and run that updated commit via a cached git worktree.
+
+PATH handling behavior:
+
+- The installer checks whether `~/.local/bin` is currently on `PATH`.
+- If missing, it can append `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file for `sh` (`~/.profile`), `bash` (`~/.bashrc`), or `zsh` (`~/.zshrc`).
+- By default, it prompts before updating `PATH` when run interactively.
+- `--add-path` performs the rc-file update without prompting.
+- `--skip-add-path` skips the rc-file update without prompting.
+
 ## Chat Agent Prompt Context (Major Files)
 
 For day-to-day prompt/setup changes, these are the main files that assemble most of the chat agent context:
