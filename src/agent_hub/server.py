@@ -46,7 +46,6 @@ AGENT_CAPABILITIES_CACHE_FILE_NAME = "agent_capabilities_cache.json"
 SECRETS_DIR_NAME = "secrets"
 OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
-CODEX_MODELS_CACHE_FILE_NAME = "models_cache.json"
 GITHUB_APP_INSTALLATION_FILE_NAME = "github_app_installation.json"
 GITHUB_PERSONAL_ACCESS_TOKEN_FILE_NAME = "github_personal_access_token.json"
 GITHUB_GIT_CREDENTIALS_FILE_NAME = "github_credentials"
@@ -97,39 +96,58 @@ AGENT_LABEL_BY_TYPE = {
     AGENT_TYPE_GEMINI: "Gemini CLI",
 }
 AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE = {
-    AGENT_TYPE_CODEX: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
-    AGENT_TYPE_CLAUDE: ["default", "sonnet", "opus", "haiku"],
+    AGENT_TYPE_CODEX: ["default"],
+    AGENT_TYPE_CLAUDE: ["default"],
     AGENT_TYPE_GEMINI: ["default"],
 }
 AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE = {
-    AGENT_TYPE_CODEX: ["default", "minimal", "low", "medium", "high", "xhigh"],
+    AGENT_TYPE_CODEX: ["default"],
     AGENT_TYPE_CLAUDE: ["default"],
     AGENT_TYPE_GEMINI: ["default"],
 }
 AGENT_CAPABILITY_MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,120}")
 AGENT_CAPABILITY_CODEX_MODEL_TOKEN_RE = re.compile(r"^(?:gpt-[a-z0-9][a-z0-9._-]*|o[0-9][a-z0-9._-]*)$")
-AGENT_CAPABILITY_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
-AGENT_CAPABILITY_REASONING_VALUE_RE = re.compile(r"\b(?:minimal|low|medium|high|xhigh)\b")
+AGENT_CAPABILITY_GEMINI_MODEL_ALIASES = {"auto", "pro", "flash", "flash-lite"}
+AGENT_CAPABILITY_REASONING_LEVELS_BY_TYPE = {
+    AGENT_TYPE_CODEX: ("minimal", "low", "medium", "high", "xhigh"),
+    AGENT_TYPE_CLAUDE: ("low", "medium", "high", "max"),
+    AGENT_TYPE_GEMINI: ("low", "medium", "high", "max"),
+}
+AGENT_CAPABILITY_REASONING_VALUE_RE = re.compile(r"\b(?:minimal|low|medium|high|xhigh|max)\b")
 AGENT_CAPABILITY_REASONING_LIST_RE = re.compile(
-    r"(?:\bsupported\b|\bavailable\b)?\s*\breasoning(?:\s+effort)?\s+modes?\b\s*[:=-]\s*([^\n\r]+)",
+    r"(?:\b(?:reasoning|effort|thinking)(?:\s+(?:mode|modes|level|levels|effort))?\b[^:\n\r]{0,48})"
+    r"(?:\b(?:possible values?|choices?|available values?|valid values?)\b)?\s*[:=-]\s*([^\n\r]+)",
     re.IGNORECASE,
 )
+AGENT_CAPABILITY_MODEL_LIST_RE = re.compile(
+    r"(?:\bmodel(?:\s+aliases?)?\b[^:\n\r]{0,48})"
+    r"(?:\b(?:possible values?|choices?|available values?|valid values?)\b)?\s*[:=-]\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
+AGENT_CAPABILITY_HELP_OPTION_RE = re.compile(r"(?<!\w)--([a-z0-9][a-z0-9-]*)", re.IGNORECASE)
+AGENT_CAPABILITY_HELP_LIST_MARKER_RE = re.compile(
+    r"\b(?:possible values?|choices?|available values?|valid values?)\b", re.IGNORECASE
+)
+AGENT_CAPABILITY_HELP_LIST_VALUE_RE = re.compile(
+    r"\b(?:possible values?|choices?|available values?|valid values?)\b\s*[:=-]\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
+AGENT_CAPABILITY_HELP_INLINE_VALUES_RE = re.compile(
+    r"\[\s*possible values?\s*:\s*([^\]]+)\]", re.IGNORECASE
+)
+AGENT_CAPABILITY_HELP_BULLET_VALUE_RE = re.compile(r"^\s*-\s*([A-Za-z0-9][A-Za-z0-9._-]{0,80})\b")
+AGENT_CAPABILITY_HELP_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,80}")
 AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS = float(
     os.environ.get("AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS", "8.0")
 )
 AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE = {
     AGENT_TYPE_CODEX: (
-        ("codex", "models", "--json"),
-        ("codex", "models"),
+        ("codex", "--help"),
     ),
     AGENT_TYPE_CLAUDE: (
-        ("claude", "models", "--json"),
-        ("claude", "models"),
         ("claude", "--help"),
     ),
     AGENT_TYPE_GEMINI: (
-        ("gemini", "models", "--json"),
-        ("gemini", "models"),
         ("gemini", "--help"),
     ),
 }
@@ -814,8 +832,8 @@ def _normalize_mode_options(raw_values: Any, fallback: list[str]) -> list[str]:
 
 
 def _normalize_model_options_for_agent(agent_type: str, raw_values: Any, fallback: list[str]) -> list[str]:
-    fallback_normalized = _normalize_mode_options(fallback, ["default"])
-    candidate_values = _normalize_mode_options(raw_values, fallback_normalized)
+    del fallback
+    candidate_values = _normalize_mode_options(raw_values, ["default"])
     filtered = ["default"]
     seen = {"default"}
     for value in candidate_values:
@@ -827,41 +845,15 @@ def _normalize_model_options_for_agent(agent_type: str, raw_values: Any, fallbac
             continue
         filtered.append(value)
         seen.add(value)
-    if len(filtered) > 1:
-        return filtered
-    fallback_filtered = ["default"]
-    seen = {"default"}
-    for value in fallback_normalized:
-        if value in seen:
-            continue
-        if value == "default":
-            continue
-        if not _token_is_model_candidate(agent_type, value):
-            continue
-        fallback_filtered.append(value)
-        seen.add(value)
-    if fallback_filtered:
-        return fallback_filtered
-    return ["default"]
+    return filtered
 
 
 def _normalize_reasoning_mode_options_for_agent(agent_type: str, raw_values: Any, fallback: list[str]) -> list[str]:
-    fallback_normalized = _normalize_mode_options(fallback, ["default"])
-    candidate_values = _normalize_mode_options(raw_values, fallback_normalized)
-    candidate_levels = [value for value in candidate_values if value in AGENT_CAPABILITY_REASONING_LEVELS]
-
-    # A single Codex reasoning level is usually parsed from default/help text, not a supported-modes list.
-    if agent_type == AGENT_TYPE_CODEX and len(candidate_levels) == 1:
-        fallback_levels = [value for value in fallback_normalized if value in AGENT_CAPABILITY_REASONING_LEVELS]
-        if len(fallback_levels) >= 2:
-            return ["default", *fallback_levels]
-
+    del fallback
+    candidate_values = _normalize_mode_options(raw_values, ["default"])
+    candidate_levels = [value for value in candidate_values if _token_is_reasoning_candidate(agent_type, value)]
     if candidate_levels:
         return ["default", *candidate_levels]
-
-    fallback_levels = [value for value in fallback_normalized if value in AGENT_CAPABILITY_REASONING_LEVELS]
-    if fallback_levels:
-        return ["default", *fallback_levels]
     return ["default"]
 
 
@@ -962,7 +954,7 @@ def _token_is_model_candidate(agent_type: str, token: str) -> bool:
             or value in {"sonnet", "opus", "haiku"}
         )
     if agent_type == AGENT_TYPE_GEMINI:
-        return value.startswith("gemini")
+        return value.startswith("gemini") or value in AGENT_CAPABILITY_GEMINI_MODEL_ALIASES
     return False
 
 
@@ -970,58 +962,15 @@ def _option_count_excluding_default(values: list[str]) -> int:
     return sum(1 for value in values if str(value or "").strip().lower() != "default")
 
 
-def _prefer_richer_option_set(current: list[str], candidate: list[str]) -> list[str]:
-    if _option_count_excluding_default(candidate) > _option_count_excluding_default(current):
-        return candidate
-    return current
-
-
-def _extract_codex_models_from_cache_payload(payload: Any) -> list[str]:
-    if not isinstance(payload, dict):
-        return []
-    raw_models = payload.get("models")
-    if not isinstance(raw_models, list):
-        return []
-
-    ranked: list[tuple[int, int, str]] = []
-    for index, raw_model in enumerate(raw_models):
-        if not isinstance(raw_model, dict):
-            continue
-        visibility = str(raw_model.get("visibility") or "").strip().lower()
-        if visibility in {"hidden", "hide", "internal"}:
-            continue
-        slug = str(
-            raw_model.get("slug")
-            or raw_model.get("id")
-            or raw_model.get("model")
-            or raw_model.get("name")
-            or ""
-        ).strip().lower()
-        if not _token_is_model_candidate(AGENT_TYPE_CODEX, slug):
-            continue
-        priority_raw = raw_model.get("priority")
-        try:
-            priority = int(priority_raw)
-        except (TypeError, ValueError):
-            priority = index + 10_000
-        ranked.append((priority, index, slug))
-
-    discovered: list[str] = []
-    seen: set[str] = set()
-    for _priority, _index, slug in sorted(ranked):
-        if slug in seen:
-            continue
-        seen.add(slug)
-        discovered.append(slug)
-    return discovered
+def _token_is_reasoning_candidate(agent_type: str, token: str) -> bool:
+    value = str(token or "").strip().lower()
+    if not value or value == "default":
+        return False
+    levels = AGENT_CAPABILITY_REASONING_LEVELS_BY_TYPE.get(agent_type, ())
+    return value in levels
 
 
 def _extract_models_from_json_payload(payload: Any, agent_type: str) -> list[str]:
-    if agent_type == AGENT_TYPE_CODEX:
-        parsed_cache_models = _extract_codex_models_from_cache_payload(payload)
-        if parsed_cache_models:
-            return parsed_cache_models
-
     discovered: list[str] = []
     seen: set[str] = set()
     model_keys = {"model", "name", "id", "slug", "display_name"}
@@ -1067,32 +1016,116 @@ def _extract_model_candidates_from_output(output_text: str, agent_type: str) -> 
     except json.JSONDecodeError:
         pass
 
-    seen: set[str] = set()
+    return _extract_option_values_from_help_text(
+        text,
+        option_name_matcher=lambda option_name: option_name == "model" or option_name.endswith("-model"),
+        token_validator=lambda token: _token_is_model_candidate(agent_type, token),
+        contextual_list_pattern=AGENT_CAPABILITY_MODEL_LIST_RE,
+    )
+
+
+def _extract_option_values_from_help_text(
+    help_text: str,
+    *,
+    option_name_matcher: Callable[[str], bool],
+    token_validator: Callable[[str], bool],
+    contextual_list_pattern: re.Pattern[str] | None = None,
+) -> list[str]:
     discovered: list[str] = []
-    for match in AGENT_CAPABILITY_MODEL_TOKEN_RE.findall(text):
-        token = match.strip().lower()
-        if not _token_is_model_candidate(agent_type, token):
-            continue
-        if token in seen:
-            continue
-        discovered.append(token)
+    seen: set[str] = set()
+    active_option_matches = False
+    collect_bullet_values = False
+
+    def add_token(raw_token: str) -> None:
+        token = str(raw_token or "").strip().lower().strip(".,;:()[]{}")
+        if not token or token in seen:
+            return
+        if not token_validator(token):
+            return
         seen.add(token)
+        discovered.append(token)
+
+    def add_segment(raw_segment: str) -> None:
+        for raw_token in AGENT_CAPABILITY_HELP_TOKEN_RE.findall(str(raw_segment or "")):
+            add_token(raw_token)
+
+    lines = str(help_text or "").splitlines()
+    for raw_line in lines:
+        line = str(raw_line or "").rstrip()
+        lower_line = line.lower()
+        option_names = [name.lower() for name in AGENT_CAPABILITY_HELP_OPTION_RE.findall(lower_line)]
+        if option_names:
+            active_option_matches = any(option_name_matcher(name) for name in option_names)
+            collect_bullet_values = False
+
+        if active_option_matches:
+            for match in AGENT_CAPABILITY_HELP_INLINE_VALUES_RE.finditer(line):
+                add_segment(match.group(1))
+
+            has_inline_list_values = False
+            for match in AGENT_CAPABILITY_HELP_LIST_VALUE_RE.finditer(line):
+                add_segment(match.group(1))
+                has_inline_list_values = True
+
+            if AGENT_CAPABILITY_HELP_LIST_MARKER_RE.search(lower_line) and not has_inline_list_values:
+                collect_bullet_values = True
+                continue
+
+        if collect_bullet_values:
+            bullet_match = AGENT_CAPABILITY_HELP_BULLET_VALUE_RE.match(line)
+            if bullet_match:
+                add_token(bullet_match.group(1))
+                continue
+            if not line.strip():
+                collect_bullet_values = False
+
+    if contextual_list_pattern is not None:
+        for match in contextual_list_pattern.finditer(help_text):
+            add_segment(match.group(1))
+
     return discovered
 
 
-def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
+def _extract_reasoning_candidates_from_output(output_text: str, agent_type: str) -> list[str]:
     text = str(output_text or "")
     if not text:
         return []
     discovered: list[str] = []
     seen: set[str] = set()
 
+    def add_token(raw_token: str) -> None:
+        token = str(raw_token or "").strip().lower().strip(".,;:()[]{}")
+        if not token or token in seen:
+            return
+        if not _token_is_reasoning_candidate(agent_type, token):
+            return
+        seen.add(token)
+        discovered.append(token)
+
     def add_from_text(value: str) -> None:
         for token in AGENT_CAPABILITY_REASONING_VALUE_RE.findall(str(value or "").lower()):
-            if token in seen:
-                continue
-            seen.add(token)
-            discovered.append(token)
+            add_token(token)
+        for token in AGENT_CAPABILITY_HELP_TOKEN_RE.findall(str(value or "").lower()):
+            add_token(token)
+
+    def maybe_normalized(values: list[str]) -> list[str]:
+        normalized = _normalize_mode_options(values, ["default"])
+        if _option_count_excluding_default(normalized) < 2:
+            return []
+        return normalized
+
+    help_candidates = _extract_option_values_from_help_text(
+        text,
+        option_name_matcher=lambda option_name: any(
+            keyword in option_name for keyword in ("effort", "reasoning", "thinking")
+        ),
+        token_validator=lambda token: _token_is_reasoning_candidate(agent_type, token),
+        contextual_list_pattern=AGENT_CAPABILITY_REASONING_LIST_RE,
+    )
+    if help_candidates:
+        normalized_help = maybe_normalized(help_candidates)
+        if normalized_help:
+            return normalized_help
 
     try:
         payload = json.loads(text)
@@ -1105,6 +1138,11 @@ def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
             "supported_reasoning",
             "reasoning_mode_options",
             "supported_reasoning_levels",
+            "effort_levels",
+            "supported_effort_levels",
+            "supported_effort",
+            "supported_thinking_levels",
+            "thinking_levels",
         }
 
         def walk(node: Any) -> None:
@@ -1120,6 +1158,7 @@ def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
                                             item.get("effort")
                                             or item.get("level")
                                             or item.get("name")
+                                            or item.get("value")
                                             or ""
                                         )
                                     )
@@ -1131,6 +1170,7 @@ def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
                                     value.get("effort")
                                     or value.get("level")
                                     or value.get("name")
+                                    or value.get("value")
                                     or ""
                                 )
                             )
@@ -1145,13 +1185,15 @@ def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
                         walk(item)
 
         walk(payload)
-        if discovered:
-            return _normalize_mode_options(discovered, ["default"])
+        normalized_json = maybe_normalized(discovered)
+        if normalized_json:
+            return normalized_json
 
     for match in AGENT_CAPABILITY_REASONING_LIST_RE.finditer(text):
         add_from_text(match.group(1))
-    if discovered:
-        return _normalize_mode_options(discovered, ["default"])
+    normalized_text = maybe_normalized(discovered)
+    if normalized_text:
+        return normalized_text
     return []
 
 
@@ -2946,39 +2988,12 @@ class HubState:
     def _discover_agent_capabilities_for_type(self, agent_type: str, previous: dict[str, Any]) -> dict[str, Any]:
         resolved_type = _normalize_chat_agent_type(agent_type)
         commands = AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE.get(resolved_type, ())
-        defaults_for_type = _agent_capability_defaults_for_type(resolved_type)
-        discovered_models: list[str] = []
-        discovered_reasoning_modes: list[str] = []
+        discovered_models: list[str] = ["default"]
+        discovered_reasoning_modes: list[str] = ["default"]
         last_error = ""
         now = _iso_now()
 
-        if resolved_type == AGENT_TYPE_CODEX:
-            cache_file = self.host_codex_dir / CODEX_MODELS_CACHE_FILE_NAME
-            try:
-                cache_output = cache_file.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                cache_output = ""
-            if cache_output.strip():
-                parsed_models = _extract_model_candidates_from_output(cache_output, resolved_type)
-                if parsed_models:
-                    discovered_models = _prefer_richer_option_set(
-                        discovered_models,
-                        _normalize_model_options_for_agent(resolved_type, parsed_models, defaults_for_type["models"]),
-                    )
-                parsed_reasoning = _extract_reasoning_candidates_from_output(cache_output)
-                if parsed_reasoning:
-                    discovered_reasoning_modes = _prefer_richer_option_set(
-                        discovered_reasoning_modes,
-                        _normalize_reasoning_mode_options_for_agent(
-                            resolved_type,
-                            parsed_reasoning,
-                            defaults_for_type["reasoning_modes"],
-                        ),
-                    )
-
         for raw_cmd in commands:
-            if discovered_models and (resolved_type != AGENT_TYPE_CODEX or discovered_reasoning_modes):
-                break
             cmd = [str(token) for token in raw_cmd]
             return_code, output_text = _run_agent_capability_probe(cmd, AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
             if return_code == 127:
@@ -3002,44 +3017,32 @@ class HubState:
 
             parsed_models = _extract_model_candidates_from_output(output_text, resolved_type)
             if parsed_models:
-                discovered_models = _prefer_richer_option_set(
-                    discovered_models,
-                    _normalize_model_options_for_agent(
-                        resolved_type,
-                        parsed_models,
-                        defaults_for_type["models"],
-                    ),
+                discovered_models = _normalize_model_options_for_agent(
+                    resolved_type,
+                    parsed_models,
+                    ["default"],
                 )
-            if resolved_type == AGENT_TYPE_CODEX:
-                parsed_reasoning = _extract_reasoning_candidates_from_output(output_text)
-                if parsed_reasoning:
-                    discovered_reasoning_modes = _prefer_richer_option_set(
-                        discovered_reasoning_modes,
-                        _normalize_reasoning_mode_options_for_agent(
-                            resolved_type,
-                            parsed_reasoning,
-                            defaults_for_type["reasoning_modes"],
-                        ),
-                    )
-
-        if not discovered_models:
-            discovered_models = _normalize_model_options_for_agent(
-                resolved_type,
-                previous.get("models"),
-                defaults_for_type["models"],
-            )
-        if resolved_type == AGENT_TYPE_CODEX:
-            if not discovered_reasoning_modes:
+            parsed_reasoning = _extract_reasoning_candidates_from_output(output_text, resolved_type)
+            if parsed_reasoning:
                 discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
                     resolved_type,
-                    previous.get("reasoning_modes"),
-                    defaults_for_type["reasoning_modes"],
+                    parsed_reasoning,
+                    ["default"],
                 )
-        else:
+
+            if (
+                _option_count_excluding_default(discovered_models) >= 1
+                and _option_count_excluding_default(discovered_reasoning_modes) >= 1
+            ):
+                break
+
+        if not discovered_models:
+            discovered_models = ["default"]
+        if not discovered_reasoning_modes:
             discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
                 resolved_type,
-                previous.get("reasoning_modes"),
-                defaults_for_type["reasoning_modes"],
+                [],
+                ["default"],
             )
 
         return {

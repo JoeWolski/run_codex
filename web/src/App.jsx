@@ -36,15 +36,15 @@ const DEFAULT_AGENT_CAPABILITIES = {
     {
       agentType: "codex",
       label: "Codex",
-      models: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
-      reasoningModes: ["default", "minimal", "low", "medium", "high", "xhigh"],
+      models: ["default"],
+      reasoningModes: ["default"],
       updatedAt: "",
       lastError: ""
     },
     {
       agentType: "claude",
       label: "Claude",
-      models: ["default", "sonnet", "opus", "haiku"],
+      models: ["default"],
       reasoningModes: ["default"],
       updatedAt: "",
       lastError: ""
