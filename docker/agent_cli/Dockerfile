@@ -10,7 +10,6 @@ RUN apt-get update \
     ca-certificates \
     curl \
     gh \
-    gosu \
     git \
     less \
     openssh-client \

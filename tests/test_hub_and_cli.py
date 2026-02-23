@@ -672,9 +672,20 @@ class HubStateTests(unittest.TestCase):
         cmd = captured["cmd"]
         self.assertIn("--network", cmd)
         self.assertIn("host", cmd)
+        self.assertIn("--user", cmd)
+        self.assertIn(f"{self.state.local_uid}:{self.state.local_gid}", cmd)
         self.assertIn("codex", cmd)
         self.assertIn("login", cmd)
         self.assertNotIn("--device-auth", cmd)
+        self.assertNotIn(f"LOCAL_UID={self.state.local_uid}", cmd)
+        for raw_gid in self.state.local_supp_gids.split(","):
+            token = raw_gid.strip()
+            if not token:
+                continue
+            if int(token) == self.state.local_gid:
+                continue
+            self.assertIn("--group-add", cmd)
+            self.assertIn(token, cmd)
         container_home = f"/home/{self.state.local_user}"
         self.assertNotIn(f"{self.state.host_agent_home}:{container_home}", cmd)
         self.assertIn(f"{self.state.host_codex_dir}:{container_home}/.codex", cmd)
@@ -3500,7 +3511,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("git config --system --add safe.directory '*'", setup_script)
             self.assertIn('AGENT_HUB_GIT_CREDENTIALS_SOURCE', setup_script)
             self.assertIn('AGENT_HUB_GIT_CREDENTIALS_FILE', setup_script)
-            self.assertIn('chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true', setup_script)
+            self.assertNotIn("chown -R", setup_script)
             commit_cmd = next((cmd for cmd in commands if len(cmd) >= 3 and cmd[0:2] == ["docker", "commit"]), None)
             self.assertIsNotNone(commit_cmd)
             assert commit_cmd is not None
@@ -4415,6 +4426,58 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--volume", run_cmd)
             self.assertIn(f"{image_cli.DOCKER_SOCKET_PATH}:{image_cli.DOCKER_SOCKET_PATH}", run_cmd)
 
+    def test_cli_sets_runtime_user_and_group_adds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._docker_socket_gid", return_value=4444
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--local-uid",
+                        "1234",
+                        "--local-gid",
+                        "2345",
+                        "--local-supplementary-gids",
+                        "3000,3001",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn("--user", run_cmd)
+            self.assertIn("1234:2345", run_cmd)
+
+            self.assertIn("--group-add", run_cmd)
+            self.assertIn("3000", run_cmd)
+            self.assertIn("3001", run_cmd)
+            self.assertIn("4444", run_cmd)
+
     def test_cli_adds_host_gateway_alias_on_linux(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -4744,13 +4807,13 @@ class DockerEntrypointTests(unittest.TestCase):
             },
             clear=False,
         ):
-            module._configure_git_identity("agent")
+            module._configure_git_identity()
 
         self.assertEqual(run_mock.call_count, 2)
         run_mock.assert_has_calls(
             [
-                call(["gosu", "agent", "git", "config", "--global", "user.name", "Joe W"]),
-                call(["gosu", "agent", "git", "config", "--global", "user.email", "joew@example.com"]),
+                call(["git", "config", "--global", "user.name", "Joe W"]),
+                call(["git", "config", "--global", "user.email", "joew@example.com"]),
             ]
         )
 
@@ -4765,7 +4828,7 @@ class DockerEntrypointTests(unittest.TestCase):
             clear=False,
         ):
             with self.assertRaises(RuntimeError):
-                module._configure_git_identity("agent")
+                module._configure_git_identity()
 
     def test_prepare_git_credentials_copies_source_and_sets_gh_token(self) -> None:
         module = self._load_entrypoint_module()
@@ -4789,7 +4852,7 @@ class DockerEntrypointTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                module._prepare_git_credentials(os.getuid(), os.getgid())
+                module._prepare_git_credentials()
                 self.assertEqual(os.environ.get("GH_TOKEN"), "ghp_test_token_123")
                 self.assertEqual(os.environ.get("GITHUB_TOKEN"), "ghp_test_token_123")
 
@@ -4823,7 +4886,7 @@ class DockerEntrypointTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                module._prepare_git_credentials(os.getuid(), os.getgid())
+                module._prepare_git_credentials()
                 self.assertEqual(os.environ.get("GH_TOKEN"), "already-set-token")
                 self.assertEqual(os.environ.get("GITHUB_TOKEN"), "already-set-token")
 
@@ -4850,134 +4913,61 @@ class DockerEntrypointTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                module._prepare_git_credentials(os.getuid(), os.getgid())
+                module._prepare_git_credentials()
                 self.assertEqual(os.environ.get("GH_TOKEN"), "ghp_enterprise_token")
                 self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
 
-    def test_ensure_user_and_groups_allows_non_unique_uid_on_useradd(self) -> None:
+    def test_entrypoint_main_execs_default_codex_command(self) -> None:
         module = self._load_entrypoint_module()
-        with tempfile.TemporaryDirectory() as tmp:
-            local_home = str(Path(tmp) / "home-joew")
-            run_success_responses = {
-                ("getent", "group", "1000"): [True],
-                ("id", "-u", "joew"): [False, True],
-                ("which", "sudo"): [False],
-            }
-
-            def fake_run_success(command: list[str]) -> bool:
-                responses = run_success_responses.get(tuple(command), [])
-                if not responses:
-                    return False
-                return responses.pop(0)
-
-            def fake_run(command: list[str], check: bool = True) -> SimpleNamespace:
-                if command == ["id", "-u", "joew"]:
-                    return SimpleNamespace(returncode=0, stdout="1000\n")
-                if command == ["id", "-g", "joew"]:
-                    return SimpleNamespace(returncode=0, stdout="1000\n")
-                return SimpleNamespace(returncode=0, stdout="")
-
-            with patch.dict(
-                os.environ,
-                {
-                    "LOCAL_USER": "joew",
-                    "LOCAL_GROUP": "joew",
-                    "LOCAL_UID": "1000",
-                    "LOCAL_GID": "1000",
-                    "LOCAL_SUPP_GIDS": "",
-                    "LOCAL_SUPP_GROUPS": "",
-                    "LOCAL_HOME": local_home,
-                    "LOCAL_UMASK": "0022",
-                },
-                clear=False,
-            ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
-                module.os, "geteuid", return_value=0
-            ), patch.object(
-                module.os, "execvp", side_effect=SystemExit(0)
-            ), patch.object(
-                module, "_run_success", side_effect=fake_run_success
-            ), patch.object(
-                module, "_run", side_effect=fake_run
-            ) as run_mock, patch.object(
-                module, "_ensure_runtime_home_paths", return_value=None
-            ), patch.object(
-                module, "_prepare_git_credentials", return_value=None
-            ), patch.object(
-                module, "_configure_git_identity", return_value=None
-            ):
-                with self.assertRaises(SystemExit):
-                    module._ensure_user_and_groups()
-
-            run_mock.assert_any_call(
-                [
-                    "useradd",
-                    "--uid",
-                    "1000",
-                    "--non-unique",
-                    "--gid",
-                    "1000",
-                    "--home-dir",
-                    local_home,
-                    "--create-home",
-                    "--shell",
-                    "/bin/bash",
-                    "joew",
-                ]
-            )
-
-    def test_ensure_user_and_groups_allows_non_unique_uid_on_usermod(self) -> None:
-        module = self._load_entrypoint_module()
-        run_success_responses = {
-            ("getent", "group", "1000"): [True],
-            ("id", "-u", "joew"): [True, True],
-            ("which", "sudo"): [False],
-        }
-
-        def fake_run_success(command: list[str]) -> bool:
-            responses = run_success_responses.get(tuple(command), [])
-            if not responses:
-                return False
-            return responses.pop(0)
-
-        def fake_run(command: list[str], check: bool = True) -> SimpleNamespace:
-            if command == ["id", "-u", "joew"]:
-                return SimpleNamespace(returncode=0, stdout="1001\n")
-            if command == ["id", "-g", "joew"]:
-                return SimpleNamespace(returncode=0, stdout="1000\n")
-            return SimpleNamespace(returncode=0, stdout="")
-
         with patch.dict(
             os.environ,
             {
-                "LOCAL_USER": "joew",
-                "LOCAL_GROUP": "joew",
-                "LOCAL_UID": "1000",
-                "LOCAL_GID": "1000",
-                "LOCAL_SUPP_GIDS": "",
-                "LOCAL_SUPP_GROUPS": "",
-                "LOCAL_HOME": "/home/joew",
+                "HOME": "/tmp/entrypoint-home",
                 "LOCAL_UMASK": "0022",
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
-            module.os, "geteuid", return_value=0
-        ), patch.object(
-            module.os, "execvp", side_effect=SystemExit(0)
-        ), patch.object(
-            module, "_run_success", side_effect=fake_run_success
-        ), patch.object(
-            module, "_run", side_effect=fake_run
-        ) as run_mock, patch.object(
             module, "_ensure_runtime_home_paths", return_value=None
-        ), patch.object(
+        ) as ensure_paths, patch.object(
+            module, "_prepare_git_credentials", return_value=None
+        ) as prepare_credentials, patch.object(
+            module, "_configure_git_identity", return_value=None
+        ) as configure_git, patch.object(
+            module.os, "execvp", side_effect=SystemExit(0)
+        ) as execvp:
+            with self.assertRaises(SystemExit):
+                module._entrypoint_main()
+
+        ensure_paths.assert_called_once_with("/tmp/entrypoint-home")
+        prepare_credentials.assert_called_once_with()
+        configure_git.assert_called_once_with()
+        execvp.assert_called_once_with("codex", ["codex"])
+
+    def test_entrypoint_main_execs_requested_command(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "",
+                "LOCAL_HOME": "/tmp/entrypoint-local-home",
+                "LOCAL_UMASK": "0022",
+            },
+            clear=False,
+        ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "bash", "-lc", "echo ok"]), patch.object(
+            module, "_ensure_runtime_home_paths", return_value=None
+        ) as ensure_paths, patch.object(
             module, "_prepare_git_credentials", return_value=None
         ), patch.object(
             module, "_configure_git_identity", return_value=None
-        ):
+        ), patch.object(
+            module.os, "execvp", side_effect=SystemExit(0)
+        ) as execvp:
             with self.assertRaises(SystemExit):
-                module._ensure_user_and_groups()
+                module._entrypoint_main()
 
-        run_mock.assert_any_call(["usermod", "--uid", "1000", "--non-unique", "joew"])
+        ensure_paths.assert_called_once_with("/tmp/entrypoint-local-home")
+        self.assertEqual(os.environ.get("HOME"), "/tmp/entrypoint-local-home")
+        execvp.assert_called_once_with("bash", ["bash", "-lc", "echo ok"])
 
 
 if __name__ == "__main__":

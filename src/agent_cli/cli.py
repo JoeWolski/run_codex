@@ -255,6 +255,18 @@ def _default_group_name() -> str:
     return grp.getgrgid(os.getgid()).gr_name
 
 
+def _gid_for_group_name(group_name: str) -> int:
+    import grp
+
+    normalized = str(group_name or "").strip()
+    if not normalized:
+        raise click.ClickException("Group name must not be empty")
+    try:
+        return int(grp.getgrnam(normalized).gr_gid)
+    except KeyError as exc:
+        raise click.ClickException(f"Unknown group name: {normalized}") from exc
+
+
 def _default_supplementary_gids() -> str:
     gids = sorted({gid for gid in os.getgroups() if gid != os.getgid()})
     return ",".join(str(gid) for gid in gids)
@@ -318,6 +330,40 @@ def _normalize_csv(value: str | None) -> str:
         return ""
     values = [part.strip() for part in value.split(",") if part.strip()]
     return ",".join(values)
+
+
+def _parse_gid_csv(value: str) -> list[int]:
+    gids: list[int] = []
+    seen: set[int] = set()
+    for raw in value.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise click.ClickException(f"Invalid supplemental GID: {token!r}")
+        gid = int(token, 10)
+        if gid in seen:
+            continue
+        gids.append(gid)
+        seen.add(gid)
+    return gids
+
+
+def _group_names_to_gid_csv(value: str | None) -> str:
+    if value is None:
+        return ""
+    names = _normalize_csv(value)
+    if not names:
+        return ""
+    gids = [str(_gid_for_group_name(name)) for name in names.split(",") if name]
+    return _normalize_csv(",".join(gids))
+
+
+def _docker_socket_gid() -> int | None:
+    try:
+        return int(os.stat(DOCKER_SOCKET_PATH).st_gid)
+    except OSError:
+        return None
 
 
 def _parse_mount(spec: str, label: str) -> Tuple[str, str]:
@@ -632,20 +678,28 @@ def main(
         )
 
     user = local_user or _default_user()
-    group = local_group or _default_group_name()
     uid = local_uid if local_uid is not None else os.getuid()
-    gid = local_gid if local_gid is not None else os.getgid()
+    if local_gid is not None:
+        gid = local_gid
+    elif local_group:
+        gid = _gid_for_group_name(local_group)
+    else:
+        gid = os.getgid()
 
-    supp_gids = _normalize_csv(
-        local_supplementary_gids
-        if local_supplementary_gids is not None
-        else _default_supplementary_gids()
-    )
-    supp_groups = _normalize_csv(
-        local_supplementary_groups
-        if local_supplementary_groups is not None
-        else _default_supplementary_groups()
-    )
+    if local_supplementary_gids is not None:
+        supp_gids_csv = _normalize_csv(local_supplementary_gids)
+    elif local_supplementary_groups is not None:
+        supp_gids_csv = _group_names_to_gid_csv(local_supplementary_groups)
+    else:
+        supp_gids_csv = _default_supplementary_gids()
+    supplemental_group_ids = [supp_gid for supp_gid in _parse_gid_csv(supp_gids_csv) if supp_gid != gid]
+    docker_socket_gid = _docker_socket_gid()
+    if (
+        docker_socket_gid is not None
+        and docker_socket_gid != gid
+        and docker_socket_gid not in supplemental_group_ids
+    ):
+        supplemental_group_ids.append(docker_socket_gid)
 
     container_home_path = container_home or f"/home/{user}"
     container_project_name = project_path.name
@@ -774,6 +828,8 @@ def main(
 
     run_args = [
         "--init",
+        "--user",
+        f"{uid}:{gid}",
         "--gpus",
         "all",
         "--workdir",
@@ -795,20 +851,6 @@ def main(
         "--volume",
         f"{config_path}:{container_home_path}/.codex/config.toml:ro",
         "--env",
-        f"LOCAL_USER={user}",
-        "--env",
-        f"LOCAL_GROUP={group}",
-        "--env",
-        f"LOCAL_UID={uid}",
-        "--env",
-        f"LOCAL_GID={gid}",
-        "--env",
-        f"LOCAL_SUPP_GIDS={supp_gids}",
-        "--env",
-        f"LOCAL_SUPP_GROUPS={supp_groups}",
-        "--env",
-        f"LOCAL_HOME={container_home_path}",
-        "--env",
         f"LOCAL_UMASK={local_umask}",
         "--env",
         f"HOME={container_home_path}",
@@ -823,6 +865,9 @@ def main(
         "--env",
         f"CONTAINER_PROJECT_PATH={container_project_path}",
     ]
+
+    for supplemental_gid in supplemental_group_ids:
+        run_args.extend(["--group-add", str(supplemental_gid)])
 
     if sys.platform.startswith("linux"):
         run_args.extend(["--add-host", "host.docker.internal:host-gateway"])
@@ -885,7 +930,6 @@ def main(
                     "fi\n"
                     + script
                     + "\n"
-                    + 'chown -R "${LOCAL_UID}:${LOCAL_GID}" "${CONTAINER_PROJECT_PATH}" || true\n'
                 ),
             ]
             _docker_rm_force(container_name)
