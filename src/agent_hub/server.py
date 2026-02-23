@@ -106,6 +106,13 @@ AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE = {
     AGENT_TYPE_GEMINI: ["default"],
 }
 AGENT_CAPABILITY_MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,120}")
+AGENT_CAPABILITY_CODEX_MODEL_TOKEN_RE = re.compile(r"^(?:gpt-[a-z0-9][a-z0-9._-]*|o[0-9][a-z0-9._-]*)$")
+AGENT_CAPABILITY_REASONING_LEVELS = ("minimal", "low", "medium", "high", "xhigh")
+AGENT_CAPABILITY_REASONING_VALUE_RE = re.compile(r"\b(?:minimal|low|medium|high|xhigh)\b")
+AGENT_CAPABILITY_REASONING_LIST_RE = re.compile(
+    r"(?:\bsupported\b|\bavailable\b)?\s*\breasoning(?:\s+effort)?\s+modes?\b\s*[:=-]\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
 AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS = float(
     os.environ.get("AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS", "8.0")
 )
@@ -791,6 +798,58 @@ def _normalize_mode_options(raw_values: Any, fallback: list[str]) -> list[str]:
     return normalized
 
 
+def _normalize_model_options_for_agent(agent_type: str, raw_values: Any, fallback: list[str]) -> list[str]:
+    fallback_normalized = _normalize_mode_options(fallback, ["default"])
+    candidate_values = _normalize_mode_options(raw_values, fallback_normalized)
+    filtered = ["default"]
+    seen = {"default"}
+    for value in candidate_values:
+        if value in seen:
+            continue
+        if value == "default":
+            continue
+        if not _token_is_model_candidate(agent_type, value):
+            continue
+        filtered.append(value)
+        seen.add(value)
+    if len(filtered) > 1:
+        return filtered
+    fallback_filtered = ["default"]
+    seen = {"default"}
+    for value in fallback_normalized:
+        if value in seen:
+            continue
+        if value == "default":
+            continue
+        if not _token_is_model_candidate(agent_type, value):
+            continue
+        fallback_filtered.append(value)
+        seen.add(value)
+    if fallback_filtered:
+        return fallback_filtered
+    return ["default"]
+
+
+def _normalize_reasoning_mode_options_for_agent(agent_type: str, raw_values: Any, fallback: list[str]) -> list[str]:
+    fallback_normalized = _normalize_mode_options(fallback, ["default"])
+    candidate_values = _normalize_mode_options(raw_values, fallback_normalized)
+    candidate_levels = [value for value in candidate_values if value in AGENT_CAPABILITY_REASONING_LEVELS]
+
+    # A single Codex reasoning level is usually parsed from default/help text, not a supported-modes list.
+    if agent_type == AGENT_TYPE_CODEX and len(candidate_levels) == 1:
+        fallback_levels = [value for value in fallback_normalized if value in AGENT_CAPABILITY_REASONING_LEVELS]
+        if len(fallback_levels) >= 2:
+            return ["default", *fallback_levels]
+
+    if candidate_levels:
+        return ["default", *candidate_levels]
+
+    fallback_levels = [value for value in fallback_normalized if value in AGENT_CAPABILITY_REASONING_LEVELS]
+    if fallback_levels:
+        return ["default", *fallback_levels]
+    return ["default"]
+
+
 def _agent_capability_defaults_for_type(agent_type: str) -> dict[str, Any]:
     resolved_type = _normalize_chat_agent_type(agent_type)
     default_models = AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE.get(
@@ -804,8 +863,8 @@ def _agent_capability_defaults_for_type(agent_type: str) -> dict[str, Any]:
     return {
         "agent_type": resolved_type,
         "label": AGENT_LABEL_BY_TYPE.get(resolved_type, resolved_type.title()),
-        "models": _normalize_mode_options(default_models, ["default"]),
-        "reasoning_modes": _normalize_mode_options(default_reasoning, ["default"]),
+        "models": _normalize_model_options_for_agent(resolved_type, default_models, ["default"]),
+        "reasoning_modes": _normalize_reasoning_mode_options_for_agent(resolved_type, default_reasoning, ["default"]),
         "updated_at": "",
         "last_error": "",
     }
@@ -842,8 +901,12 @@ def _normalize_agent_capabilities_payload(raw_payload: Any) -> dict[str, Any]:
         defaults_for_type = _agent_capability_defaults_for_type(agent_type)
         raw_agent = raw_agent_map.get(agent_type, {})
         label = str(raw_agent.get("label") or defaults_for_type["label"]).strip() or defaults_for_type["label"]
-        models = _normalize_mode_options(raw_agent.get("models"), defaults_for_type["models"])
-        reasoning_modes = _normalize_mode_options(raw_agent.get("reasoning_modes"), defaults_for_type["reasoning_modes"])
+        models = _normalize_model_options_for_agent(agent_type, raw_agent.get("models"), defaults_for_type["models"])
+        reasoning_modes = _normalize_reasoning_mode_options_for_agent(
+            agent_type,
+            raw_agent.get("reasoning_modes"),
+            defaults_for_type["reasoning_modes"],
+        )
         updated_at = str(raw_agent.get("updated_at") or raw_payload.get("updated_at") or "").strip()
         last_error = str(raw_agent.get("last_error") or "").strip()
         normalized_agents.append(
@@ -872,7 +935,9 @@ def _token_is_model_candidate(agent_type: str, token: str) -> bool:
     if not value or value == "default":
         return False
     if agent_type == AGENT_TYPE_CODEX:
-        return value.startswith("gpt-") or "codex" in value
+        if value in {"codex", "codex-provided"}:
+            return False
+        return AGENT_CAPABILITY_CODEX_MODEL_TOKEN_RE.match(value) is not None
     if agent_type == AGENT_TYPE_CLAUDE:
         return (
             value.startswith("claude")
@@ -946,17 +1011,58 @@ def _extract_model_candidates_from_output(output_text: str, agent_type: str) -> 
 
 
 def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
-    text = str(output_text or "").lower()
+    text = str(output_text or "")
     if not text:
         return []
     discovered: list[str] = []
-    known = ["minimal", "low", "medium", "high", "xhigh"]
-    for level in known:
-        if re.search(rf"\b{re.escape(level)}\b", text):
-            discovered.append(level)
-    if not discovered:
-        return []
-    return _normalize_mode_options(discovered, ["default"])
+    seen: set[str] = set()
+
+    def add_from_text(value: str) -> None:
+        for token in AGENT_CAPABILITY_REASONING_VALUE_RE.findall(str(value or "").lower()):
+            if token in seen:
+                continue
+            seen.add(token)
+            discovered.append(token)
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, (dict, list)):
+        keys_with_mode_lists = {
+            "reasoning_modes",
+            "supported_reasoning_modes",
+            "supported_reasoning",
+            "reasoning_mode_options",
+        }
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    normalized_key = str(key or "").strip().lower().replace("-", "_")
+                    if normalized_key in keys_with_mode_lists:
+                        if isinstance(value, list):
+                            for item in value:
+                                add_from_text(str(item or ""))
+                        elif isinstance(value, str):
+                            add_from_text(value)
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+                return
+            if isinstance(node, list):
+                for item in node:
+                    if isinstance(item, (dict, list)):
+                        walk(item)
+
+        walk(payload)
+        if discovered:
+            return _normalize_mode_options(discovered, ["default"])
+
+    for match in AGENT_CAPABILITY_REASONING_LIST_RE.finditer(text):
+        add_from_text(match.group(1))
+    if discovered:
+        return _normalize_mode_options(discovered, ["default"])
+    return []
 
 
 def _run_agent_capability_probe(cmd: list[str], timeout_seconds: float) -> tuple[int, str]:
@@ -2750,6 +2856,7 @@ class HubState:
             if return_code == 124:
                 last_error = f"timeout running command: {' '.join(cmd)}"
                 LOGGER.warning("Agent capability discovery timeout agent=%s cmd=%s", resolved_type, cmd)
+                continue
             elif return_code != 0:
                 last_error = f"command failed ({return_code}): {' '.join(cmd)}"
                 LOGGER.info(
@@ -2759,30 +2866,42 @@ class HubState:
                     return_code,
                     _short_summary(output_text, max_words=60, max_chars=600),
                 )
+                continue
 
             parsed_models = _extract_model_candidates_from_output(output_text, resolved_type)
             if parsed_models:
-                discovered_models = _normalize_mode_options(parsed_models, ["default"])
+                discovered_models = _normalize_model_options_for_agent(
+                    resolved_type,
+                    parsed_models,
+                    _agent_capability_defaults_for_type(resolved_type)["models"],
+                )
             if resolved_type == AGENT_TYPE_CODEX:
                 parsed_reasoning = _extract_reasoning_candidates_from_output(output_text)
                 if parsed_reasoning:
-                    discovered_reasoning_modes = parsed_reasoning
+                    discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
+                        resolved_type,
+                        parsed_reasoning,
+                        _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
+                    )
             if discovered_models and (resolved_type != AGENT_TYPE_CODEX or discovered_reasoning_modes):
                 break
 
         if not discovered_models:
-            discovered_models = _normalize_mode_options(
+            discovered_models = _normalize_model_options_for_agent(
+                resolved_type,
                 previous.get("models"),
                 _agent_capability_defaults_for_type(resolved_type)["models"],
             )
         if resolved_type == AGENT_TYPE_CODEX:
             if not discovered_reasoning_modes:
-                discovered_reasoning_modes = _normalize_mode_options(
+                discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
+                    resolved_type,
                     previous.get("reasoning_modes"),
                     _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
                 )
         else:
-            discovered_reasoning_modes = _normalize_mode_options(
+            discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
+                resolved_type,
                 previous.get("reasoning_modes"),
                 _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
             )

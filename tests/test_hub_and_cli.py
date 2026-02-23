@@ -251,6 +251,92 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(gemini["models"], ["default", "gemini-2.5-pro"])
         self.assertTrue((self.state.data_dir / hub_server.AGENT_CAPABILITIES_CACHE_FILE_NAME).exists())
 
+    def test_reasoning_candidate_extractor_requires_supported_modes_context(self) -> None:
+        self.assertEqual(
+            hub_server._extract_reasoning_candidates_from_output("Default reasoning effort: low"),
+            [],
+        )
+        self.assertEqual(
+            hub_server._extract_reasoning_candidates_from_output("Supported reasoning modes: low medium high"),
+            ["default", "low", "medium", "high"],
+        )
+        self.assertEqual(
+            hub_server._extract_reasoning_candidates_from_output(json.dumps({"model_reasoning_effort": "low"})),
+            [],
+        )
+        self.assertEqual(
+            hub_server._extract_reasoning_candidates_from_output(
+                json.dumps({"supported_reasoning_modes": ["minimal", "low", "medium"]})
+            ),
+            ["default", "minimal", "low", "medium"],
+        )
+
+    def test_agent_capabilities_payload_normalizes_invalid_codex_models_and_reasoning(self) -> None:
+        payload = hub_server._normalize_agent_capabilities_payload(
+            {
+                "version": 1,
+                "updated_at": "2026-01-03T00:00:00Z",
+                "discovery_in_progress": False,
+                "discovery_started_at": "",
+                "discovery_finished_at": "2026-01-03T00:00:00Z",
+                "agents": [
+                    {
+                        "agent_type": "codex",
+                        "label": "Codex",
+                        "models": ["default", "codex", "codex-provided"],
+                        "reasoning_modes": ["default", "low"],
+                        "updated_at": "2026-01-03T00:00:00Z",
+                        "last_error": "",
+                    }
+                ],
+            }
+        )
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        self.assertEqual(
+            codex["models"],
+            hub_server.AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
+        )
+        self.assertEqual(
+            codex["reasoning_modes"],
+            hub_server.AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
+        )
+
+    def test_agent_capabilities_discovery_ignores_failed_codex_probe_output(self) -> None:
+        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+            if cmd[:3] == ["codex", "models", "--json"]:
+                return (
+                    2,
+                    'Unknown argument "models".\nmodel: codex-provided\nreasoning effort: low',
+                )
+            if cmd[:2] == ["codex", "models"]:
+                return (
+                    2,
+                    "Command failed.\nprovider: codex-provided\nreasoning effort: low",
+                )
+            if cmd[:2] == ["codex", "--help"]:
+                return 0, "Codex CLI help.\nDefault reasoning effort: low.\nProvider: codex-provided."
+            return 127, ""
+
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+            started_payload = self.state.start_agent_capabilities_discovery()
+            self.assertTrue(started_payload["discovery_in_progress"])
+            worker = self.state._agent_capabilities_discovery_thread
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+
+        payload = self.state.agent_capabilities_payload()
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        self.assertEqual(
+            codex["models"],
+            hub_server.AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
+        )
+        self.assertEqual(
+            codex["reasoning_modes"],
+            hub_server.AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
+        )
+
     def test_openai_credentials_round_trip_status(self) -> None:
         initial = self.state.openai_auth_status()
         self.assertFalse(initial["connected"])
