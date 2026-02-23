@@ -774,6 +774,36 @@ function InfoIcon() {
   );
 }
 
+function RefreshWarningIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+      <path
+        d="M14.7 5.7A5.5 5.5 0 0 0 5.3 7.4M5.3 14.3A5.5 5.5 0 0 0 14.7 12.6"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+      />
+      <path
+        d="M14.7 5.7v2.3h-2.3M5.3 14.3V12h2.3"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M10 7.25v3.55"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+      <circle cx="10" cy="12.95" r="0.85" fill="currentColor" />
+    </svg>
+  );
+}
+
 function DownloadArrowIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
@@ -1461,6 +1491,7 @@ function HubApp() {
   const [pendingSessions, setPendingSessions] = useState([]);
   const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
   const [pendingChatStarts, setPendingChatStarts] = useState({});
+  const [pendingContainerRefreshes, setPendingContainerRefreshes] = useState({});
   const [themePreference, setThemePreference] = useState(() => loadThemePreference());
   const [defaultAgentSettingSaving, setDefaultAgentSettingSaving] = useState(false);
   const [openAiProviderStatus, setOpenAiProviderStatus] = useState(() =>
@@ -2471,6 +2502,24 @@ function HubApp() {
     }
   }
 
+  async function handleRefreshChatContainer(chatId) {
+    setPendingContainerRefreshes((prev) => ({ ...prev, [chatId]: Date.now() }));
+    try {
+      await fetchJson(`/api/chats/${chatId}/refresh-container`, { method: "POST" });
+      setError("");
+      refreshState().catch(() => {});
+    } catch (err) {
+      setError(err.message || String(err));
+      refreshState().catch(() => {});
+    } finally {
+      setPendingContainerRefreshes((prev) => {
+        const next = { ...prev };
+        delete next[chatId];
+        return next;
+      });
+    }
+  }
+
   async function handleDeleteChat(chatId, uiId = chatId) {
     setHubState((prev) => ({
       ...prev,
@@ -2480,6 +2529,11 @@ function HubApp() {
       prev.filter((session) => session.ui_id !== uiId && session.server_chat_id !== chatId)
     );
     setPendingChatStarts((prev) => {
+      const next = { ...prev };
+      delete next[chatId];
+      return next;
+    });
+    setPendingContainerRefreshes((prev) => {
       const next = { ...prev };
       delete next[chatId];
       return next;
@@ -3139,6 +3193,13 @@ function HubApp() {
     const isRunning = Boolean(chat.is_running);
     const pendingStart = Boolean(pendingChatStarts[resolvedChatId] || chat.is_pending_start);
     const isStarting = isChatStarting(normalizedStatus, isRunning, pendingStart);
+    const isContainerOutdated = Boolean(chat.container_outdated);
+    const containerOutdatedReason = String(chat.container_outdated_reason || "");
+    const isContainerRefreshInFlight = Boolean(pendingContainerRefreshes[resolvedChatId]);
+    const showContainerRefreshButton = chatHasServer && isContainerOutdated;
+    const containerRefreshTooltip = isContainerRefreshInFlight
+      ? "Refreshing container with latest snapshot..."
+      : containerOutdatedReason || "Running on an out-of-date container. Refresh to restart on latest snapshot.";
     const titleStatus = String(chat.title_status || "idle").toLowerCase();
     const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
     const envCount = (chat.env_vars || []).length;
@@ -3382,6 +3443,25 @@ function HubApp() {
               >
                 <InfoIcon />
                 <span>Connect account</span>
+              </button>
+            ) : null}
+            {showContainerRefreshButton ? (
+              <button
+                type="button"
+                className={`icon-button chat-header-icon chat-header-refresh${isContainerRefreshInFlight ? " is-refreshing" : ""}`}
+                title={containerRefreshTooltip}
+                aria-label={
+                  isContainerRefreshInFlight
+                    ? `Refreshing container for ${chat.display_name || chat.name}`
+                    : `Refresh out-of-date container for ${chat.display_name || chat.name}`
+                }
+                disabled={isContainerRefreshInFlight}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleRefreshChatContainer(resolvedChatId);
+                }}
+              >
+                <RefreshWarningIcon />
               </button>
             ) : null}
             <button

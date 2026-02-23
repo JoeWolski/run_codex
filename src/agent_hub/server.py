@@ -91,6 +91,10 @@ AGENT_COMMAND_BY_TYPE = {
     AGENT_TYPE_CLAUDE: "claude",
     AGENT_TYPE_GEMINI: "gemini",
 }
+AGENT_RESUME_ARGS_BY_TYPE = {
+    AGENT_TYPE_CLAUDE: ("--continue",),
+    AGENT_TYPE_GEMINI: ("--resume",),
+}
 AGENT_LABEL_BY_TYPE = {
     AGENT_TYPE_CODEX: "Codex",
     AGENT_TYPE_CLAUDE: "Claude",
@@ -503,6 +507,18 @@ def _normalize_chat_agent_type(raw_value: Any, *, strict: bool = False) -> str:
         supported = ", ".join(sorted(SUPPORTED_CHAT_AGENT_TYPES))
         raise HTTPException(status_code=400, detail=f"agent_type must be one of: {supported}.")
     return DEFAULT_CHAT_AGENT_TYPE
+
+
+def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
+    if arg == long_option or arg.startswith(f"{long_option}="):
+        return True
+    if short_option and (arg == short_option or arg.startswith(f"{short_option}=")):
+        return True
+    return False
+
+
+def _has_cli_option(args: list[str], *, long_option: str, short_option: str | None = None) -> bool:
+    return any(_cli_arg_matches_option(str(arg), long_option=long_option, short_option=short_option) for arg in args)
 
 
 def _configure_hub_logging(level: str) -> None:
@@ -7173,6 +7189,49 @@ class HubState:
             project_id=str(project.get("id") or ""),
         )
 
+    def _chat_container_outdated_state(
+        self,
+        *,
+        chat: dict[str, Any],
+        project: dict[str, Any],
+        is_running: bool,
+    ) -> tuple[bool, str]:
+        if not is_running or not isinstance(project, dict):
+            return False, ""
+
+        latest_snapshot = str(project.get("setup_snapshot_image") or "").strip()
+        expected_snapshot = self._project_setup_snapshot_tag(project)
+        build_status = str(project.get("build_status") or "").strip().lower()
+        if build_status != "ready" or not latest_snapshot or latest_snapshot != expected_snapshot:
+            return False, ""
+
+        active_snapshot = str(chat.get("setup_snapshot_image") or "").strip()
+        if not active_snapshot or active_snapshot == latest_snapshot:
+            return False, ""
+
+        reason = (
+            f"Running on setup snapshot '{active_snapshot}' while project is ready on '{latest_snapshot}'. "
+            "Refresh to restart on the latest container and resume chat context."
+        )
+        return True, reason
+
+    @staticmethod
+    def _resume_agent_args(agent_type: str, agent_args: list[str]) -> list[str]:
+        normalized_args = [str(arg) for arg in agent_args if str(arg).strip()]
+        if agent_type == AGENT_TYPE_CLAUDE:
+            if _has_cli_option(normalized_args, long_option="--continue") or _has_cli_option(
+                normalized_args, long_option="--resume"
+            ):
+                return normalized_args
+        if agent_type == AGENT_TYPE_GEMINI:
+            if _has_cli_option(normalized_args, long_option="--resume", short_option="-r"):
+                return normalized_args
+
+        resume_args = list(AGENT_RESUME_ARGS_BY_TYPE.get(agent_type, ()))
+        if not resume_args:
+            return normalized_args
+        return [*resume_args, *normalized_args]
+
     def state_payload(self) -> dict[str, Any]:
         state = self.load()
         project_map: dict[str, dict[str, Any]] = {}
@@ -7269,6 +7328,13 @@ class HubState:
                 project_name
             )
             chat_copy["project_name"] = project_name
+            is_outdated, outdated_reason = self._chat_container_outdated_state(
+                chat=chat_copy,
+                project=project_for_chat,
+                is_running=running,
+            )
+            chat_copy["container_outdated"] = is_outdated
+            chat_copy["container_outdated_reason"] = outdated_reason
             subtitle = _chat_subtitle_from_log(self.chat_log(chat_id))
             cached_title = _truncate_title(str(chat_copy.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
             if cached_title and _looks_like_terminal_control_payload(cached_title):
@@ -7314,7 +7380,7 @@ class HubState:
         state["settings"] = _normalize_hub_settings_payload(state.get("settings"))
         return state
 
-    def start_chat(self, chat_id: str) -> dict[str, Any]:
+    def start_chat(self, chat_id: str, *, resume: bool = False) -> dict[str, Any]:
         state = self.load()
         chat = state["chats"].get(chat_id)
         if chat is None:
@@ -7369,6 +7435,8 @@ class HubState:
             str(self.system_prompt_file),
             "--no-alt-screen",
         ]
+        if resume and agent_type == AGENT_TYPE_CODEX:
+            cmd.append("--resume")
         repo_url = str(project.get("repo_url") or "")
         cmd.extend(self._openai_credentials_arg())
         cmd.extend(self._github_git_args_for_repo(repo_url))
@@ -7387,6 +7455,11 @@ class HubState:
                 continue
             cmd.extend(["--env-var", env_entry])
         agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
+        if resume and agent_type == AGENT_TYPE_CODEX:
+            # agent_cli resume mode and explicit args are mutually exclusive.
+            agent_args = []
+        elif resume:
+            agent_args = self._resume_agent_args(agent_type, agent_args)
         if agent_args:
             cmd.append("--")
             cmd.extend(agent_args)
@@ -7403,6 +7476,26 @@ class HubState:
         state["chats"][chat_id] = chat
         self.save(state)
         return chat
+
+    def refresh_chat_container(self, chat_id: str) -> dict[str, Any]:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        project = state["projects"].get(chat["project_id"])
+        if project is None:
+            raise HTTPException(status_code=404, detail="Parent project missing.")
+
+        running = bool(chat.get("status") == "running" and _is_process_running(chat.get("pid")))
+        if not running:
+            raise HTTPException(status_code=409, detail="Chat must be running to refresh its container.")
+
+        is_outdated, _reason = self._chat_container_outdated_state(chat=chat, project=project, is_running=running)
+        if not is_outdated:
+            raise HTTPException(status_code=409, detail="Chat container is already up to date.")
+
+        self.close_chat(chat_id)
+        return self.start_chat(chat_id, resume=True)
 
     def close_chat(self, chat_id: str) -> dict[str, Any]:
         state = self.load()
@@ -8612,6 +8705,10 @@ def main(
     @app.post("/api/chats/{chat_id}/start")
     def api_start_chat(chat_id: str) -> dict[str, Any]:
         return {"chat": state.start_chat(chat_id)}
+
+    @app.post("/api/chats/{chat_id}/refresh-container")
+    def api_refresh_chat_container(chat_id: str) -> dict[str, Any]:
+        return {"chat": state.refresh_chat_container(chat_id)}
 
     @app.post("/api/chats/{chat_id}/close")
     def api_close_chat(chat_id: str) -> dict[str, Any]:

@@ -1407,6 +1407,233 @@ Gemini CLI
         started_chat = self.state.load()["chats"][chat["id"]]
         self.assertEqual(started_chat["agent_type"], "gemini")
 
+    def test_start_chat_resume_for_codex_uses_agent_cli_resume_without_explicit_args(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=["--model", "gpt-5.3-codex"],
+            agent_type="codex",
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"], resume=True)
+
+        cmd = captured["cmd"]
+        self.assertIn("--resume", cmd)
+        self.assertNotIn("--", cmd)
+        self.assertNotIn("gpt-5.3-codex", cmd)
+
+    def test_start_chat_resume_for_claude_adds_continue_flag(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=["--model", "sonnet"],
+            agent_type="claude",
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"], resume=True)
+
+        cmd = captured["cmd"]
+        self.assertIn("--", cmd)
+        args_index = cmd.index("--")
+        runtime_args = cmd[args_index + 1:]
+        self.assertIn("--continue", runtime_args)
+        self.assertIn("--model", runtime_args)
+        self.assertIn("sonnet", runtime_args)
+
+    def test_start_chat_resume_for_gemini_adds_resume_flag(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=["--model", "gemini-2.5-pro"],
+            agent_type="gemini",
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4242
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"], resume=True)
+
+        cmd = captured["cmd"]
+        self.assertIn("--", cmd)
+        args_index = cmd.index("--")
+        runtime_args = cmd[args_index + 1:]
+        self.assertIn("--resume", runtime_args)
+        self.assertIn("--model", runtime_args)
+        self.assertIn("gemini-2.5-pro", runtime_args)
+
+    def test_state_payload_marks_running_chat_container_outdated(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        latest_snapshot = self.state._project_setup_snapshot_tag(project)
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 7777
+        state_data["chats"][chat["id"]]["setup_snapshot_image"] = "older-snapshot-tag"
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._is_process_running", return_value=True):
+            payload = self.state.state_payload()
+
+        chat_payload = next(item for item in payload["chats"] if item["id"] == chat["id"])
+        self.assertTrue(chat_payload["container_outdated"])
+        self.assertIn("older-snapshot-tag", chat_payload["container_outdated_reason"])
+        self.assertIn(latest_snapshot, chat_payload["container_outdated_reason"])
+
+    def test_refresh_chat_container_closes_and_restarts_with_resume(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            agent_type="claude",
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 9988
+        state_data["chats"][chat["id"]]["setup_snapshot_image"] = "older-snapshot-tag"
+        self.state.save(state_data)
+
+        captured: dict[str, object] = {}
+
+        def fake_close(_: hub_server.HubState, chat_id: str) -> dict[str, str]:
+            captured["closed"] = chat_id
+            return {"id": chat_id, "status": "stopped"}
+
+        def fake_start(_: hub_server.HubState, chat_id: str, resume: bool = False) -> dict[str, str]:
+            captured["started"] = {"chat_id": chat_id, "resume": resume}
+            return {"id": chat_id, "status": "running"}
+
+        with patch("agent_hub.server._is_process_running", return_value=True), patch.object(
+            hub_server.HubState, "close_chat", fake_close
+        ), patch.object(
+            hub_server.HubState, "start_chat", fake_start
+        ):
+            result = self.state.refresh_chat_container(chat["id"])
+
+        self.assertEqual(captured["closed"], chat["id"])
+        self.assertEqual(captured["started"], {"chat_id": chat["id"], "resume": True})
+        self.assertEqual(result, {"id": chat["id"], "status": "running"})
+
     def test_start_chat_passes_github_app_credentials_when_configured(self) -> None:
         self._connect_github_app()
         project = self.state.add_project(
@@ -6170,6 +6397,22 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             agent_args=["--model", "sonnet"],
             agent_type="claude",
         )
+
+    def test_chat_refresh_container_route_calls_state_refresh(self) -> None:
+        app = self._build_app()
+        chat = {"id": "chat-1", "status": "running"}
+
+        with patch.object(
+            hub_server.HubState,
+            "refresh_chat_container",
+            return_value=chat,
+        ) as refresh_chat:
+            with TestClient(app) as client:
+                response = client.post("/api/chats/chat-1/refresh-container")
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {"chat": chat})
+        refresh_chat.assert_called_once_with("chat-1")
 
     def test_settings_patch_route_updates_default_agent_type(self) -> None:
         app = self._build_app()

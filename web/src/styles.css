@@ -1541,6 +1541,40 @@ button:focus-visible {
   height: 14px;
 }
 
+.chat-header-refresh {
+  color: var(--warning);
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+}
+
+.chat-header-refresh:hover {
+  color: var(--warning-hover);
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+}
+
+.chat-header-refresh:focus-visible {
+  box-shadow: 0 0 0 3px var(--warning-soft);
+}
+
+.chat-header-refresh:disabled {
+  opacity: 0.8;
+  cursor: progress;
+}
+
+.chat-header-refresh.is-refreshing svg {
+  animation: chat-header-refresh-spin 0.9s linear infinite;
+}
+
+@keyframes chat-header-refresh-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .chat-header-delete:hover {
   color: #ffffff;
   border-color: var(--danger);
