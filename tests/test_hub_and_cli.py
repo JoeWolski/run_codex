@@ -651,6 +651,7 @@ class HubStateTests(unittest.TestCase):
 
     def test_start_openai_account_login_uses_host_network(self) -> None:
         captured: dict[str, list[str]] = {}
+        self.state.local_supp_gids = f"{self.state.local_gid},3000,3001"
 
         def fake_popen(cmd: list[str], **kwargs):
             del kwargs
@@ -679,14 +680,17 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("login", cmd)
         self.assertNotIn("--device-auth", cmd)
         self.assertNotIn(f"LOCAL_UID={self.state.local_uid}", cmd)
-        for raw_gid in self.state.local_supp_gids.split(","):
-            token = raw_gid.strip()
-            if not token:
-                continue
-            if int(token) == self.state.local_gid:
-                continue
+        image_idx = cmd.index(hub_server.DEFAULT_AGENT_IMAGE)
+        codex_idx = cmd.index("codex")
+        login_idx = cmd.index("login")
+        self.assertLess(image_idx, codex_idx)
+        self.assertLess(codex_idx, login_idx)
+        for group in ("3000", "3001"):
             self.assertIn("--group-add", cmd)
-            self.assertIn(token, cmd)
+            self.assertIn(group, cmd)
+            group_idx = cmd.index(group)
+            self.assertLess(group_idx, image_idx)
+        self.assertNotIn("--group-add", cmd[login_idx + 1 :])
         container_home = hub_server.DEFAULT_CONTAINER_HOME
         self.assertNotIn(f"{self.state.host_agent_home}:{container_home}", cmd)
         self.assertIn(f"{self.state.host_codex_dir}:{container_home}/.codex", cmd)

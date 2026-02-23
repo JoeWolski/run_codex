@@ -4512,14 +4512,18 @@ class HubState:
             f"CONTAINER_HOME={container_home}",
             "--env",
             f"PATH={container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            DEFAULT_AGENT_IMAGE,
-            "codex",
-            "login",
         ]
         for supp_gid in _parse_gid_csv(self.local_supp_gids):
             if supp_gid == self.local_gid:
                 continue
             cmd.extend(["--group-add", str(supp_gid)])
+        cmd.extend(
+            [
+                DEFAULT_AGENT_IMAGE,
+                "codex",
+                "login",
+            ]
+        )
         if method == "device_auth":
             cmd.append("--device-auth")
         return cmd
