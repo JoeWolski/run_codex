@@ -177,6 +177,24 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
         self.assertEqual(loaded["build_status"], "ready")
 
+    def test_state_payload_reports_project_build_log_availability(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        payload = self.state.state_payload()
+        loaded = next(item for item in payload["projects"] if item["id"] == project["id"])
+        self.assertIn("has_build_log", loaded)
+        self.assertFalse(loaded["has_build_log"])
+
+        log_path = self.state.project_build_log(project["id"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("snapshot build output\n", encoding="utf-8")
+
+        updated_payload = self.state.state_payload()
+        updated = next(item for item in updated_payload["projects"] if item["id"] == project["id"])
+        self.assertTrue(updated["has_build_log"])
+
     def test_settings_default_agent_type_persists_and_is_exposed(self) -> None:
         initial_settings = self.state.settings_payload()
         self.assertEqual(initial_settings["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)

@@ -2333,30 +2333,6 @@ function HubApp() {
     });
   }
 
-  async function handleSaveProjectSettings(projectId) {
-    setEditingProjects((prev) => ({ ...prev, [projectId]: false }));
-    markProjectBuilding(projectId);
-    try {
-      await persistProjectSettings(projectId);
-      setPendingProjectBuilds((prev) => {
-        const next = { ...prev };
-        delete next[projectId];
-        return next;
-      });
-      setError("");
-      refreshState().catch(() => {});
-    } catch (err) {
-      setEditingProjects((prev) => ({ ...prev, [projectId]: true }));
-      setPendingProjectBuilds((prev) => {
-        const next = { ...prev };
-        delete next[projectId];
-        return next;
-      });
-      setError(err.message || String(err));
-      refreshState().catch(() => {});
-    }
-  }
-
   function handleEditProject(project) {
     setProjectDrafts((prev) => ({
       ...prev,
@@ -3756,31 +3732,51 @@ function HubApp() {
                 const statusInfo = projectStatusInfo(buildStatus);
                 const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
                 const canStartChat = buildStatus === "ready";
-                const canShowStoredLogButton = buildStatus === "ready" || buildStatus === "failed";
                 const isEditing = Boolean(editingProjects[project.id]);
                 const isStoredLogOpen = Boolean(openBuildLogs[project.id]);
                 const storedLogText = projectStaticLogs[project.id];
+                const hasStoredLogText = Boolean(String(storedLogText || "").trim());
+                const hasLiveLogText = Boolean(String(projectBuildLogs[project.id] || "").trim());
+                const hasBuildLog = Boolean(project.has_build_log) || hasStoredLogText || hasLiveLogText;
 
                 return (
                   <article className="card project-card" key={project.id}>
                     <div className="project-head">
                       <h3>{project.name}</h3>
-                      {!isEditing ? (
-                        <button
-                          type="button"
-                          className="icon-button"
-                          title="Edit project settings"
-                          aria-label={`Edit ${project.name}`}
-                          onClick={() => handleEditProject(project)}
-                        >
-                          ✎
-                        </button>
-                      ) : null}
+                      <button
+                        type="button"
+                        className="icon-button"
+                        title={isEditing ? "Collapse project settings" : "Edit project settings"}
+                        aria-label={isEditing ? `Collapse settings for ${project.name}` : `Edit ${project.name}`}
+                        onClick={() => {
+                          if (isEditing) {
+                            handleCancelProjectEdit(project);
+                            return;
+                          }
+                          handleEditProject(project);
+                        }}
+                      >
+                        {isEditing ? "✕" : "✎"}
+                      </button>
                     </div>
                     <div className="meta">ID: {project.id}</div>
                     <div className="meta">Repo: {project.repo_url}</div>
                     <div className="meta">Branch: {project.default_branch || "master"}</div>
-                    <div className="meta">Status: <span className={`project-build-state ${statusInfo.key}`}>{statusInfo.label}</span></div>
+                    <div className="meta project-status-meta">
+                      <span>Status:</span>
+                      <span className={`project-build-state ${statusInfo.key}`}>{statusInfo.label}</span>
+                      {hasBuildLog ? (
+                        <button
+                          type="button"
+                          className={`icon-button build-log-icon-button ${isStoredLogOpen ? "is-open" : ""}`}
+                          title="image build log"
+                          aria-label={`image build log for ${project.name}`}
+                          onClick={() => handleToggleStoredBuildLog(project.id)}
+                        >
+                          <MdDescription aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </div>
                     <div className="meta">
                       Base image source:{" "}
                       {project.base_image_value
@@ -3822,35 +3818,35 @@ function HubApp() {
                     ) : null}
 
                     <div className="stack compact">
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        disabled={!canStartChat && isBuilding}
-                        onClick={() => (canStartChat ? handleCreateChat(project.id) : handleBuildProject(project.id))}
-                      >
-                        {canStartChat
-                          ? "New chat"
-                          : isBuilding
-                            ? <SpinnerLabel text="Building image..." />
-                            : "Build"}
-                      </button>
+                      {!isEditing ? (
+                        <div className="actions project-collapsed-actions">
+                          <button
+                            type="button"
+                            className="btn-primary project-collapsed-primary"
+                            disabled={!canStartChat && isBuilding}
+                            onClick={() => (canStartChat ? handleCreateChat(project.id) : handleBuildProject(project.id))}
+                          >
+                            {canStartChat
+                              ? "New chat"
+                              : isBuilding
+                                ? <SpinnerLabel text="Building image..." />
+                                : "Build"}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-danger project-collapsed-delete"
+                            onClick={() => handleDeleteProject(project.id)}
+                          >
+                            Delete project
+                          </button>
+                        </div>
+                      ) : null}
                       {isBuilding ? (
                         <ProjectBuildTerminal
                           text={projectBuildLogs[project.id] || "Preparing project image...\r\n"}
                         />
                       ) : null}
-                      {canShowStoredLogButton ? (
-                        <div className="actions">
-                          <button
-                            type="button"
-                            className="btn-secondary btn-small build-log-toggle"
-                            onClick={() => handleToggleStoredBuildLog(project.id)}
-                          >
-                            {isStoredLogOpen ? "Hide stored build log" : "Show stored build log"}
-                          </button>
-                        </div>
-                      ) : null}
-                      {canShowStoredLogButton && isStoredLogOpen ? (
+                      {hasBuildLog && isStoredLogOpen ? (
                         <pre className="log-box">
                           {storedLogText && storedLogText.trim()
                             ? storedLogText
@@ -3900,30 +3896,25 @@ function HubApp() {
                             onChange={(rows) => updateProjectDraft(project.id, { defaultEnvVars: rows })}
                           />
 
-                          <div className="actions">
+                          <div className="actions project-edit-actions">
                             <button
                               type="button"
                               className="btn-primary"
-                              onClick={() => handleSaveProjectSettings(project.id)}
+                              disabled={isBuilding}
+                              onClick={() => handleBuildProject(project.id)}
                             >
-                              Save project settings
+                              {isBuilding ? <SpinnerLabel text="Building image..." /> : "Build"}
                             </button>
                             <button
                               type="button"
-                              className="btn-secondary"
-                              onClick={() => handleCancelProjectEdit(project)}
+                              className="btn-danger project-edit-delete"
+                              onClick={() => handleDeleteProject(project.id)}
                             >
-                              Cancel
+                              Delete project
                             </button>
                           </div>
                         </>
                       ) : null}
-
-                      <div className="actions">
-                        <button type="button" className="btn-danger" onClick={() => handleDeleteProject(project.id)}>
-                          Delete project
-                        </button>
-                      </div>
                     </div>
                   </article>
                 );
