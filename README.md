@@ -142,6 +142,7 @@ Behavior highlights:
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
 - Snapshot setup scripts run as the mapped host UID/GID (not root); OS-level package installs should be done in the base image layer.
+- Setup snapshot commits reset image `USER` to root so follow-on provider overlay builds can install packages deterministically.
 - Applies permissive in-container defaults unless you explicitly override them with trailing agent args:
   Codex uses `--ask-for-approval never --sandbox danger-full-access`; Claude uses `--permission-mode bypassPermissions`; Gemini uses `--approval-mode yolo`.
 - In `agent_hub` repo-path mode, a Dockerfile file path uses repository-root build context, while a directory path uses that directory as context.

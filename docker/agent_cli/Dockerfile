@@ -2,6 +2,8 @@ ARG BASE_IMAGE=nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
 ARG AGENT_PROVIDER=codex
 
+USER root
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \

@@ -36,4 +36,5 @@ docker build \
 
 - The image entrypoint is `docker/agent_cli/docker-entrypoint.py`.
 - `hub_artifact` is installed into `/usr/local/bin/hub_artifact` for artifact publishing in hub-launched chats.
+- Docker build layers run as `USER root` to keep package installation deterministic even when a setup snapshot was committed from a non-root runtime user.
 - Runtime user identity is provided by `docker run --user <uid>:<gid>` and `--group-add`, not by mutating `/etc/passwd` at container startup.

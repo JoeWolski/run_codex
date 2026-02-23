@@ -23,6 +23,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 DOCKER_ENTRYPOINT = ROOT / "docker" / "agent_cli" / "docker-entrypoint.py"
+AGENT_CLI_DOCKERFILE = ROOT / "docker" / "agent_cli" / "Dockerfile"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -3445,6 +3446,12 @@ PY
 
 
 class CliEnvVarTests(unittest.TestCase):
+    def test_agent_cli_dockerfile_sets_root_user_before_apt_layers(self) -> None:
+        content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn("USER root", content)
+        self.assertLess(content.index("USER root"), content.index("RUN apt-get update"))
+
     def test_default_config_uses_developer_instructions_for_file_artifacts(self) -> None:
         config_path = ROOT / "config" / "agent.config.toml"
         content = config_path.read_text(encoding="utf-8")
@@ -3516,6 +3523,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(commit_cmd)
             assert commit_cmd is not None
             self.assertIn("--change", commit_cmd)
+            self.assertIn("USER root", commit_cmd)
             self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]', commit_cmd)
             self.assertIn('CMD ["bash"]', commit_cmd)
 

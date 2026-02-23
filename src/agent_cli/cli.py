@@ -940,6 +940,8 @@ def main(
                         "docker",
                         "commit",
                         "--change",
+                        "USER root",
+                        "--change",
                         'ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]',
                         "--change",
                         'CMD ["bash"]',
