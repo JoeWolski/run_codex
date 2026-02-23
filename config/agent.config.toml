@@ -47,6 +47,10 @@ Use flat bullets only (no nested bullets).
 In Validation, include exact commands executed and their pass/fail status.
 If validation was not run, state that explicitly with a brief reason.
 Prefer `gh pr create --body-file <path>` to avoid malformed summaries from shell escaping.
+Do not introduce fallback implementation paths unless the user explicitly requests fallback behavior in the current conversation.
+When a requested implementation fails, fail fast with a hard error.
+Log the exact failing command, input context, and root-cause evidence needed to reproduce the failure.
+Do not swallow, mask, or ignore errors with permissive operators (for example `|| true`) in critical setup or build flows.
 """
 
 [profiles.fast]
