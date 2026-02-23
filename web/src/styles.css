@@ -422,9 +422,55 @@ code {
   grid-template-columns: 1fr;
 }
 
-.create-project-auto-config-button,
 .create-project-submit-button {
   margin-top: 2px;
+}
+
+.create-project-config-mode {
+  display: grid;
+  gap: 6px;
+}
+
+.create-project-config-mode-label {
+  margin: 0;
+}
+
+.create-project-config-mode-toggle {
+  width: fit-content;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.create-project-config-mode-button {
+  width: auto;
+  min-width: 88px;
+  min-height: 34px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 7px 12px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.create-project-config-mode-button:hover {
+  background: var(--bg-muted);
+  color: var(--text-primary);
+}
+
+.create-project-config-mode-button.active {
+  border-color: var(--border);
+  background: var(--bg-muted);
+  color: var(--text-primary);
+}
+
+.create-project-config-mode-button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .auto-config-meta {

@@ -4,6 +4,11 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import { isChatStarting, reconcilePendingChatStarts, reconcilePendingSessions } from "./chatPendingState";
 import {
+  isAutoCreateProjectConfigMode,
+  normalizeCreateProjectConfigMode,
+  shouldShowManualProjectConfigInputs
+} from "./createProjectConfigMode";
+import {
   MdArchive,
   MdAudiotrack,
   MdCode,
@@ -18,6 +23,7 @@ import {
 } from "react-icons/md";
 
 const THEME_STORAGE_KEY = "agent_hub_theme";
+const CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY = "agent_hub_project_config_mode";
 const DEFAULT_AGENT_TYPE = "codex";
 const DEFAULT_AGENT_CAPABILITIES = {
   version: 1,
@@ -219,6 +225,17 @@ function loadThemePreference() {
     return normalizeThemePreference(window.localStorage.getItem(THEME_STORAGE_KEY));
   } catch {
     return "system";
+  }
+}
+
+function loadCreateProjectConfigMode() {
+  if (typeof window === "undefined") {
+    return "auto";
+  }
+  try {
+    return normalizeCreateProjectConfigMode(window.localStorage.getItem(CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY));
+  } catch {
+    return "auto";
   }
 }
 
@@ -1395,6 +1412,7 @@ function HubApp() {
   );
   const [error, setError] = useState("");
   const [createForm, setCreateForm] = useState(() => emptyCreateForm());
+  const [createProjectConfigMode, setCreateProjectConfigMode] = useState(() => loadCreateProjectConfigMode());
   const [pendingAutoConfigProjects, setPendingAutoConfigProjects] = useState([]);
   const [projectDrafts, setProjectDrafts] = useState({});
   const [editingProjects, setEditingProjects] = useState({});
@@ -1740,6 +1758,20 @@ function HubApp() {
   }, [refreshState, refreshAuthSettings, refreshAgentCapabilities, startAgentCapabilitiesDiscovery]);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(
+        CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY,
+        normalizeCreateProjectConfigMode(createProjectConfigMode)
+      );
+    } catch {
+      // Local storage persistence failure should not block project creation.
+    }
+  }, [createProjectConfigMode]);
+
+  useEffect(() => {
     let stopped = false;
     let reconnectTimer = null;
     let ws = null;
@@ -2061,13 +2093,13 @@ function HubApp() {
 
     const formSnapshot = {
       repoUrl,
-      name: String(createForm.name || ""),
-      defaultBranch: String(createForm.defaultBranch || "").trim(),
-      baseImageMode: normalizeBaseMode(createForm.baseImageMode),
-      baseImageValue: String(createForm.baseImageValue || ""),
-      setupScript: String(createForm.setupScript || ""),
-      defaultVolumes: (createForm.defaultVolumes || []).map((row) => ({ ...row })),
-      defaultEnvVars: (createForm.defaultEnvVars || []).map((row) => ({ ...row }))
+      name: "",
+      defaultBranch: "",
+      baseImageMode: "tag",
+      baseImageValue: "",
+      setupScript: "",
+      defaultVolumes: [],
+      defaultEnvVars: []
     };
     let fallbackMounts;
     let fallbackEnvVars;
@@ -2129,6 +2161,7 @@ function HubApp() {
         body: JSON.stringify(autoConfigProjectPayload)
       });
       setPendingAutoConfigProjects((prev) => prev.filter((project) => project.id !== pendingProjectId));
+      setCreateForm(emptyCreateForm());
       setError("");
       refreshState().catch(() => {});
     } catch (err) {
@@ -2147,6 +2180,10 @@ function HubApp() {
 
   async function handleCreateProject(event) {
     event.preventDefault();
+    if (isAutoCreateProjectConfigMode(createProjectConfigMode)) {
+      await handleAutoConfigureCreateForm();
+      return;
+    }
     try {
       const mounts = buildMountPayload(createForm.defaultVolumes);
       const envVars = buildEnvPayload(createForm.defaultEnvVars);
@@ -3484,55 +3521,80 @@ function HubApp() {
                     onChange={(event) => updateCreateForm({ repoUrl: event.target.value })}
                     placeholder="git@github.com:org/repo.git or https://..."
                   />
-                  <button
-                    type="button"
-                    className="btn-secondary create-project-auto-config-button"
-                    onClick={handleAutoConfigureCreateForm}
-                    disabled={!String(createForm.repoUrl || "").trim()}
-                  >
-                    Auto configure
-                  </button>
-                  <div className="row two">
-                    <input
-                      value={createForm.name}
-                      onChange={(event) => updateCreateForm({ name: event.target.value })}
-                      placeholder="Optional project name"
-                    />
-                    <input
-                      value={createForm.defaultBranch}
-                      onChange={(event) => updateCreateForm({ defaultBranch: event.target.value })}
-                      placeholder="Default branch (optional)"
-                    />
+                  <div className="create-project-config-mode">
+                    <div className="label create-project-config-mode-label">Config mode</div>
+                    <div className="create-project-config-mode-toggle" role="group" aria-label="Project config mode">
+                      <button
+                        type="button"
+                        className={`create-project-config-mode-button ${
+                          !shouldShowManualProjectConfigInputs(createProjectConfigMode) ? "active" : ""
+                        }`}
+                        aria-pressed={!shouldShowManualProjectConfigInputs(createProjectConfigMode)}
+                        onClick={() => setCreateProjectConfigMode("auto")}
+                      >
+                        Auto
+                      </button>
+                      <button
+                        type="button"
+                        className={`create-project-config-mode-button ${
+                          shouldShowManualProjectConfigInputs(createProjectConfigMode) ? "active" : ""
+                        }`}
+                        aria-pressed={shouldShowManualProjectConfigInputs(createProjectConfigMode)}
+                        onClick={() => setCreateProjectConfigMode("manual")}
+                      >
+                        Manual
+                      </button>
+                    </div>
                   </div>
-                  <div className="row two">
-                    <select
-                      value={createForm.baseImageMode}
-                      onChange={(event) => updateCreateForm({ baseImageMode: event.target.value })}
-                    >
-                      <option value="tag">Docker image tag</option>
-                      <option value="repo_path">Repo Dockerfile/path</option>
-                    </select>
-                    <input
-                      value={createForm.baseImageValue}
-                      onChange={(event) => updateCreateForm({ baseImageValue: event.target.value })}
-                      placeholder={baseInputPlaceholder(createForm.baseImageMode)}
-                    />
-                  </div>
-                  <textarea
-                    className="script-input"
-                    value={createForm.setupScript}
-                    onChange={(event) => updateCreateForm({ setupScript: event.target.value })}
-                    placeholder={
-                      "Setup script (one command per line; runs in container with checked-out project as working directory)\n" +
-                      "example:\nuv sync\nuv run python -m pip install -e ."
-                    }
-                  />
+                  {shouldShowManualProjectConfigInputs(createProjectConfigMode) ? (
+                    <>
+                      <div className="row two">
+                        <input
+                          value={createForm.name}
+                          onChange={(event) => updateCreateForm({ name: event.target.value })}
+                          placeholder="Optional project name"
+                        />
+                        <input
+                          value={createForm.defaultBranch}
+                          onChange={(event) => updateCreateForm({ defaultBranch: event.target.value })}
+                          placeholder="Default branch (optional)"
+                        />
+                      </div>
+                      <div className="row two">
+                        <select
+                          value={createForm.baseImageMode}
+                          onChange={(event) => updateCreateForm({ baseImageMode: event.target.value })}
+                        >
+                          <option value="tag">Docker image tag</option>
+                          <option value="repo_path">Repo Dockerfile/path</option>
+                        </select>
+                        <input
+                          value={createForm.baseImageValue}
+                          onChange={(event) => updateCreateForm({ baseImageValue: event.target.value })}
+                          placeholder={baseInputPlaceholder(createForm.baseImageMode)}
+                        />
+                      </div>
+                      <textarea
+                        className="script-input"
+                        value={createForm.setupScript}
+                        onChange={(event) => updateCreateForm({ setupScript: event.target.value })}
+                        placeholder={
+                          "Setup script (one command per line; runs in container with checked-out project as working directory)\n" +
+                          "example:\nuv sync\nuv run python -m pip install -e ."
+                        }
+                      />
 
-                  <div className="label">Default volumes for new chats</div>
-                  <VolumeEditor rows={createForm.defaultVolumes} onChange={(rows) => updateCreateForm({ defaultVolumes: rows })} />
+                      <div className="label">Default volumes for new chats</div>
+                      <VolumeEditor rows={createForm.defaultVolumes} onChange={(rows) => updateCreateForm({ defaultVolumes: rows })} />
 
-                  <div className="label">Default environment variables for new chats</div>
-                  <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
+                      <div className="label">Default environment variables for new chats</div>
+                      <EnvVarEditor rows={createForm.defaultEnvVars} onChange={(rows) => updateCreateForm({ defaultEnvVars: rows })} />
+                    </>
+                  ) : (
+                    <div className="meta">
+                      Auto mode uses repository analysis to infer setup script, image mode, mounts, and environment defaults.
+                    </div>
+                  )}
 
                   <button type="submit" className="btn-primary create-project-submit-button">
                     Add project
