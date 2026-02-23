@@ -11,8 +11,8 @@ import { firefox } from "playwright";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..", "..");
-const hostVisibleRepoRoot = fs.existsSync("/home/joew/projects/agent_hub")
-  ? "/home/joew/projects/agent_hub"
+const hostVisibleRepoRoot = fs.existsSync("/home/agentuser/projects/agent_hub")
+  ? "/home/agentuser/projects/agent_hub"
   : repoRoot;
 
 const DEFAULTS = {
@@ -24,7 +24,7 @@ const DEFAULTS = {
   viewportWidth: 1580,
   viewportHeight: 980,
   projectName: "Agent Hub Frontend Demo Project",
-  repoUrl: "https://github.com/example/demo.git",
+  repoUrl: "https://example.com/org/repo.git",
   configFile: path.join(hostVisibleRepoRoot, "config", "agent.config.toml"),
   outputDir: path.join(hostVisibleRepoRoot, "tools", "demo", "output"),
   scriptFile: path.join(hostVisibleRepoRoot, "tools", "demo", "output", "demo_script.json"),
