@@ -605,8 +605,6 @@ class HubStateTests(unittest.TestCase):
         )
         auto_config_prompt = hub_server._render_prompt_template(
             hub_server.PROMPT_AUTO_CONFIGURE_PROJECT_FILE,
-            ccache_mount="/tmp/ccache:/workspace/.ccache",
-            sccache_mount="/tmp/sccache:/workspace/.cache/sccache",
             repo_url="https://github.com/acme/demo.git",
             branch="main",
         )
@@ -615,6 +613,7 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("1. test prompt", codex_prompt)
         self.assertIn("Repository URL: https://github.com/acme/demo.git", auto_config_prompt)
         self.assertIn("Checked out branch: main", auto_config_prompt)
+        self.assertIn("Do not include compiler-cache mounts", auto_config_prompt)
         self.assertIn("Dockerfile file path: build context is repository root.", auto_config_prompt)
         self.assertIn("choose a Dockerfile file path when the Dockerfile needs repository-root context", auto_config_prompt)
 
@@ -2840,6 +2839,60 @@ class HubStateTests(unittest.TestCase):
             )
 
         self.assertEqual(recommendation["default_rw_mounts"], [])
+
+    def test_normalize_auto_config_recommendation_ignores_cache_signals_in_test_paths(self) -> None:
+        workspace = self.tmp_path / "workspace-test-cache-signals"
+        cache_fixture = workspace / "tests" / "fixtures"
+        cache_fixture.mkdir(parents=True, exist_ok=True)
+        (cache_fixture / "CMakeLists.txt").write_text(
+            "set(CMAKE_C_COMPILER_LAUNCHER ccache)\n",
+            encoding="utf-8",
+        )
+        fake_home = self.tmp_path / "fake-home-test-cache-signals"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                workspace,
+            )
+
+        self.assertEqual(recommendation["default_rw_mounts"], [])
+
+    def test_normalize_auto_config_recommendation_replaces_cache_like_mounts_with_inferred_canonical_mounts(self) -> None:
+        workspace = self.tmp_path / "workspace-cache-canonicalize"
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / "CMakeLists.txt").write_text(
+            "set(CMAKE_CXX_COMPILER_LAUNCHER ccache)\n",
+            encoding="utf-8",
+        )
+        legacy_cache_host = self.tmp_path / "legacy-cache-host"
+        legacy_cache_host.mkdir(parents=True, exist_ok=True)
+        fake_home = self.tmp_path / "fake-home-cache-canonicalize"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [f"{legacy_cache_host}:/workspace/.scache"],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                workspace,
+            )
+
+        expected_mount = f"{fake_home / '.ccache'}:{hub_server.DEFAULT_CONTAINER_HOME}/.ccache"
+        self.assertEqual(recommendation["default_rw_mounts"], [expected_mount])
 
     def test_normalize_auto_config_recommendation_keeps_detected_ccache_mount_only(self) -> None:
         workspace = self.tmp_path / "workspace-ccache-only"

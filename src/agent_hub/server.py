@@ -123,6 +123,7 @@ AUTO_CONFIG_CACHE_SIGNAL_IGNORED_DIRS = {
     ".git",
     ".hg",
     ".svn",
+    "__pycache__",
     ".venv",
     "venv",
     "node_modules",
@@ -130,6 +131,16 @@ AUTO_CONFIG_CACHE_SIGNAL_IGNORED_DIRS = {
     "dist",
     "out",
     "target",
+}
+AUTO_CONFIG_CACHE_SIGNAL_IGNORED_PATH_PARTS = {
+    "test",
+    "tests",
+    "__tests__",
+    "testing",
+    "spec",
+    "specs",
+    "fixture",
+    "fixtures",
 }
 AUTO_CONFIG_CACHE_SIGNAL_DOC_DIRS = {"docs", "doc", "documentation"}
 AUTO_CONFIG_CACHE_SIGNAL_FILENAMES = {
@@ -169,14 +180,20 @@ AUTO_CONFIG_CACHE_SIGNAL_SUFFIXES = {
 }
 AUTO_CONFIG_CCACHE_SIGNAL_PATTERNS = (
     re.compile(r"\bCMAKE_[A-Z0-9_]*COMPILER_LAUNCHER\b[^\n#]*\bccache\b", re.IGNORECASE),
-    re.compile(r"\bccache\b\s+(?:--|[A-Za-z0-9_./-])", re.IGNORECASE),
-    re.compile(r"\bCCACHE_[A-Z0-9_]+\b", re.IGNORECASE),
+    re.compile(
+        r"(?:^|[;&|]\s*)(?:[A-Za-z0-9_./-]+/)?ccache\s+(?:--|[A-Za-z0-9_./-])",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(r"\b(?:export\s+)?CCACHE_[A-Z0-9_]+\s*(?:=|:)"),
     re.compile(r"\b(?:export\s+)?(?:CC|CXX)\s*=\s*(?:\"|')?ccache\b", re.IGNORECASE),
 )
 AUTO_CONFIG_SCCACHE_SIGNAL_PATTERNS = (
     re.compile(r"\bCMAKE_[A-Z0-9_]*COMPILER_LAUNCHER\b[^\n#]*\bsccache\b", re.IGNORECASE),
-    re.compile(r"\bsccache\b\s+(?:--|[A-Za-z0-9_./-])", re.IGNORECASE),
-    re.compile(r"\bSCCACHE_[A-Z0-9_]+\b", re.IGNORECASE),
+    re.compile(
+        r"(?:^|[;&|]\s*)(?:[A-Za-z0-9_./-]+/)?sccache\s+(?:--|[A-Za-z0-9_./-])",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(r"\b(?:export\s+)?SCCACHE_[A-Z0-9_]+\s*(?:=|:)"),
     re.compile(r"\bRUSTC_WRAPPER\s*=\s*(?:\"|')?sccache\b", re.IGNORECASE),
 )
 AUTO_CONFIG_SETUP_CHAIN_SPLIT_RE = re.compile(r"\s*&&\s*")
@@ -3511,13 +3528,8 @@ class HubState:
         return deduped
 
     def _auto_config_prompt(self, repo_url: str, branch: str) -> str:
-        container_home = DEFAULT_CONTAINER_HOME
-        ccache_mount = f"{Path.home().resolve() / '.ccache'}:{container_home}/.ccache"
-        sccache_mount = f"{Path.home().resolve() / '.cache' / 'sccache'}:{container_home}/.cache/sccache"
         return _render_prompt_template(
             PROMPT_AUTO_CONFIGURE_PROJECT_FILE,
-            ccache_mount=ccache_mount,
-            sccache_mount=sccache_mount,
             repo_url=repo_url,
             branch=branch,
         )
@@ -3696,6 +3708,8 @@ class HubState:
         parts = [part.lower() for part in relative.parts]
         if not parts:
             return False
+        if any(part in AUTO_CONFIG_CACHE_SIGNAL_IGNORED_PATH_PARTS for part in parts[:-1]):
+            return False
         if any(part in AUTO_CONFIG_CACHE_SIGNAL_DOC_DIRS for part in parts[:-1]):
             return False
         filename = parts[-1]
@@ -3733,16 +3747,26 @@ class HubState:
         return detected
 
     @staticmethod
+    def _cache_mount_backend_from_container_path(container_path: str) -> str:
+        normalized = str(container_path or "").strip().replace("\\", "/").rstrip("/").lower()
+        if not normalized:
+            return ""
+        if re.search(r"(?:^|/)\.?ccache(?:$|/)", normalized):
+            return "ccache"
+        if re.search(r"(?:^|/)\.cache/sccache(?:$|/)", normalized):
+            return "sccache"
+        if re.search(r"(?:^|/)\.?sccache(?:$|/)", normalized):
+            return "sccache"
+        if re.search(r"(?:^|/)\.scache(?:$|/)", normalized):
+            return "sccache"
+        return ""
+
+    @staticmethod
     def _cache_mount_backend_from_entry(entry: str) -> str:
         if ":" not in entry:
             return ""
         _host, container_raw = entry.split(":", 1)
-        container = container_raw.strip().replace("\\", "/").rstrip("/").lower()
-        if container.endswith("/.ccache"):
-            return "ccache"
-        if container.endswith("/.cache/sccache"):
-            return "sccache"
-        return ""
+        return HubState._cache_mount_backend_from_container_path(container_raw)
 
     def _augment_auto_config_cache_mounts(self, workspace: Path, rw_mounts: list[str]) -> list[str]:
         mounted = self._dedupe_entries(list(rw_mounts))
@@ -3751,7 +3775,7 @@ class HubState:
         existing: set[str] = set()
         for entry in mounted:
             backend = self._cache_mount_backend_from_entry(entry)
-            if backend and backend not in detected:
+            if backend:
                 continue
             if entry in existing:
                 continue
