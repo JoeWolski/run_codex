@@ -8,6 +8,7 @@ import {
   normalizeCreateProjectConfigMode,
   shouldShowManualProjectConfigInputs
 } from "./createProjectConfigMode";
+import { createFirstSeenOrderState, stableOrderItemsByFirstSeen } from "./stableListOrder";
 import {
   MdArchive,
   MdAudiotrack,
@@ -1507,6 +1508,10 @@ function HubApp() {
   const capabilitiesRefreshInFlightRef = useRef(false);
   const capabilitiesRefreshQueuedRef = useRef(false);
   const githubSetupResolutionRef = useRef("");
+  const projectFirstSeenOrderRef = useRef(createFirstSeenOrderState());
+  const chatFirstSeenOrderRef = useRef(createFirstSeenOrderState());
+  const autoConfigProjectOrderAliasByProjectIdRef = useRef(new Map());
+  const chatOrderAliasByServerIdRef = useRef(new Map());
   const hubSettings = useMemo(
     () => normalizeHubSettings(hubState.settings, agentCapabilities),
     [hubState.settings, agentCapabilities]
@@ -1776,6 +1781,39 @@ function HubApp() {
   }, [hubState.chats, pendingSessions, agentCapabilities]);
 
   useEffect(() => {
+    for (const session of pendingSessions) {
+      const serverChatId = String(session?.server_chat_id || "").trim();
+      const uiId = String(session?.ui_id || "").trim();
+      if (serverChatId && uiId && !chatOrderAliasByServerIdRef.current.has(serverChatId)) {
+        chatOrderAliasByServerIdRef.current.set(serverChatId, uiId);
+      }
+    }
+  }, [pendingSessions]);
+
+  const orderedVisibleChats = useMemo(
+    () =>
+      stableOrderItemsByFirstSeen(
+        visibleChats,
+        (chat, index) => {
+          const serverChatId = String(chat?.server_chat_id || "").trim();
+          if (serverChatId) {
+            const aliased = chatOrderAliasByServerIdRef.current.get(serverChatId);
+            if (aliased) {
+              return aliased;
+            }
+          }
+          const chatId = String(chat?.id || "").trim();
+          if (chatId) {
+            return chatId;
+          }
+          return serverChatId || `chat-${index}`;
+        },
+        chatFirstSeenOrderRef.current
+      ),
+    [visibleChats]
+  );
+
+  useEffect(() => {
     let cancelled = false;
     startAgentCapabilitiesDiscovery().catch(() => {});
     Promise.all([refreshState(), refreshAuthSettings(), refreshAgentCapabilities()])
@@ -1998,22 +2036,22 @@ function HubApp() {
   useEffect(() => {
     setOpenChats((prev) => {
       const next = {};
-      for (const chat of visibleChats) {
+      for (const chat of orderedVisibleChats) {
         next[chat.id] = prev[chat.id] ?? true;
       }
       return next;
     });
-  }, [visibleChats]);
+  }, [orderedVisibleChats]);
 
   useEffect(() => {
     setOpenChatDetails((prev) => {
       const next = {};
-      for (const chat of visibleChats) {
+      for (const chat of orderedVisibleChats) {
         next[chat.id] = prev[chat.id] ?? false;
       }
       return next;
     });
-  }, [visibleChats]);
+  }, [orderedVisibleChats]);
 
   useEffect(() => {
     setCollapsedProjectChats((prev) => {
@@ -2066,6 +2104,7 @@ function HubApp() {
   const projectsForList = useMemo(() => {
     const pendingRows = pendingAutoConfigProjects.map((project) => ({
       id: project.id,
+      stable_order_key: String(project.stable_order_key || project.id || ""),
       name: project.name,
       repo_url: project.repo_url,
       default_branch: project.default_branch,
@@ -2074,8 +2113,27 @@ function HubApp() {
       auto_config_log: project.auto_config_log || "",
       is_auto_config_pending: true
     }));
-    return [...pendingRows, ...(hubState.projects || [])];
+    const combinedRows = [...pendingRows, ...(hubState.projects || [])];
+    return stableOrderItemsByFirstSeen(
+      combinedRows,
+      (project, index) => {
+        const explicitStableKey = String(project?.stable_order_key || "").trim();
+        if (explicitStableKey) {
+          return explicitStableKey;
+        }
+        const projectId = String(project?.id || "").trim();
+        if (!projectId) {
+          return `project-${index}`;
+        }
+        return autoConfigProjectOrderAliasByProjectIdRef.current.get(projectId) || projectId;
+      },
+      projectFirstSeenOrderRef.current
+    );
   }, [hubState.projects, pendingAutoConfigProjects]);
+  const orderedProjects = useMemo(
+    () => projectsForList.filter((project) => !project.is_auto_config_pending),
+    [projectsForList]
+  );
   const settingsAgentOptions = useMemo(() => {
     const options = agentTypeOptions(agentCapabilities);
     if (options.length > 0) {
@@ -2216,16 +2274,17 @@ function HubApp() {
     const pendingProjectName = String(formSnapshot.name || "").trim() || extractProjectNameFromRepoUrl(repoUrl);
     const pendingProjectBranch = formSnapshot.defaultBranch || "auto-detect";
     setPendingAutoConfigProjects((prev) => [
+      ...prev,
       {
         id: pendingProjectId,
+        stable_order_key: pendingProjectId,
         name: pendingProjectName,
         repo_url: repoUrl,
         default_branch: pendingProjectBranch,
         auto_config_status: "running",
         auto_config_error: "",
         auto_config_log: "Preparing repository checkout for temporary analysis chat...\r\n"
-      },
-      ...prev
+      }
     ]);
     setError("");
 
@@ -2259,10 +2318,14 @@ function HubApp() {
           fallbackEnvVars
         )
       };
-      await fetchJson("/api/projects", {
+      const createProjectResponse = await fetchJson("/api/projects", {
         method: "POST",
         body: JSON.stringify(autoConfigProjectPayload)
       });
+      const createdProjectId = String(createProjectResponse?.project?.id || "").trim();
+      if (createdProjectId) {
+        autoConfigProjectOrderAliasByProjectIdRef.current.set(createdProjectId, pendingProjectId);
+      }
       setPendingAutoConfigProjects((prev) => prev.filter((project) => project.id !== pendingProjectId));
       setCreateForm(emptyCreateForm());
       setError("");
@@ -2383,7 +2446,7 @@ function HubApp() {
     const knownServerChatIds = (hubState.chats || [])
       .filter((chat) => String(chat.project_id || "") === String(projectId))
       .map((chat) => chat.id);
-    setPendingSessions((prev) => [{
+    setPendingSessions((prev) => [...prev, {
       ui_id: uiId,
       project_id: projectId,
       project_name: project?.name || "Unknown",
@@ -2393,7 +2456,7 @@ function HubApp() {
       server_chat_id_set_at_ms: 0,
       known_server_chat_ids: knownServerChatIds,
       seen_on_server: false
-    }, ...prev]);
+    }]);
     setActiveTab("chats");
     setOpenChats((prev) => ({ ...prev, [uiId]: true }));
     setOpenChatDetails((prev) => ({ ...prev, [uiId]: false }));
@@ -2410,6 +2473,7 @@ function HubApp() {
         refreshState().catch(() => {});
         return;
       }
+      chatOrderAliasByServerIdRef.current.set(chatId, uiId);
       setPendingSessions((prev) =>
         prev.map((session) =>
           session.ui_id === uiId
@@ -2838,11 +2902,11 @@ function HubApp() {
 
   const chatsByProject = useMemo(() => {
     const byProject = new Map();
-    for (const project of hubState.projects) {
+    for (const project of orderedProjects) {
       byProject.set(project.id, []);
     }
     const orphanChats = [];
-    for (const chat of visibleChats) {
+    for (const chat of orderedVisibleChats) {
       if (!byProject.has(chat.project_id)) {
         orphanChats.push(chat);
         continue;
@@ -2850,7 +2914,7 @@ function HubApp() {
       byProject.get(chat.project_id).push(chat);
     }
     return { byProject, orphanChats };
-  }, [hubState.projects, visibleChats]);
+  }, [orderedProjects, orderedVisibleChats]);
 
   const openAiAccountLoginUrl = String(openAiAccountSession?.loginUrl || "").trim();
   const openAiAccountSessionMethod = String(openAiAccountSession?.method || "");
@@ -3025,11 +3089,11 @@ function HubApp() {
     if (!fullscreenChatId) {
       return;
     }
-    const exists = visibleChats.some((chat) => chat.id === fullscreenChatId);
+    const exists = orderedVisibleChats.some((chat) => chat.id === fullscreenChatId);
     if (!exists) {
       setFullscreenChatId("");
     }
-  }, [visibleChats, fullscreenChatId]);
+  }, [orderedVisibleChats, fullscreenChatId]);
 
   useEffect(() => {
     if (activeTab !== "chats") {
@@ -3948,8 +4012,8 @@ function HubApp() {
         ) : activeTab === "chats" ? (
           <section className="panel chats-panel">
             <div className="stack chat-groups">
-              {hubState.projects.length === 0 ? <div className="empty">No projects yet.</div> : null}
-              {hubState.projects.map((project) => {
+              {orderedProjects.length === 0 ? <div className="empty">No projects yet.</div> : null}
+              {orderedProjects.map((project) => {
                 const projectChats = chatsByProject.byProject.get(project.id) || [];
                 const buildStatus = String(project.build_status || "pending");
                 const canStartChat = buildStatus === "ready";
