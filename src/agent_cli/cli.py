@@ -19,7 +19,7 @@ from typing import Iterable, Tuple
 import click
 
 
-DEFAULT_BASE_IMAGE = "nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04"
+DEFAULT_BASE_IMAGE = "ubuntu:24.04"
 DEFAULT_SETUP_RUNTIME_IMAGE = "agent-ubuntu2204-setup:latest"
 DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204-codex:latest"
 CLAUDE_RUNTIME_IMAGE = "agent-ubuntu2204-claude:latest"

@@ -7361,7 +7361,7 @@ def _html_page() -> str:
             <option value="tag">Docker image tag</option>
             <option value="repo_path">Repo Dockerfile/path</option>
           </select>
-          <input id="project-base-image-value" placeholder="Docker image tag (e.g. nvcr.io/nvidia/isaac-lab:2.3.2)" />
+          <input id="project-base-image-value" placeholder="ubuntu:24.04" />
         </div>
         <textarea id="project-setup-script" class="script-input" placeholder="Setup script (one command per line, run in the checked-out project)&#10;example:&#10;uv sync&#10;uv run python -m pip install -e ."></textarea>
         <div class="section-label">Default volumes for new chats</div>
@@ -7385,6 +7385,8 @@ def _html_page() -> str:
     </section>
   </main>
   <script>
+    const DEFAULT_BASE_IMAGE_TAG = 'ubuntu:24.04';
+
     async function fetchJson(url, options={}) {
       const response = await fetch(url, Object.assign({ headers: { "Content-Type":"application/json" } }, options));
       if (!response.ok) {
@@ -7425,7 +7427,7 @@ def _html_page() -> str:
       if (mode === 'repo_path') {
         return 'Path in repo to Dockerfile or dir (e.g. docker/base or docker/base/Dockerfile)';
       }
-      return 'Docker image tag (e.g. nvcr.io/nvidia/isaac-lab:2.3.2)';
+      return DEFAULT_BASE_IMAGE_TAG;
     }
 
     function updateBasePlaceholderForCreate() {

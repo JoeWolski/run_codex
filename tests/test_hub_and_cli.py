@@ -163,7 +163,7 @@ class HubStateTests(unittest.TestCase):
             default_branch="main",
             setup_script="echo hi",
             base_image_mode="tag",
-            base_image_value="nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04",
+            base_image_value="ubuntu:24.04",
             default_ro_mounts=[f"{self.host_ro}:/data_ro"],
             default_rw_mounts=[f"{self.host_rw}:/data_rw"],
             default_env_vars=["FOO=bar"],
@@ -4024,6 +4024,12 @@ PY
 
 
 class CliEnvVarTests(unittest.TestCase):
+    def test_agent_cli_default_base_image_uses_ubuntu_24_04(self) -> None:
+        content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertEqual(image_cli.DEFAULT_BASE_IMAGE, "ubuntu:24.04")
+        self.assertIn("ARG BASE_IMAGE=ubuntu:24.04", content)
+
     def test_agent_cli_dockerfile_sets_root_user_before_apt_layers(self) -> None:
         content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
 

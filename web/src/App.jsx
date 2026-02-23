@@ -24,6 +24,7 @@ import {
 
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY = "agent_hub_project_config_mode";
+const DEFAULT_BASE_IMAGE_TAG = "ubuntu:24.04";
 const DEFAULT_AGENT_TYPE = "codex";
 const DEFAULT_HUB_SETTINGS = { defaultAgentType: DEFAULT_AGENT_TYPE };
 const DEFAULT_AGENT_CAPABILITIES = {
@@ -317,7 +318,7 @@ function baseInputPlaceholder(mode) {
   if (mode === "repo_path") {
     return "Path in repo to Dockerfile or dir (e.g. docker/base or docker/base/Dockerfile)";
   }
-  return "Docker image tag (e.g. nvcr.io/nvidia/isaac-lab:2.3.2)";
+  return DEFAULT_BASE_IMAGE_TAG;
 }
 
 function parseMountEntry(spec, mode) {
