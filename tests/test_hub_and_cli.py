@@ -5486,6 +5486,70 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             self.assertIn(overlay_tag, run_cmd)
 
+    def test_ensure_runtime_image_built_if_missing_waits_for_concurrent_builder(self) -> None:
+        target_image = "agent-runtime-claude-test"
+        build_started = threading.Event()
+        allow_finish = threading.Event()
+        lock = threading.Lock()
+        image_ready = {"value": False}
+        build_calls: list[str] = []
+        worker_errors: list[str] = []
+        worker_results: list[str] = []
+
+        def fake_image_exists(tag: str) -> bool:
+            self.assertEqual(tag, target_image)
+            with lock:
+                return bool(image_ready["value"])
+
+        def fake_build_runtime_image(*, base_image: str, target_image: str, agent_provider: str) -> None:
+            self.assertEqual(base_image, "snapshot:test")
+            self.assertEqual(target_image, "agent-runtime-claude-test")
+            self.assertEqual(agent_provider, image_cli.AGENT_PROVIDER_CLAUDE)
+            with lock:
+                build_calls.append(target_image)
+            build_started.set()
+            self.assertTrue(
+                allow_finish.wait(timeout=2.0),
+                "Test setup failed: timed out waiting to release concurrent build.",
+            )
+            with lock:
+                image_ready["value"] = True
+
+        def worker() -> None:
+            try:
+                image_cli._ensure_runtime_image_built_if_missing(
+                    base_image="snapshot:test",
+                    target_image=target_image,
+                    agent_provider=image_cli.AGENT_PROVIDER_CLAUDE,
+                )
+                worker_results.append("ok")
+            except Exception as exc:  # pragma: no cover - test assertions capture failures explicitly
+                worker_errors.append(str(exc))
+
+        with patch("agent_cli.cli._docker_image_exists", side_effect=fake_image_exists), patch.object(
+            image_cli,
+            "_build_runtime_image",
+            side_effect=fake_build_runtime_image,
+        ):
+            first = threading.Thread(target=worker, daemon=True)
+            second = threading.Thread(target=worker, daemon=True)
+            first.start()
+            self.assertTrue(build_started.wait(timeout=2.0), "First worker did not start runtime image build.")
+            second.start()
+
+            # While the first builder is in-progress, the second worker must block instead of starting another build.
+            self.assertEqual(len(build_calls), 1)
+
+            allow_finish.set()
+            first.join(timeout=2.0)
+            second.join(timeout=2.0)
+
+        self.assertFalse(first.is_alive(), "First worker did not exit.")
+        self.assertFalse(second.is_alive(), "Second worker did not exit.")
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(len(worker_results), 2)
+        self.assertEqual(len(build_calls), 1)
+
     def test_resume_uses_shell_command_as_container_entry_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

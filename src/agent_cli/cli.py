@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -13,8 +14,9 @@ import sys
 import tempfile
 import tomllib
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Tuple
+from typing import Iterable, Iterator, Tuple
 
 import click
 
@@ -43,6 +45,7 @@ GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 AGENT_HUB_SECRETS_DIR_NAME = "secrets"
 AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME = "github_credentials"
+RUNTIME_IMAGE_BUILD_LOCK_DIR = Path(tempfile.gettempdir()) / "agent-cli-image-build-locks"
 
 
 def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
@@ -683,6 +686,37 @@ def _snapshot_runtime_image_for_provider(snapshot_tag: str, agent_provider: str)
     return f"agent-runtime-{_sanitize_tag_component(agent_provider)}-{_short_hash(snapshot_tag)}"
 
 
+def _runtime_image_build_lock_path(target_image: str) -> Path:
+    digest = hashlib.sha256(str(target_image or "").encode("utf-8")).hexdigest()
+    return RUNTIME_IMAGE_BUILD_LOCK_DIR / f"{digest}.lock"
+
+
+@contextmanager
+def _runtime_image_build_lock(target_image: str) -> Iterator[None]:
+    lock_path = _runtime_image_build_lock_path(target_image)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = lock_path.open("a+", encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(
+            f"Failed to initialize runtime image build lock for '{target_image}' at {lock_path}: {exc}"
+        ) from exc
+    try:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise click.ClickException(
+                f"Failed to acquire runtime image build lock for '{target_image}' at {lock_path}: {exc}"
+            ) from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_handle.close()
+
+
 def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: str) -> None:
     click.echo(
         f"Building runtime image '{target_image}' from {DEFAULT_DOCKERFILE} "
@@ -704,6 +738,19 @@ def _build_runtime_image(*, base_image: str, target_image: str, agent_provider: 
         ],
         cwd=_repo_root(),
     )
+
+
+def _ensure_runtime_image_built_if_missing(*, base_image: str, target_image: str, agent_provider: str) -> None:
+    if _docker_image_exists(target_image):
+        return
+    with _runtime_image_build_lock(target_image):
+        if _docker_image_exists(target_image):
+            return
+        _build_runtime_image(
+            base_image=base_image,
+            target_image=target_image,
+            agent_provider=agent_provider,
+        )
 
 
 def _read_openai_api_key(path: Path) -> str | None:
@@ -1219,7 +1266,7 @@ def main(
             )
             for host_path, container_path in rw_mount_specs:
                 _validate_rw_mount(host_path, container_path, runtime_uid=uid, runtime_gid=gid)
-            _build_runtime_image(
+            _ensure_runtime_image_built_if_missing(
                 base_image=ensure_selected_base_image(),
                 target_image=DEFAULT_SETUP_RUNTIME_IMAGE,
                 agent_provider=AGENT_PROVIDER_NONE,
@@ -1274,12 +1321,11 @@ def main(
                 snapshot_tag,
                 selected_agent_provider,
             )
-            if not _docker_image_exists(provider_snapshot_runtime_image):
-                _build_runtime_image(
-                    base_image=snapshot_tag,
-                    target_image=provider_snapshot_runtime_image,
-                    agent_provider=selected_agent_provider,
-                )
+            _ensure_runtime_image_built_if_missing(
+                base_image=snapshot_tag,
+                target_image=provider_snapshot_runtime_image,
+                agent_provider=selected_agent_provider,
+            )
             runtime_image = provider_snapshot_runtime_image
     elif prepare_snapshot_only:
         raise click.ClickException("--prepare-snapshot-only requires --snapshot-image-tag")
