@@ -164,6 +164,7 @@ def _ensure_user_and_groups() -> None:
                     "useradd",
                     "--uid",
                     str(local_uid),
+                    "--non-unique",
                     "--gid",
                     str(local_gid),
                     "--home-dir",
@@ -180,6 +181,7 @@ def _ensure_user_and_groups() -> None:
                     "useradd",
                     "--uid",
                     str(local_uid),
+                    "--non-unique",
                     "--gid",
                     str(local_gid),
                     "--home-dir",
@@ -194,7 +196,7 @@ def _ensure_user_and_groups() -> None:
     if _run_success(["id", "-u", local_user]):
         current_uid = int(_run(["id", "-u", local_user], check=False).stdout.strip())
         if current_uid != local_uid:
-            _run(["usermod", "--uid", str(local_uid), local_user])
+            _run(["usermod", "--uid", str(local_uid), "--non-unique", local_user])
 
     current_gid = int(_run(["id", "-g", local_user], check=False).stdout.strip())
     if current_gid != local_gid:

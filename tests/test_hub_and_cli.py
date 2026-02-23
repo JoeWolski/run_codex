@@ -4854,6 +4854,131 @@ class DockerEntrypointTests(unittest.TestCase):
                 self.assertEqual(os.environ.get("GH_TOKEN"), "ghp_enterprise_token")
                 self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
 
+    def test_ensure_user_and_groups_allows_non_unique_uid_on_useradd(self) -> None:
+        module = self._load_entrypoint_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            local_home = str(Path(tmp) / "home-joew")
+            run_success_responses = {
+                ("getent", "group", "1000"): [True],
+                ("id", "-u", "joew"): [False, True],
+                ("which", "sudo"): [False],
+            }
+
+            def fake_run_success(command: list[str]) -> bool:
+                responses = run_success_responses.get(tuple(command), [])
+                if not responses:
+                    return False
+                return responses.pop(0)
+
+            def fake_run(command: list[str], check: bool = True) -> SimpleNamespace:
+                if command == ["id", "-u", "joew"]:
+                    return SimpleNamespace(returncode=0, stdout="1000\n")
+                if command == ["id", "-g", "joew"]:
+                    return SimpleNamespace(returncode=0, stdout="1000\n")
+                return SimpleNamespace(returncode=0, stdout="")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "LOCAL_USER": "joew",
+                    "LOCAL_GROUP": "joew",
+                    "LOCAL_UID": "1000",
+                    "LOCAL_GID": "1000",
+                    "LOCAL_SUPP_GIDS": "",
+                    "LOCAL_SUPP_GROUPS": "",
+                    "LOCAL_HOME": local_home,
+                    "LOCAL_UMASK": "0022",
+                },
+                clear=False,
+            ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
+                module.os, "geteuid", return_value=0
+            ), patch.object(
+                module.os, "execvp", side_effect=SystemExit(0)
+            ), patch.object(
+                module, "_run_success", side_effect=fake_run_success
+            ), patch.object(
+                module, "_run", side_effect=fake_run
+            ) as run_mock, patch.object(
+                module, "_ensure_runtime_home_paths", return_value=None
+            ), patch.object(
+                module, "_prepare_git_credentials", return_value=None
+            ), patch.object(
+                module, "_configure_git_identity", return_value=None
+            ):
+                with self.assertRaises(SystemExit):
+                    module._ensure_user_and_groups()
+
+            run_mock.assert_any_call(
+                [
+                    "useradd",
+                    "--uid",
+                    "1000",
+                    "--non-unique",
+                    "--gid",
+                    "1000",
+                    "--home-dir",
+                    local_home,
+                    "--create-home",
+                    "--shell",
+                    "/bin/bash",
+                    "joew",
+                ]
+            )
+
+    def test_ensure_user_and_groups_allows_non_unique_uid_on_usermod(self) -> None:
+        module = self._load_entrypoint_module()
+        run_success_responses = {
+            ("getent", "group", "1000"): [True],
+            ("id", "-u", "joew"): [True, True],
+            ("which", "sudo"): [False],
+        }
+
+        def fake_run_success(command: list[str]) -> bool:
+            responses = run_success_responses.get(tuple(command), [])
+            if not responses:
+                return False
+            return responses.pop(0)
+
+        def fake_run(command: list[str], check: bool = True) -> SimpleNamespace:
+            if command == ["id", "-u", "joew"]:
+                return SimpleNamespace(returncode=0, stdout="1001\n")
+            if command == ["id", "-g", "joew"]:
+                return SimpleNamespace(returncode=0, stdout="1000\n")
+            return SimpleNamespace(returncode=0, stdout="")
+
+        with patch.dict(
+            os.environ,
+            {
+                "LOCAL_USER": "joew",
+                "LOCAL_GROUP": "joew",
+                "LOCAL_UID": "1000",
+                "LOCAL_GID": "1000",
+                "LOCAL_SUPP_GIDS": "",
+                "LOCAL_SUPP_GROUPS": "",
+                "LOCAL_HOME": "/home/joew",
+                "LOCAL_UMASK": "0022",
+            },
+            clear=False,
+        ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
+            module.os, "geteuid", return_value=0
+        ), patch.object(
+            module.os, "execvp", side_effect=SystemExit(0)
+        ), patch.object(
+            module, "_run_success", side_effect=fake_run_success
+        ), patch.object(
+            module, "_run", side_effect=fake_run
+        ) as run_mock, patch.object(
+            module, "_ensure_runtime_home_paths", return_value=None
+        ), patch.object(
+            module, "_prepare_git_credentials", return_value=None
+        ), patch.object(
+            module, "_configure_git_identity", return_value=None
+        ):
+            with self.assertRaises(SystemExit):
+                module._ensure_user_and_groups()
+
+        run_mock.assert_any_call(["usermod", "--uid", "1000", "--non-unique", "joew"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,11 +34,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && rm -rf /var/lib/apt/lists/*
 
 RUN if ! id -u agent >/dev/null 2>&1; then \
-      groupadd --gid 1000 agent || true; \
-      useradd --uid 1000 --gid 1000 --home-dir /home/agent --create-home --shell /bin/bash agent; \
+      useradd --home-dir /home/agent --create-home --shell /bin/bash agent; \
     fi \
+ && agent_group="$(id -gn agent)" \
  && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
- && chown -R agent:agent /home/agent
+ && chown -R "agent:${agent_group}" /home/agent
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 COPY docker/agent_cli/hub_artifact /usr/local/bin/hub_artifact
