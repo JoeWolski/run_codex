@@ -883,12 +883,56 @@ button:focus-visible {
   width: auto;
 }
 
-.chat-actions .chat-primary-action {
+.project-status-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.build-log-icon-button {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  margin-left: 2px;
+  font-size: 0.95rem;
+}
+
+.build-log-icon-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.build-log-icon-button.is-open {
+  color: var(--text-primary);
+  background: var(--bg-muted);
+}
+
+.project-collapsed-actions {
+  width: 100%;
+  flex-wrap: nowrap;
+}
+
+.project-collapsed-actions .project-collapsed-primary {
+  flex: 0 0 auto;
   min-width: 132px;
 }
 
-.build-log-toggle {
-  min-width: 190px;
+.project-collapsed-actions .project-collapsed-delete {
+  margin-left: auto;
+}
+
+.project-edit-actions {
+  width: 100%;
+  flex-wrap: nowrap;
+}
+
+.project-edit-actions .project-edit-delete {
+  margin-left: auto;
+}
+
+.chat-actions .chat-primary-action {
+  min-width: 132px;
 }
 
 .status,
@@ -1899,8 +1943,23 @@ button:focus-visible {
     width: 100%;
   }
 
-  .chat-actions .chat-primary-action,
-  .build-log-toggle {
+  .project-collapsed-actions {
+    flex-wrap: nowrap;
+  }
+
+  .project-collapsed-actions button {
+    width: auto;
+  }
+
+  .project-edit-actions {
+    flex-wrap: nowrap;
+  }
+
+  .project-edit-actions button {
+    width: auto;
+  }
+
+  .chat-actions .chat-primary-action {
     min-width: 0;
   }
 

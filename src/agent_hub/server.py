@@ -6925,6 +6925,11 @@ class HubState:
             project_copy["build_error"] = str(project_copy.get("build_error") or "")
             project_copy["build_started_at"] = str(project_copy.get("build_started_at") or "")
             project_copy["build_finished_at"] = str(project_copy.get("build_finished_at") or "")
+            log_path = self.project_build_log(pid)
+            try:
+                project_copy["has_build_log"] = log_path.exists() and log_path.stat().st_size > 0
+            except OSError:
+                project_copy["has_build_log"] = False
             project_map[pid] = project_copy
         chats = []
         dead_chat_ids: list[str] = []
