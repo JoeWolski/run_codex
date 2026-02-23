@@ -36,6 +36,9 @@
 - Favor state-driven rendering over ad hoc DOM behavior.
 - Keep async flows cancellation-safe and shutdown-safe.
 - Validate changes with appropriate build/test checks before handoff.
+- Time every new individual test in isolation.
+- If any new individual test takes longer than 1 second, fix it before merge.
+- Long or hanging unit tests are not acceptable.
 - When updating, fixing, or adding features for a specific agent, verify the changes do not break or degrade behavior for any other supported agent.
 
 ## UI Evidence Workflow

@@ -16,6 +16,7 @@ Environment variables:
   AGENT_HUB_ARTIFACTS_URL   publish endpoint URL injected by Agent Hub
   AGENT_HUB_ARTIFACT_TOKEN  per-chat publish token injected by Agent Hub
   HUB_ARTIFACT_MAX_ATTEMPTS optional per-file upload attempts (default: 8)
+  HUB_ARTIFACT_DISABLE_RETRIES set to 1 to force single-attempt uploads (default: 0)
   HUB_ARTIFACT_RETRY_DELAY_BASE_SEC optional exponential backoff base delay (default: 1)
   HUB_ARTIFACT_RETRY_DELAY_MAX_SEC optional exponential backoff max delay (default: 30)
   HUB_ARTIFACT_CONNECT_TIMEOUT_SEC optional per-request connect timeout (default: 10)
@@ -79,19 +80,35 @@ require_int_ge() {
   fi
 }
 
-max_attempts="${HUB_ARTIFACT_MAX_ATTEMPTS:-8}"
+require_bool_01() {
+  local name="$1"
+  local value="$2"
+  if [[ "${value}" != "0" && "${value}" != "1" ]]; then
+    echo "${name} must be either 0 or 1." >&2
+    exit 2
+  fi
+}
+
+configured_max_attempts="${HUB_ARTIFACT_MAX_ATTEMPTS:-8}"
+disable_retries="${HUB_ARTIFACT_DISABLE_RETRIES:-0}"
 retry_delay_base_sec="${HUB_ARTIFACT_RETRY_DELAY_BASE_SEC:-1}"
 retry_delay_max_sec="${HUB_ARTIFACT_RETRY_DELAY_MAX_SEC:-30}"
 connect_timeout_sec="${HUB_ARTIFACT_CONNECT_TIMEOUT_SEC:-10}"
 request_timeout_sec="${HUB_ARTIFACT_REQUEST_TIMEOUT_SEC:-120}"
 progress_every="${HUB_ARTIFACT_PROGRESS_EVERY:-25}"
 
-require_int_ge "HUB_ARTIFACT_MAX_ATTEMPTS" "${max_attempts}" 1
+require_bool_01 "HUB_ARTIFACT_DISABLE_RETRIES" "${disable_retries}"
+require_int_ge "HUB_ARTIFACT_MAX_ATTEMPTS" "${configured_max_attempts}" 1
 require_int_ge "HUB_ARTIFACT_RETRY_DELAY_BASE_SEC" "${retry_delay_base_sec}" 0
 require_int_ge "HUB_ARTIFACT_RETRY_DELAY_MAX_SEC" "${retry_delay_max_sec}" 0
 require_int_ge "HUB_ARTIFACT_CONNECT_TIMEOUT_SEC" "${connect_timeout_sec}" 1
 require_int_ge "HUB_ARTIFACT_REQUEST_TIMEOUT_SEC" "${request_timeout_sec}" 1
 require_int_ge "HUB_ARTIFACT_PROGRESS_EVERY" "${progress_every}" 1
+
+max_attempts="${configured_max_attempts}"
+if [[ "${disable_retries}" == "1" ]]; then
+  max_attempts="1"
+fi
 
 upload_paths=()
 
@@ -207,13 +224,12 @@ for path in "${upload_paths[@]}"; do
   if [[ ${#upload_paths[@]} -eq 1 ]]; then
     name_arg="${artifact_name}"
   fi
-  attempt=1
-  while true; do
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
     if publish_one "${path}" "${name_arg}"; then
       published_count=$((published_count + 1))
       break
     fi
-    if [[ "${attempt}" -ge "${max_attempts}" ]]; then
+    if [[ "${attempt}" -eq "${max_attempts}" ]]; then
       echo "Artifact publish failed after ${attempt} attempt(s): ${path}" >&2
       failed_count=$((failed_count + 1))
       failed_paths+=("${path}")
@@ -228,8 +244,8 @@ for path in "${upload_paths[@]}"; do
       fi
       retry_level=$((retry_level - 1))
     done
-    attempt=$((attempt + 1))
-    echo "Retrying artifact publish (${attempt}/${max_attempts}): ${path} (sleep ${delay}s)" >&2
+    next_attempt=$((attempt + 1))
+    echo "Retrying artifact publish (${next_attempt}/${max_attempts}): ${path} (sleep ${delay}s)" >&2
     if (( delay > 0 )); then
       sleep "${delay}"
     fi

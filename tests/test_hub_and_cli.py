@@ -1014,6 +1014,7 @@ Gemini CLI
         self.assertIn("host", cmd)
         self.assertIn("--tmpfs", cmd)
         self.assertIn(hub_server.TMP_DIR_TMPFS_SPEC, cmd)
+        self.assertIn("exec", hub_server.TMP_DIR_TMPFS_SPEC)
         self.assertIn("--user", cmd)
         self.assertIn(f"{self.state.local_uid}:{self.state.local_gid}", cmd)
         self.assertIn("codex", cmd)
@@ -4250,6 +4251,11 @@ Gemini CLI
 
 
 class HubArtifactCommandTests(unittest.TestCase):
+    @staticmethod
+    def _temporary_exec_dir() -> tempfile.TemporaryDirectory[str]:
+        # Some containerized test environments mount /tmp with noexec.
+        return tempfile.TemporaryDirectory(dir=ROOT)
+
     def _make_fake_curl(self, fake_bin: Path) -> Path:
         fake_bin.mkdir(parents=True, exist_ok=True)
         curl_script = fake_bin / "curl"
@@ -4327,7 +4333,7 @@ PY
         )
 
     def test_hub_artifact_publish_accepts_file_list(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
@@ -4343,6 +4349,7 @@ PY
             env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
             env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
             env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
 
             result = self._run_publish(str(file_one), str(file_two), env=env)
             self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
@@ -4358,7 +4365,7 @@ PY
             self.assertNotIn("name", payloads[1])
 
     def test_hub_artifact_publish_accepts_directory_and_rejects_subdirectories(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             fake_bin = tmp_path / "fake-bin"
             self._make_fake_curl(fake_bin)
@@ -4367,6 +4374,7 @@ PY
             env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
             env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
             env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
 
             flat_dir = tmp_path / "flat"
             flat_dir.mkdir(parents=True, exist_ok=True)
@@ -4395,7 +4403,7 @@ PY
             self.assertFalse(nested_log.exists())
 
     def test_hub_artifact_publish_rejects_name_for_multiple_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
@@ -4409,13 +4417,14 @@ PY
             env["HUB_ARTIFACT_CURL_LOG"] = str(tmp_path / "curl.log")
             env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
             env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
 
             result = self._run_publish(str(file_one), str(file_two), "--name", "Combined", env=env)
             self.assertEqual(result.returncode, 2)
             self.assertIn("--name can only be used when publishing exactly one file.", result.stderr)
 
     def test_hub_artifact_publish_accepts_archive_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             archive_file = tmp_path / "bundle.zip"
             archive_file.write_text("zip payload", encoding="utf-8")
@@ -4427,6 +4436,7 @@ PY
             env["HUB_ARTIFACT_CURL_LOG"] = str(tmp_path / "curl.log")
             env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
             env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
 
             result = self._run_publish(str(archive_file), env=env)
             self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
@@ -4436,7 +4446,7 @@ PY
             self.assertEqual(payloads[0]["path"], str(archive_file))
 
     def test_hub_artifact_publish_retries_only_failed_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
@@ -4466,8 +4476,38 @@ PY
             self.assertEqual(uploaded_paths.count(str(file_two)), 2)
             self.assertEqual(uploaded_paths[0], str(file_one))
 
+    def test_hub_artifact_publish_disable_retries_forces_single_attempt(self) -> None:
+        with self._temporary_exec_dir() as tmp:
+            tmp_path = Path(tmp)
+            file_one = tmp_path / "a.txt"
+            file_two = tmp_path / "b.txt"
+            file_one.write_text("a", encoding="utf-8")
+            file_two.write_text("b", encoding="utf-8")
+            fake_bin = tmp_path / "fake-bin"
+            self._make_fake_curl(fake_bin)
+            curl_log = tmp_path / "curl.log"
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
+            env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
+            env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
+            env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "9"
+            env["HUB_ARTIFACT_DISABLE_RETRIES"] = "1"
+            env["HUB_ARTIFACT_ALWAYS_FAIL_PATH"] = str(file_two)
+
+            result = self._run_publish(str(file_one), str(file_two), env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"Artifact publish failed after 1 attempt(s): {file_two}", result.stderr)
+            self.assertNotIn("Retrying artifact publish", result.stderr)
+
+            payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            uploaded_paths = [payload["path"] for payload in payloads]
+            self.assertEqual(uploaded_paths.count(str(file_one)), 1)
+            self.assertEqual(uploaded_paths.count(str(file_two)), 1)
+
     def test_hub_artifact_publish_reports_failed_paths_after_retries(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             file_one = tmp_path / "a.txt"
             file_two = tmp_path / "b.txt"
@@ -4499,10 +4539,11 @@ PY
             self.assertEqual(uploaded_paths.count(str(file_two)), 2)
 
     def test_hub_artifact_publish_handles_large_file_batch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             files = []
-            for index in range(200):
+            file_count = 60
+            for index in range(file_count):
                 path = tmp_path / f"file-{index:03d}.txt"
                 path.write_text(f"payload-{index}\n", encoding="utf-8")
                 files.append(path)
@@ -4516,21 +4557,21 @@ PY
             env["HUB_ARTIFACT_CURL_LOG"] = str(curl_log)
             env["AGENT_HUB_ARTIFACTS_URL"] = "http://example.invalid/publish"
             env["AGENT_HUB_ARTIFACT_TOKEN"] = "token-test"
-            env["HUB_ARTIFACT_PROGRESS_EVERY"] = "50"
+            env["HUB_ARTIFACT_PROGRESS_EVERY"] = "20"
             env["HUB_ARTIFACT_RETRY_DELAY_BASE_SEC"] = "0"
             env["HUB_ARTIFACT_MAX_ATTEMPTS"] = "3"
-            env["HUB_ARTIFACT_FAIL_ONCE_PATH"] = str(files[137])
+            env["HUB_ARTIFACT_FAIL_ONCE_PATH"] = str(files[37])
             env["HUB_ARTIFACT_FAIL_ONCE_MARKER"] = str(tmp_path / "failed-once.marker")
 
             result = self._run_publish(*[str(path) for path in files], env=env)
             self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
-            self.assertIn("Published 200 artifacts.", result.stdout)
-            self.assertIn("Artifact upload progress: 200/200 processed;", result.stderr)
+            self.assertIn(f"Published {file_count} artifacts.", result.stdout)
+            self.assertIn(f"Artifact upload progress: {file_count}/{file_count} processed;", result.stderr)
 
             payloads = [json.loads(line) for line in curl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
             uploaded_paths = [payload["path"] for payload in payloads]
-            self.assertEqual(uploaded_paths.count(str(files[137])), 2)
-            self.assertEqual(len(payloads), 201)
+            self.assertEqual(uploaded_paths.count(str(files[37])), 2)
+            self.assertEqual(len(payloads), file_count + 1)
             self.assertEqual(uploaded_paths.count(str(files[0])), 1)
             self.assertEqual(uploaded_paths.count(str(files[-1])), 1)
 
@@ -6037,6 +6078,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn(f"{image_cli.DOCKER_SOCKET_PATH}:{image_cli.DOCKER_SOCKET_PATH}", run_cmd)
             self.assertIn("--tmpfs", run_cmd)
             self.assertIn(image_cli.TMP_DIR_TMPFS_SPEC, run_cmd)
+            self.assertIn("exec", image_cli.TMP_DIR_TMPFS_SPEC)
 
     def test_cli_mounts_project_under_workspace_with_project_directory_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6618,6 +6660,11 @@ class DockerEntrypointTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    @staticmethod
+    def _temporary_exec_dir() -> tempfile.TemporaryDirectory[str]:
+        # Some containerized test environments mount /tmp with noexec.
+        return tempfile.TemporaryDirectory(dir=ROOT)
+
     def test_configure_git_identity_sets_global_git_config(self) -> None:
         module = self._load_entrypoint_module()
         with patch.object(module, "_run", return_value=SimpleNamespace(returncode=0)) as run_mock, patch.dict(
@@ -6740,7 +6787,7 @@ class DockerEntrypointTests(unittest.TestCase):
 
     def test_ensure_claude_native_command_path_creates_home_symlink(self) -> None:
         module = self._load_entrypoint_module()
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             home_path = tmp_path / "home"
             source_path = tmp_path / "bin" / "claude"
@@ -6760,7 +6807,7 @@ class DockerEntrypointTests(unittest.TestCase):
 
     def test_ensure_claude_native_command_path_fails_when_source_missing(self) -> None:
         module = self._load_entrypoint_module()
-        with tempfile.TemporaryDirectory() as tmp:
+        with self._temporary_exec_dir() as tmp:
             tmp_path = Path(tmp)
             home_path = tmp_path / "home"
             missing_source = tmp_path / "missing" / "claude"
