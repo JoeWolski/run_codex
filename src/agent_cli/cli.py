@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import urllib.parse
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Tuple
 
@@ -40,6 +41,8 @@ DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
+AGENT_HUB_SECRETS_DIR_NAME = "secrets"
+AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME = "github_credentials"
 
 
 def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
@@ -265,6 +268,48 @@ def _default_system_prompt_file() -> Path:
 
 def _default_credentials_file() -> Path:
     return _repo_root() / ".credentials"
+
+
+def _default_agent_hub_data_dir() -> Path:
+    return Path.home() / ".local" / "share" / "agent-hub"
+
+
+def _default_agent_hub_github_credentials_file() -> Path:
+    return _default_agent_hub_data_dir() / AGENT_HUB_SECRETS_DIR_NAME / AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+
+
+def _parse_git_credential_store_host(credential_line: str) -> str | None:
+    candidate = str(credential_line or "").strip()
+    if not candidate:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return None
+    host = str(parsed.hostname or "").strip().lower()
+    if not host:
+        return None
+    try:
+        return _normalize_git_credential_host(host)
+    except click.ClickException:
+        return None
+
+
+def _discover_agent_hub_github_credentials() -> tuple[Path | None, str]:
+    credentials_path = _default_agent_hub_github_credentials_file()
+    if not credentials_path.is_file():
+        return None, ""
+
+    try:
+        with credentials_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                host = _parse_git_credential_store_host(line)
+                if host:
+                    return credentials_path.resolve(), host
+    except (OSError, UnicodeError):
+        return None, ""
+
+    return None, ""
 
 
 def _default_group_name() -> str:
@@ -925,6 +970,13 @@ def main(
             raise click.ClickException(f"Git credential file does not exist: {git_credential_path}")
     if git_credential_host:
         git_credential_host_value = _normalize_git_credential_host(git_credential_host)
+
+    if git_credential_path is None and not git_credential_host_value:
+        discovered_path, discovered_host = _discover_agent_hub_github_credentials()
+        if discovered_path is not None and discovered_host:
+            git_credential_path = discovered_path
+            git_credential_host_value = discovered_host
+
     if bool(git_credential_path) != bool(git_credential_host_value):
         raise click.ClickException(
             "--git-credential-file and --git-credential-host must be provided together"

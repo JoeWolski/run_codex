@@ -5268,6 +5268,135 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("GIT_CONFIG_KEY_2=url.https://github.com/.insteadOf", env_values)
             self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@github.com/", env_values)
 
+    def test_cli_auto_discovers_agent_hub_github_credentials_when_flags_not_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            stored_credentials = (
+                tmp_path
+                / ".local"
+                / "share"
+                / "agent-hub"
+                / image_cli.AGENT_HUB_SECRETS_DIR_NAME
+                / image_cli.AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+            )
+            stored_credentials.parent.mkdir(parents=True, exist_ok=True)
+            stored_credentials.write_text(
+                "https://x-access-token:ghs_test_installation_token@github.com\n",
+                encoding="utf-8",
+            )
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.Path.home", return_value=tmp_path), patch(
+                "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+
+            self.assertIn(
+                f"{stored_credentials.resolve()}:{image_cli.GIT_CREDENTIALS_SOURCE_PATH}:ro",
+                run_cmd,
+            )
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=github.com", env_values)
+            self.assertIn("GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_1=git@github.com:", env_values)
+
+    def test_cli_auto_discovery_parses_github_enterprise_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            stored_credentials = (
+                tmp_path
+                / ".local"
+                / "share"
+                / "agent-hub"
+                / image_cli.AGENT_HUB_SECRETS_DIR_NAME
+                / image_cli.AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+            )
+            stored_credentials.parent.mkdir(parents=True, exist_ok=True)
+            stored_credentials.write_text(
+                "https://agentuser:github_pat_enterprise_test_token@github.enterprise.local\n",
+                encoding="utf-8",
+            )
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.Path.home", return_value=tmp_path), patch(
+                "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=github.enterprise.local", env_values)
+            self.assertIn("GIT_CONFIG_KEY_1=url.https://github.enterprise.local/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_1=git@github.enterprise.local:", env_values)
+            self.assertIn("GIT_CONFIG_KEY_2=url.https://github.enterprise.local/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@github.enterprise.local/", env_values)
+
     def test_cli_mounts_docker_socket_into_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
