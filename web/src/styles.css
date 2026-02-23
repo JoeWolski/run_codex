@@ -369,14 +369,17 @@ code {
 
 .projects-list .stack {
   gap: 0;
-  border-top: 1px solid var(--border);
 }
 
 .projects-list .stack > .project-card {
   margin: 0;
   padding: 18px 0 18px var(--space-2);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 0;
   border-left: 2px solid transparent;
+}
+
+.projects-list .stack > .project-card + .project-card {
+  border-top: 1px solid var(--border);
 }
 
 .projects-list .stack > .project-card:hover {
@@ -1495,7 +1498,7 @@ button:focus-visible {
 .chat-groups > .project-chat-group {
   margin: 0;
   padding: var(--space-2) 0 0;
-  border-top: 1px solid var(--border);
+  border-top: 0;
 }
 
 .chat-groups > .project-chat-group > .stack.compact {
