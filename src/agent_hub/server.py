@@ -46,6 +46,7 @@ AGENT_CAPABILITIES_CACHE_FILE_NAME = "agent_capabilities_cache.json"
 SECRETS_DIR_NAME = "secrets"
 OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
+CODEX_MODELS_CACHE_FILE_NAME = "models_cache.json"
 GITHUB_APP_INSTALLATION_FILE_NAME = "github_app_installation.json"
 GITHUB_PERSONAL_ACCESS_TOKEN_FILE_NAME = "github_personal_access_token.json"
 GITHUB_GIT_CREDENTIALS_FILE_NAME = "github_credentials"
@@ -120,7 +121,6 @@ AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE = {
     AGENT_TYPE_CODEX: (
         ("codex", "models", "--json"),
         ("codex", "models"),
-        ("codex", "--help"),
     ),
     AGENT_TYPE_CLAUDE: (
         ("claude", "models", "--json"),
@@ -951,9 +951,65 @@ def _token_is_model_candidate(agent_type: str, token: str) -> bool:
     return False
 
 
-def _extract_models_from_json_payload(payload: Any, agent_type: str) -> list[str]:
+def _option_count_excluding_default(values: list[str]) -> int:
+    return sum(1 for value in values if str(value or "").strip().lower() != "default")
+
+
+def _prefer_richer_option_set(current: list[str], candidate: list[str]) -> list[str]:
+    if _option_count_excluding_default(candidate) > _option_count_excluding_default(current):
+        return candidate
+    return current
+
+
+def _extract_codex_models_from_cache_payload(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, list):
+        return []
+
+    ranked: list[tuple[int, int, str]] = []
+    for index, raw_model in enumerate(raw_models):
+        if not isinstance(raw_model, dict):
+            continue
+        visibility = str(raw_model.get("visibility") or "").strip().lower()
+        if visibility in {"hidden", "hide", "internal"}:
+            continue
+        slug = str(
+            raw_model.get("slug")
+            or raw_model.get("id")
+            or raw_model.get("model")
+            or raw_model.get("name")
+            or ""
+        ).strip().lower()
+        if not _token_is_model_candidate(AGENT_TYPE_CODEX, slug):
+            continue
+        priority_raw = raw_model.get("priority")
+        try:
+            priority = int(priority_raw)
+        except (TypeError, ValueError):
+            priority = index + 10_000
+        ranked.append((priority, index, slug))
+
     discovered: list[str] = []
     seen: set[str] = set()
+    for _priority, _index, slug in sorted(ranked):
+        if slug in seen:
+            continue
+        seen.add(slug)
+        discovered.append(slug)
+    return discovered
+
+
+def _extract_models_from_json_payload(payload: Any, agent_type: str) -> list[str]:
+    if agent_type == AGENT_TYPE_CODEX:
+        parsed_cache_models = _extract_codex_models_from_cache_payload(payload)
+        if parsed_cache_models:
+            return parsed_cache_models
+
+    discovered: list[str] = []
+    seen: set[str] = set()
+    model_keys = {"model", "name", "id", "slug", "display_name"}
 
     def add(value: Any) -> None:
         token = str(value or "").strip().lower()
@@ -962,23 +1018,22 @@ def _extract_models_from_json_payload(payload: Any, agent_type: str) -> list[str
         seen.add(token)
         discovered.append(token)
 
-    def walk(node: Any) -> None:
+    def walk(node: Any, parent_key: str = "") -> None:
         if isinstance(node, dict):
-            for key in ("model", "name", "id"):
-                if key in node:
-                    add(node.get(key))
-            if "models" in node:
-                walk(node.get("models"))
-            for value in node.values():
+            for key, value in node.items():
+                normalized_key = str(key or "").strip().lower().replace("-", "_")
+                if normalized_key in model_keys:
+                    add(value)
                 if isinstance(value, (dict, list)):
-                    walk(value)
+                    walk(value, normalized_key)
             return
         if isinstance(node, list):
             for item in node:
-                walk(item)
+                walk(item, parent_key or "models")
             return
         if isinstance(node, str):
-            add(node)
+            if parent_key in model_keys or parent_key == "models":
+                add(node)
 
     walk(payload)
     return discovered
@@ -1034,6 +1089,7 @@ def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
             "supported_reasoning_modes",
             "supported_reasoning",
             "reasoning_mode_options",
+            "supported_reasoning_levels",
         }
 
         def walk(node: Any) -> None:
@@ -1043,7 +1099,26 @@ def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
                     if normalized_key in keys_with_mode_lists:
                         if isinstance(value, list):
                             for item in value:
-                                add_from_text(str(item or ""))
+                                if isinstance(item, dict):
+                                    add_from_text(
+                                        str(
+                                            item.get("effort")
+                                            or item.get("level")
+                                            or item.get("name")
+                                            or ""
+                                        )
+                                    )
+                                else:
+                                    add_from_text(str(item or ""))
+                        elif isinstance(value, dict):
+                            add_from_text(
+                                str(
+                                    value.get("effort")
+                                    or value.get("level")
+                                    or value.get("name")
+                                    or ""
+                                )
+                            )
                         elif isinstance(value, str):
                             add_from_text(value)
                     if isinstance(value, (dict, list)):
@@ -2841,12 +2916,39 @@ class HubState:
     def _discover_agent_capabilities_for_type(self, agent_type: str, previous: dict[str, Any]) -> dict[str, Any]:
         resolved_type = _normalize_chat_agent_type(agent_type)
         commands = AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE.get(resolved_type, ())
+        defaults_for_type = _agent_capability_defaults_for_type(resolved_type)
         discovered_models: list[str] = []
         discovered_reasoning_modes: list[str] = []
         last_error = ""
         now = _iso_now()
 
+        if resolved_type == AGENT_TYPE_CODEX:
+            cache_file = self.host_codex_dir / CODEX_MODELS_CACHE_FILE_NAME
+            try:
+                cache_output = cache_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                cache_output = ""
+            if cache_output.strip():
+                parsed_models = _extract_model_candidates_from_output(cache_output, resolved_type)
+                if parsed_models:
+                    discovered_models = _prefer_richer_option_set(
+                        discovered_models,
+                        _normalize_model_options_for_agent(resolved_type, parsed_models, defaults_for_type["models"]),
+                    )
+                parsed_reasoning = _extract_reasoning_candidates_from_output(cache_output)
+                if parsed_reasoning:
+                    discovered_reasoning_modes = _prefer_richer_option_set(
+                        discovered_reasoning_modes,
+                        _normalize_reasoning_mode_options_for_agent(
+                            resolved_type,
+                            parsed_reasoning,
+                            defaults_for_type["reasoning_modes"],
+                        ),
+                    )
+
         for raw_cmd in commands:
+            if discovered_models and (resolved_type != AGENT_TYPE_CODEX or discovered_reasoning_modes):
+                break
             cmd = [str(token) for token in raw_cmd]
             return_code, output_text = _run_agent_capability_probe(cmd, AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
             if return_code == 127:
@@ -2870,40 +2972,44 @@ class HubState:
 
             parsed_models = _extract_model_candidates_from_output(output_text, resolved_type)
             if parsed_models:
-                discovered_models = _normalize_model_options_for_agent(
-                    resolved_type,
-                    parsed_models,
-                    _agent_capability_defaults_for_type(resolved_type)["models"],
+                discovered_models = _prefer_richer_option_set(
+                    discovered_models,
+                    _normalize_model_options_for_agent(
+                        resolved_type,
+                        parsed_models,
+                        defaults_for_type["models"],
+                    ),
                 )
             if resolved_type == AGENT_TYPE_CODEX:
                 parsed_reasoning = _extract_reasoning_candidates_from_output(output_text)
                 if parsed_reasoning:
-                    discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
-                        resolved_type,
-                        parsed_reasoning,
-                        _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
+                    discovered_reasoning_modes = _prefer_richer_option_set(
+                        discovered_reasoning_modes,
+                        _normalize_reasoning_mode_options_for_agent(
+                            resolved_type,
+                            parsed_reasoning,
+                            defaults_for_type["reasoning_modes"],
+                        ),
                     )
-            if discovered_models and (resolved_type != AGENT_TYPE_CODEX or discovered_reasoning_modes):
-                break
 
         if not discovered_models:
             discovered_models = _normalize_model_options_for_agent(
                 resolved_type,
                 previous.get("models"),
-                _agent_capability_defaults_for_type(resolved_type)["models"],
+                defaults_for_type["models"],
             )
         if resolved_type == AGENT_TYPE_CODEX:
             if not discovered_reasoning_modes:
                 discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
                     resolved_type,
                     previous.get("reasoning_modes"),
-                    _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
+                    defaults_for_type["reasoning_modes"],
                 )
         else:
             discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
                 resolved_type,
                 previous.get("reasoning_modes"),
-                _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
+                defaults_for_type["reasoning_modes"],
             )
 
         return {

@@ -253,6 +253,90 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(gemini["models"], ["default", "gemini-2.5-pro"])
         self.assertTrue((self.state.data_dir / hub_server.AGENT_CAPABILITIES_CACHE_FILE_NAME).exists())
 
+    def test_agent_capabilities_discovery_reads_codex_models_cache(self) -> None:
+        self.state.host_codex_dir = self.tmp_path / "codex-home"
+        self.state.host_codex_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = self.state.host_codex_dir / hub_server.CODEX_MODELS_CACHE_FILE_NAME
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "gpt-5.3-codex",
+                            "priority": 0,
+                            "visibility": "list",
+                            "supported_reasoning_levels": [
+                                {"effort": "low"},
+                                {"effort": "medium"},
+                                {"effort": "high"},
+                                {"effort": "xhigh"},
+                            ],
+                        },
+                        {"slug": "gpt-5.3-codex-spark", "priority": 2, "visibility": "list"},
+                        {"slug": "gpt-5.2-codex", "priority": 3, "visibility": "list"},
+                        {"slug": "gpt-5.1-codex-max", "priority": 4, "visibility": "list"},
+                        {"slug": "gpt-5.1-codex", "priority": 5, "visibility": "hide"},
+                        {"slug": "gpt-5.2", "priority": 6, "visibility": "list"},
+                        {"slug": "gpt-5.1-codex-mini", "priority": 12, "visibility": "list"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+            if cmd[:2] == ["codex", "models"]:
+                return 2, 'error: unsupported command\nexample: -c model="o3"'
+            return 127, ""
+
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+            started_payload = self.state.start_agent_capabilities_discovery()
+            self.assertTrue(started_payload["discovery_in_progress"])
+            worker = self.state._agent_capabilities_discovery_thread
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+
+        payload = self.state.agent_capabilities_payload()
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        self.assertEqual(
+            codex["models"],
+            [
+                "default",
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+                "gpt-5.2-codex",
+                "gpt-5.1-codex-max",
+                "gpt-5.2",
+                "gpt-5.1-codex-mini",
+            ],
+        )
+        self.assertNotIn("o3", codex["models"])
+        self.assertEqual(codex["reasoning_modes"], ["default", "low", "medium", "high", "xhigh"])
+
+    def test_agent_capabilities_discovery_keeps_richer_codex_model_set(self) -> None:
+        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+            if cmd[:3] == ["codex", "models", "--json"]:
+                return 0, json.dumps({"models": [{"id": "gpt-5.3-codex"}, {"id": "gpt-5.2-codex"}]})
+            if cmd[:2] == ["codex", "models"]:
+                return 0, 'Use -c model="o3" to set the model.'
+            return 127, ""
+
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+            started_payload = self.state.start_agent_capabilities_discovery()
+            self.assertTrue(started_payload["discovery_in_progress"])
+            worker = self.state._agent_capabilities_discovery_thread
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+
+        payload = self.state.agent_capabilities_payload()
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        self.assertEqual(codex["models"], ["default", "gpt-5.3-codex", "gpt-5.2-codex"])
+        self.assertNotIn("o3", codex["models"])
+
     def test_reasoning_candidate_extractor_requires_supported_modes_context(self) -> None:
         self.assertEqual(
             hub_server._extract_reasoning_candidates_from_output("Default reasoning effort: low"),
