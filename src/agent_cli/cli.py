@@ -34,8 +34,6 @@ DEFAULT_CODEX_APPROVAL_POLICY = "never"
 DEFAULT_CODEX_SANDBOX_MODE = "danger-full-access"
 DEFAULT_CLAUDE_PERMISSION_MODE = "bypassPermissions"
 DEFAULT_GEMINI_APPROVAL_MODE = "yolo"
-MANAGED_GEMINI_CONTEXT_START = "<!-- agent_cli managed shared context: BEGIN -->"
-MANAGED_GEMINI_CONTEXT_END = "<!-- agent_cli managed shared context: END -->"
 GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
 SYSTEM_PROMPT_FILE_NAME = "SYSTEM_PROMPT.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
@@ -196,21 +194,11 @@ def _gemini_default_runtime_flags(*, explicit_args: Iterable[str]) -> list[str]:
     return flags
 
 
-def _remove_managed_gemini_context_sections(value: str) -> str:
-    if not value:
-        return ""
-
-    managed_block = re.compile(
-        rf"{re.escape(MANAGED_GEMINI_CONTEXT_START)}[\s\S]*?{re.escape(MANAGED_GEMINI_CONTEXT_END)}\n?",
-    )
-    without_managed = managed_block.sub("", value)
-    cleaned_lines = [line.rstrip() for line in without_managed.splitlines()]
-    normalized = "\n".join(cleaned_lines).strip()
-    return normalized
-
-
 def _sync_gemini_shared_context_file(*, host_gemini_dir: Path, shared_prompt_context: str) -> None:
     context_file = host_gemini_dir / GEMINI_CONTEXT_FILE_NAME
+    updated_context = str(shared_prompt_context or "").strip()
+    updated = f"{updated_context}\n" if updated_context else ""
+
     existing = ""
     if context_file.exists():
         try:
@@ -218,27 +206,6 @@ def _sync_gemini_shared_context_file(*, host_gemini_dir: Path, shared_prompt_con
         except (OSError, UnicodeError) as exc:
             click.echo(f"Warning: unable to read Gemini context file {context_file}: {exc}", err=True)
             return
-
-    preserved_user_content = _remove_managed_gemini_context_sections(existing)
-    managed_context = str(shared_prompt_context or "").strip()
-
-    sections: list[str] = []
-    if preserved_user_content:
-        sections.append(preserved_user_content)
-    if managed_context:
-        sections.append(
-            "\n".join(
-                [
-                    MANAGED_GEMINI_CONTEXT_START,
-                    managed_context,
-                    MANAGED_GEMINI_CONTEXT_END,
-                ]
-            )
-        )
-
-    updated = ""
-    if sections:
-        updated = "\n\n".join(sections).rstrip() + "\n"
 
     if existing == updated:
         return

@@ -86,7 +86,7 @@ No manual artifact wiring is required for `agent_hub` chats:
 - `agent_hub` injects `AGENT_HUB_ARTIFACTS_URL` and `AGENT_HUB_ARTIFACT_TOKEN` into each chat runtime.
 - `agent_hub` passes its config file into each runtime as `~/.codex/config.toml` for Codex.
 - `agent_cli` loads shared core instructions from `SYSTEM_PROMPT.md`.
-- `agent_cli` injects those instructions into Codex via CLI config override, appends them to Claude via `--append-system-prompt`, and syncs them into Gemini's managed `~/.gemini/GEMINI.md` section.
+- `agent_cli` injects those instructions into Codex via CLI config override, appends them to Claude via `--append-system-prompt`, and syncs the same shared context into Gemini's `~/.gemini/GEMINI.md`.
 - `agent_cli` appends project-doc bootstrap hints (from `config/agent.config.toml`) to the same shared prompt context for all providers.
 - The default `SYSTEM_PROMPT.md` already includes instructions telling the agent to publish requested deliverable files with `hub_artifact publish <path> [<path> ...]`.
 
@@ -101,7 +101,7 @@ These paths are resolved from each chat's checked-out target project workspace, 
    - Used to derive project-doc bootstrap hints appended to all providers' shared prompt context.
 2. `SYSTEM_PROMPT.md`
    - Source of shared core system instructions across Codex, Claude, and Gemini.
-   - Injected by `agent_cli` for each provider (Codex CLI config override, Claude append-system-prompt, Gemini managed context sync).
+   - Injected by `agent_cli` for each provider (Codex CLI config override, Claude append-system-prompt, Gemini context file sync).
 3. `AGENTS.md` (in the checked-out project repo)
    - Primary repo-specific instruction file loaded by the agent.
 
@@ -140,7 +140,7 @@ Behavior highlights:
 - Mounts Docker socket (`/var/run/docker.sock`) so runtime tools can access Docker when available.
 - Mounts config file to `~/.codex/config.toml` in the container (Codex runtime).
 - Loads shared core system instructions from `SYSTEM_PROMPT.md`.
-- Injects shared prompt/context into Codex (`--config developer_instructions=...`), Claude (`--append-system-prompt`), and Gemini (`~/.gemini/GEMINI.md` managed section).
+- Injects shared prompt/context into Codex (`--config developer_instructions=...`), Claude (`--append-system-prompt`), and Gemini (`~/.gemini/GEMINI.md`).
 - Derives project-doc bootstrap hints from config and appends them to that same shared prompt context.
 - Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, `~/.config/claude`, and `~/.gemini`.
 - Can build and reuse snapshot images for deterministic setup.
