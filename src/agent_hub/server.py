@@ -1961,27 +1961,9 @@ def _default_user() -> str:
         return pwd.getpwuid(os.getuid()).pw_name
 
 
-def _default_group_name() -> str:
-    import grp
-
-    return grp.getgrgid(os.getgid()).gr_name
-
-
 def _default_supplementary_gids() -> str:
     gids = sorted({gid for gid in os.getgroups() if gid != os.getgid()})
     return ",".join(str(gid) for gid in gids)
-
-
-def _default_supplementary_groups() -> str:
-    import grp
-
-    groups: list[str] = []
-    for gid in sorted({gid for gid in os.getgroups() if gid != os.getgid()}):
-        try:
-            groups.append(grp.getgrgid(gid).gr_name)
-        except KeyError:
-            groups.append(str(gid))
-    return ",".join(groups)
 
 
 def _normalize_csv(value: str | None) -> str:
@@ -1989,6 +1971,23 @@ def _normalize_csv(value: str | None) -> str:
         return ""
     values = [part.strip() for part in value.split(",") if part.strip()]
     return ",".join(values)
+
+
+def _parse_gid_csv(value: str) -> list[int]:
+    gids: list[int] = []
+    seen: set[int] = set()
+    for raw in value.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            continue
+        gid = int(token, 10)
+        if gid in seen:
+            continue
+        gids.append(gid)
+        seen.add(gid)
+    return gids
 
 
 def _read_codex_auth(path: Path) -> tuple[bool, str]:
@@ -2233,11 +2232,9 @@ class HubState:
         artifact_publish_base_url: str | None = None,
     ):
         self.local_user = _default_user()
-        self.local_group = _default_group_name()
         self.local_uid = os.getuid()
         self.local_gid = os.getgid()
         self.local_supp_gids = _normalize_csv(_default_supplementary_gids())
-        self.local_supp_groups = _normalize_csv(_default_supplementary_groups())
         self.local_umask = "0022"
         self.host_agent_home = (Path.home() / ".agent-home" / self.local_user).resolve()
         self.host_codex_dir = self.host_agent_home / ".codex"
@@ -4505,6 +4502,8 @@ class HubState:
             "--name",
             container_name,
             "--init",
+            "--user",
+            f"{self.local_uid}:{self.local_gid}",
             "--network",
             "host",
             "--workdir",
@@ -4513,20 +4512,6 @@ class HubState:
             f"{self.host_codex_dir}:{container_home}/.codex",
             "--volume",
             f"{self.config_file}:{container_home}/.codex/config.toml:ro",
-            "--env",
-            f"LOCAL_USER={self.local_user}",
-            "--env",
-            f"LOCAL_GROUP={self.local_group}",
-            "--env",
-            f"LOCAL_UID={self.local_uid}",
-            "--env",
-            f"LOCAL_GID={self.local_gid}",
-            "--env",
-            f"LOCAL_SUPP_GIDS={self.local_supp_gids}",
-            "--env",
-            f"LOCAL_SUPP_GROUPS={self.local_supp_groups}",
-            "--env",
-            f"LOCAL_HOME={container_home}",
             "--env",
             f"LOCAL_UMASK={self.local_umask}",
             "--env",
@@ -4539,6 +4524,10 @@ class HubState:
             "codex",
             "login",
         ]
+        for supp_gid in _parse_gid_csv(self.local_supp_gids):
+            if supp_gid == self.local_gid:
+                continue
+            cmd.extend(["--group-add", str(supp_gid)])
         if method == "device_auth":
             cmd.append("--device-auth")
         return cmd
