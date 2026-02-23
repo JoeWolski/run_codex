@@ -692,6 +692,7 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("Repository URL: https://github.com/acme/demo.git", auto_config_prompt)
         self.assertIn("Checked out branch: main", auto_config_prompt)
         self.assertIn("Do not include compiler-cache mounts", auto_config_prompt)
+        self.assertIn("Do not include Docker daemon socket mounts", auto_config_prompt)
         self.assertIn("Dockerfile file path: build context is repository root.", auto_config_prompt)
         self.assertIn("choose a Dockerfile file path when the Dockerfile needs repository-root context", auto_config_prompt)
 
@@ -2924,6 +2925,37 @@ class HubStateTests(unittest.TestCase):
             )
 
         self.assertEqual(recommendation["default_rw_mounts"], [])
+
+    def test_normalize_auto_config_recommendation_drops_docker_socket_mounts(self) -> None:
+        workspace = self.tmp_path / "workspace-drop-docker-socket"
+        workspace.mkdir(parents=True, exist_ok=True)
+        keep_host = self.tmp_path / "safe-cache"
+        keep_host.mkdir(parents=True, exist_ok=True)
+        fake_home = self.tmp_path / "fake-home-drop-docker-socket"
+        fake_home.mkdir(parents=True, exist_ok=True)
+
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": ["/tmp/nonexistent/docker.sock:/var/run/docker.sock"],
+                    "default_rw_mounts": [
+                        f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build",
+                        "/run/user/1000/docker.sock:/tmp/agent-docker.sock",
+                    ],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                workspace,
+            )
+
+        self.assertEqual(recommendation["default_ro_mounts"], [])
+        self.assertEqual(
+            recommendation["default_rw_mounts"],
+            [f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/.cache/build"],
+        )
 
     def test_normalize_auto_config_recommendation_ignores_cache_signals_in_test_paths(self) -> None:
         workspace = self.tmp_path / "workspace-test-cache-signals"

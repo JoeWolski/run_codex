@@ -249,6 +249,7 @@ AUTO_CONFIG_SETUP_PREFIX_RE = re.compile(
 AUTO_CONFIG_SETUP_UV_SYNC_RE = re.compile(r"^uv\s+sync\b", re.IGNORECASE)
 AUTO_CONFIG_SETUP_YARN_INSTALL_RE = re.compile(r"^(?:corepack\s+)?yarn\s+install\b", re.IGNORECASE)
 AUTO_CONFIG_SETUP_NPM_CI_RE = re.compile(r"^npm\s+ci\b", re.IGNORECASE)
+AUTO_CONFIG_DOCKER_SOCKET_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 PROMPTS_DIR_NAME = "prompts"
 PROMPT_CHAT_TITLE_OPENAI_SYSTEM_FILE = "chat_title_openai_system.md"
 PROMPT_CHAT_TITLE_OPENAI_USER_FILE = "chat_title_openai_user.md"
@@ -4268,6 +4269,26 @@ class HubState:
             )
         return relative.as_posix()
 
+    @staticmethod
+    def _normalize_auto_config_mount_path(path_value: str) -> str:
+        normalized = str(path_value or "").strip().strip("\"'").replace("\\", "/")
+        if normalized.startswith("/"):
+            normalized = normalized.split(":", 1)[0]
+        while "//" in normalized:
+            normalized = normalized.replace("//", "/")
+        if len(normalized) > 1:
+            normalized = normalized.rstrip("/")
+        return normalized.lower()
+
+    @classmethod
+    def _is_auto_config_docker_socket_path(cls, path_value: str) -> bool:
+        normalized = cls._normalize_auto_config_mount_path(path_value)
+        if not normalized:
+            return False
+        if normalized in AUTO_CONFIG_DOCKER_SOCKET_PATHS:
+            return True
+        return normalized.endswith("/docker.sock")
+
     def _normalize_auto_config_mounts(self, entries: list[str], direction: str) -> list[str]:
         normalized_entries: list[str] = []
         home_root = Path.home().resolve()
@@ -4275,6 +4296,10 @@ class HubState:
             if ":" not in raw_entry:
                 raise HTTPException(status_code=400, detail=f"Invalid auto-config {direction} mount '{raw_entry}'.")
             host_raw, container_raw = raw_entry.split(":", 1)
+            if self._is_auto_config_docker_socket_path(host_raw) or self._is_auto_config_docker_socket_path(
+                container_raw
+            ):
+                continue
             container = container_raw.strip()
             if not container.startswith("/"):
                 raise HTTPException(

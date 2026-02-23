@@ -20,7 +20,9 @@ Requirements:
 5) Inspect build tooling for deferred toolchain downloads and include the smallest build/bootstrap commands to fetch toolchains.
 6) Do not include compiler-cache mounts in default_ro_mounts/default_rw_mounts.
    - Agent Hub infers ccache/sccache mounts from build/toolchain signals in repository files.
-7) For `repo_path` recommendations, choose a Dockerfile file path when the Dockerfile needs repository-root context (for example it copies `src/` or `web/`); choose a directory path only when that directory is the intended build context.
+7) Do not include Docker daemon socket mounts (for example `/var/run/docker.sock`).
+   - `agent_cli` mounts Docker socket access separately when available.
+8) For `repo_path` recommendations, choose a Dockerfile file path when the Dockerfile needs repository-root context (for example it copies `src/` or `web/`); choose a directory path only when that directory is the intended build context.
 
 Return exactly one JSON object (no markdown fences, no prose) with this schema:
 {
