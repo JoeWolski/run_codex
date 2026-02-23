@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
+import { reconcilePendingChatStarts, reconcilePendingSessions } from "./chatPendingState";
 import {
   MdArchive,
   MdAudiotrack,
@@ -1324,35 +1325,8 @@ function HubApp() {
   const applyStatePayload = useCallback((payload) => {
     setHubState(payload);
     const serverChatMap = new Map((payload.chats || []).map((chat) => [chat.id, chat]));
-    setPendingSessions((prev) =>
-      prev.flatMap((session) => {
-        if (!session.server_chat_id) {
-          return [session];
-        }
-        const onServer = serverChatMap.has(session.server_chat_id);
-        const seenOnServer = Boolean(session.seen_on_server || onServer);
-        if (seenOnServer && !onServer) {
-          return [];
-        }
-        if (seenOnServer === Boolean(session.seen_on_server)) {
-          return [session];
-        }
-        return [{ ...session, seen_on_server: seenOnServer }];
-      })
-    );
-    setPendingChatStarts((prev) => {
-      const next = {};
-      for (const [chatId, pending] of Object.entries(prev)) {
-        if (!pending) {
-          continue;
-        }
-        const serverChat = serverChatMap.get(chatId);
-        if (serverChat && !serverChat.is_running) {
-          next[chatId] = true;
-        }
-      }
-      return next;
-    });
+    setPendingSessions((prev) => reconcilePendingSessions(prev, serverChatMap));
+    setPendingChatStarts((prev) => reconcilePendingChatStarts(prev, serverChatMap));
     setPendingProjectBuilds((prev) => {
       const next = {};
       for (const project of payload.projects || []) {
@@ -2070,6 +2044,7 @@ function HubApp() {
   }
 
   async function handleCreateChat(projectId, startSettings = null) {
+    const pendingCreatedAtMs = Date.now();
     const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const project = projectsById.get(projectId);
     const selectedStartSettings = normalizeChatStartSettings(
@@ -2085,6 +2060,8 @@ function HubApp() {
       project_name: project?.name || "Unknown",
       agent_type: agentType,
       server_chat_id: "",
+      created_at_ms: pendingCreatedAtMs,
+      server_chat_id_set_at_ms: 0,
       known_server_chat_ids: knownServerChatIds,
       seen_on_server: false
     }, ...prev]);
@@ -2106,7 +2083,13 @@ function HubApp() {
       }
       setPendingSessions((prev) =>
         prev.map((session) =>
-          session.ui_id === uiId ? { ...session, server_chat_id: chatId } : session
+          session.ui_id === uiId
+            ? {
+              ...session,
+              server_chat_id: chatId,
+              server_chat_id_set_at_ms: Date.now()
+            }
+            : session
         )
       );
       setPendingChatStarts((prev) => ({ ...prev, [chatId]: true }));
@@ -2811,9 +2794,11 @@ function HubApp() {
   function renderChatCard(chat) {
     const resolvedChatId = resolveServerChatId(chat);
     const chatHasServer = hasServerChat(chat);
+    const normalizedStatus = String(chat.status || "").toLowerCase();
     const isRunning = Boolean(chat.is_running);
-    const isStarting = Boolean(
-      pendingChatStarts[resolvedChatId] || chat.is_pending_start || String(chat.status || "") === "starting"
+    const isStarting = normalizedStatus === "starting" || Boolean(
+      normalizedStatus !== "stopped" &&
+      (pendingChatStarts[resolvedChatId] || chat.is_pending_start)
     );
     const titleStatus = String(chat.title_status || "idle").toLowerCase();
     const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
