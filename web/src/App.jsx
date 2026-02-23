@@ -772,6 +772,7 @@ function ChatTerminal({ chatId, running }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
   const [status, setStatus] = useState(running ? "connecting" : "offline");
+  const statusText = String(status || "unknown");
 
   useEffect(() => {
     if (!running) {
@@ -955,7 +956,12 @@ function ChatTerminal({ chatId, running }) {
   return (
     <div className="terminal-shell chat-terminal-shell" ref={shellRef}>
       <div className="terminal-toolbar">
-        <span className={`terminal-badge ${status}`}>{status}</span>
+        <span
+          className={`terminal-health-dot ${statusText}`}
+          role="img"
+          aria-label={`Terminal health: ${statusText}`}
+          title={statusText}
+        />
       </div>
       <div className="terminal-view" ref={hostRef} />
     </div>
