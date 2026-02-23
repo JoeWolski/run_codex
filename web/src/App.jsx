@@ -4303,7 +4303,7 @@ function HubApp() {
                         id="github-personal-access-owner-scopes"
                         value={githubPersonalAccessOwnerScopesDraft}
                         onChange={(event) => setGithubPersonalAccessOwnerScopesDraft(event.target.value)}
-                        placeholder="acme-org, joew"
+                        placeholder="acme-org, agentuser"
                         spellCheck={false}
                         autoComplete="off"
                         disabled={githubSaving || githubDisconnecting}

@@ -53,9 +53,9 @@ TEST_GITHUB_MANIFEST_CONVERSION_PAYLOAD = {
 TEST_GITHUB_PERSONAL_ACCESS_TOKEN = "github_pat_abcdefghijklmnopqrstuvwxyz1234567890"
 TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND = "github_pat_abcdefghijklmnopqrstuvwxyz0987654321"
 TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION = {
-    "account_login": "joew",
-    "account_name": "Joe W",
-    "account_email": "joew@example.com",
+    "account_login": "agentuser",
+    "account_name": "Agent User",
+    "account_email": "agentuser@example.com",
     "account_id": "10101",
     "token_scopes": "repo,read:org",
 }
@@ -407,11 +407,11 @@ class HubStateTests(unittest.TestCase):
         saved = self._connect_github_pat()
         self.assertTrue(saved["connected"])
         self.assertEqual(saved["connection_mode"], "personal_access_token")
-        self.assertEqual(saved["personal_access_token_user_login"], "joew")
-        self.assertEqual(saved["personal_access_token_user_name"], "Joe W")
-        self.assertEqual(saved["personal_access_token_user_email"], "joew@example.com")
-        self.assertEqual(saved["personal_access_token_git_user_name"], "Joe W")
-        self.assertEqual(saved["personal_access_token_git_user_email"], "joew@example.com")
+        self.assertEqual(saved["personal_access_token_user_login"], "agentuser")
+        self.assertEqual(saved["personal_access_token_user_name"], "Agent User")
+        self.assertEqual(saved["personal_access_token_user_email"], "agentuser@example.com")
+        self.assertEqual(saved["personal_access_token_git_user_name"], "Agent User")
+        self.assertEqual(saved["personal_access_token_git_user_email"], "agentuser@example.com")
         self.assertEqual(saved["personal_access_token_host"], "github.com")
         self.assertEqual(saved["personal_access_token_count"], 1)
         self.assertEqual(len(saved["personal_access_tokens"]), 1)
@@ -423,7 +423,7 @@ class HubStateTests(unittest.TestCase):
         credentials_line = self.state.github_git_credentials_file.read_text(encoding="utf-8").strip()
         self.assertEqual(
             credentials_line,
-            f"https://joew:{TEST_GITHUB_PERSONAL_ACCESS_TOKEN}@github.com",
+            f"https://agentuser:{TEST_GITHUB_PERSONAL_ACCESS_TOKEN}@github.com",
         )
 
         token_mode = self.state.github_personal_access_token_file.stat().st_mode & 0o777
@@ -769,13 +769,13 @@ class HubStateTests(unittest.TestCase):
         )
         auto_config_prompt = hub_server._render_prompt_template(
             hub_server.PROMPT_AUTO_CONFIGURE_PROJECT_FILE,
-            repo_url="https://github.com/acme/demo.git",
+            repo_url="https://github.com/org/repo.git",
             branch="main",
         )
         self.assertIn(f"Maximum length: {hub_server.CHAT_TITLE_MAX_CHARS} characters.", system_prompt)
         self.assertIn("1. test prompt", user_prompt)
         self.assertIn("1. test prompt", codex_prompt)
-        self.assertIn("Repository URL: https://github.com/acme/demo.git", auto_config_prompt)
+        self.assertIn("Repository URL: https://github.com/org/repo.git", auto_config_prompt)
         self.assertIn("Checked out branch: main", auto_config_prompt)
         self.assertIn("Do not include compiler-cache mounts", auto_config_prompt)
         self.assertIn("Do not include Docker daemon socket mounts", auto_config_prompt)
@@ -1332,8 +1332,9 @@ class HubStateTests(unittest.TestCase):
         self.assertIn(str(self.state.github_git_credentials_file), cmd)
         self.assertIn("--git-credential-host", cmd)
         self.assertIn("github.com", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_NAME=Joe W", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=joew@example.com", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
+
     def test_start_chat_uses_configured_artifact_publish_base_url(self) -> None:
         self.state.artifact_publish_base_url = "http://172.17.0.4:8765/hub"
         project = self.state.add_project(
@@ -1981,8 +1982,8 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("agent_cli", cmd)
         self.assertIn("--git-credential-file", cmd)
         self.assertIn(str(self.state.github_git_credentials_file), cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_NAME=Joe W", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=joew@example.com", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
 
     def test_resize_terminal_sets_pty_size(self) -> None:
         runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1), master_fd=42)
@@ -5516,8 +5517,8 @@ class DockerEntrypointTests(unittest.TestCase):
         with patch.object(module, "_run", return_value=SimpleNamespace(returncode=0)) as run_mock, patch.dict(
             os.environ,
             {
-                "AGENT_HUB_GIT_USER_NAME": "Joe W",
-                "AGENT_HUB_GIT_USER_EMAIL": "joew@example.com",
+                "AGENT_HUB_GIT_USER_NAME": "Agent User",
+                "AGENT_HUB_GIT_USER_EMAIL": "agentuser@example.com",
             },
             clear=False,
         ):
@@ -5526,8 +5527,8 @@ class DockerEntrypointTests(unittest.TestCase):
         self.assertEqual(run_mock.call_count, 2)
         run_mock.assert_has_calls(
             [
-                call(["git", "config", "--global", "user.name", "Joe W"]),
-                call(["git", "config", "--global", "user.email", "joew@example.com"]),
+                call(["git", "config", "--global", "user.name", "Agent User"]),
+                call(["git", "config", "--global", "user.email", "agentuser@example.com"]),
             ]
         )
 
@@ -5536,7 +5537,7 @@ class DockerEntrypointTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "AGENT_HUB_GIT_USER_NAME": "Joe W",
+                "AGENT_HUB_GIT_USER_NAME": "Agent User",
                 "AGENT_HUB_GIT_USER_EMAIL": "",
             },
             clear=False,
@@ -5551,7 +5552,7 @@ class DockerEntrypointTests(unittest.TestCase):
             source_path = tmp_path / "source-credentials"
             target_path = tmp_path / "target-credentials"
             source_path.write_text(
-                "https://joew:ghp_test_token_123@github.com\n",
+                "https://agentuser:ghp_test_token_123@github.com\n",
                 encoding="utf-8",
             )
 
@@ -5585,7 +5586,7 @@ class DockerEntrypointTests(unittest.TestCase):
             source_path = tmp_path / "source-credentials"
             target_path = tmp_path / "target-credentials"
             source_path.write_text(
-                "https://joew:ghp_different_value@github.com\n",
+                "https://agentuser:ghp_different_value@github.com\n",
                 encoding="utf-8",
             )
 
@@ -5611,7 +5612,7 @@ class DockerEntrypointTests(unittest.TestCase):
             source_path = tmp_path / "source-credentials"
             target_path = tmp_path / "target-credentials"
             source_path.write_text(
-                "https://joew:ghp_enterprise_token@github.enterprise.local\n",
+                "https://agentuser:ghp_enterprise_token@github.enterprise.local\n",
                 encoding="utf-8",
             )
 
