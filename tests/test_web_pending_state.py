@@ -14,6 +14,7 @@ class WebPendingStateTests(unittest.TestCase):
             """
             import assert from "node:assert/strict";
             import {
+              isChatStarting,
               PENDING_SESSION_STALE_MS,
               reconcilePendingSessions,
               reconcilePendingChatStarts
@@ -86,6 +87,27 @@ class WebPendingStateTests(unittest.TestCase):
               keepOnlyStarting,
               { "chat-starting": true },
               "pending start should only remain for chats still in starting state"
+            );
+
+            assert.equal(
+              isChatStarting("stopped", false, true),
+              true,
+              "stopped chats with an in-flight pending start should render as starting"
+            );
+            assert.equal(
+              isChatStarting("stopped", false, false),
+              false,
+              "stopped chats with no pending start should not render as starting"
+            );
+            assert.equal(
+              isChatStarting("starting", false, false),
+              true,
+              "starting status should render as starting"
+            );
+            assert.equal(
+              isChatStarting("running", true, true),
+              false,
+              "running chat should not render as starting"
             );
             """
         )

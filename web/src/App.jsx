@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
-import { reconcilePendingChatStarts, reconcilePendingSessions } from "./chatPendingState";
+import { isChatStarting, reconcilePendingChatStarts, reconcilePendingSessions } from "./chatPendingState";
 import {
   MdArchive,
   MdAudiotrack,
@@ -2978,10 +2978,8 @@ function HubApp() {
     const chatHasServer = hasServerChat(chat);
     const normalizedStatus = String(chat.status || "").toLowerCase();
     const isRunning = Boolean(chat.is_running);
-    const isStarting = normalizedStatus === "starting" || Boolean(
-      normalizedStatus !== "stopped" &&
-      (pendingChatStarts[resolvedChatId] || chat.is_pending_start)
-    );
+    const pendingStart = Boolean(pendingChatStarts[resolvedChatId] || chat.is_pending_start);
+    const isStarting = isChatStarting(normalizedStatus, isRunning, pendingStart);
     const titleStatus = String(chat.title_status || "idle").toLowerCase();
     const volumeCount = (chat.ro_mounts || []).length + (chat.rw_mounts || []).length;
     const envCount = (chat.env_vars || []).length;
