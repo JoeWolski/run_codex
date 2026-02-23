@@ -3610,7 +3610,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, msg=result.output)
             self.assertEqual(commands, [])
 
-    def test_snapshot_preflight_fails_on_unwritable_rw_mount_before_docker_run(self) -> None:
+    def test_snapshot_preflight_allows_unwritable_descendants_when_mount_root_is_writable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -3658,9 +3658,59 @@ class CliEnvVarTests(unittest.TestCase):
             finally:
                 locked_dir.chmod(0o700)
 
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            self.assertTrue(commands)
+            docker_run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(docker_run_cmd)
+
+    def test_snapshot_preflight_fails_when_rw_mount_root_owner_uid_mismatches_runtime_uid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            rw_mount = tmp_path / "rw-mount"
+            rw_mount.mkdir(parents=True, exist_ok=True)
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=False
+            ), patch(
+                "agent_cli.cli._docker_rm_force", return_value=None
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--local-uid",
+                        "999999",
+                        "--rw-mount",
+                        f"{rw_mount}:/workspace/.ark_toolchain_cache",
+                        "--snapshot-image-tag",
+                        "snapshot:test",
+                        "--setup-script",
+                        "echo hello",
+                        "--prepare-snapshot-only",
+                    ],
+                )
+
             self.assertNotEqual(result.exit_code, 0)
             self.assertIn("RW mount preflight failed", result.output)
-            self.assertIn(str(locked_dir), result.output)
+            self.assertIn("owner uid does not match runtime uid", result.output)
             self.assertEqual(commands, [])
 
     def test_no_alt_screen_flag_passes_through_to_codex_command(self) -> None:

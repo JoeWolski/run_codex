@@ -38,7 +38,6 @@ GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
-RW_MOUNT_SCAN_LIMIT = 2048
 
 
 def _cli_arg_matches_option(arg: str, *, long_option: str, short_option: str | None = None) -> bool:
@@ -429,9 +428,15 @@ def _path_metadata(path: Path) -> str:
     return f"uid={info.st_uid} gid={info.st_gid} mode=0o{permissions:03o}"
 
 
-def _rw_mount_preflight_error(*, host_path: Path, container_path: str, reason: str, failing_path: Path | None = None) -> None:
-    runtime_uid = os.getuid()
-    runtime_gid = os.getgid()
+def _rw_mount_preflight_error(
+    *,
+    host_path: Path,
+    container_path: str,
+    reason: str,
+    runtime_uid: int,
+    runtime_gid: int,
+    failing_path: Path | None = None,
+) -> None:
     offending = failing_path or host_path
     raise click.ClickException(
         "RW mount preflight failed for "
@@ -442,12 +447,38 @@ def _rw_mount_preflight_error(*, host_path: Path, container_path: str, reason: s
     )
 
 
-def _probe_rw_directory(root: Path, container_path: str) -> None:
+def _ensure_rw_mount_owner(root: Path, container_path: str, runtime_uid: int, runtime_gid: int) -> None:
+    try:
+        owner_uid = int(root.stat().st_uid)
+    except OSError as exc:
+        _rw_mount_preflight_error(
+            host_path=root,
+            container_path=container_path,
+            reason=f"cannot stat mount root owner ({exc})",
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
+            failing_path=root,
+        )
+    if owner_uid != runtime_uid:
+        _rw_mount_preflight_error(
+            host_path=root,
+            container_path=container_path,
+            reason=f"mount root owner uid does not match runtime uid ({owner_uid} != {runtime_uid})",
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
+            failing_path=root,
+        )
+
+
+def _probe_rw_directory(root: Path, container_path: str, runtime_uid: int, runtime_gid: int) -> None:
+    _ensure_rw_mount_owner(root, container_path, runtime_uid, runtime_gid)
     if not os.access(root, os.W_OK | os.X_OK):
         _rw_mount_preflight_error(
             host_path=root,
             container_path=container_path,
             reason="mount root directory is not writable/executable by current runtime user",
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
             failing_path=root,
         )
     try:
@@ -459,61 +490,34 @@ def _probe_rw_directory(root: Path, container_path: str) -> None:
             host_path=root,
             container_path=container_path,
             reason=f"cannot create and remove probe file in mount root ({exc})",
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
             failing_path=root,
         )
 
 
-def _scan_rw_directory_tree(root: Path) -> tuple[Path | None, str]:
-    scanned = 0
-    for current_root, dirs, files in os.walk(root):
-        current = Path(current_root)
-        scanned += 1
-        if not os.access(current, os.W_OK | os.X_OK):
-            return current, "directory is not writable/executable"
-        if scanned >= RW_MOUNT_SCAN_LIMIT:
-            return None, ""
-        for dirname in dirs:
-            candidate = current / dirname
-            scanned += 1
-            if not os.access(candidate, os.W_OK | os.X_OK):
-                return candidate, "directory is not writable/executable"
-            if scanned >= RW_MOUNT_SCAN_LIMIT:
-                return None, ""
-        for filename in files:
-            candidate = current / filename
-            scanned += 1
-            if not os.access(candidate, os.W_OK):
-                return candidate, "file is not writable"
-            if scanned >= RW_MOUNT_SCAN_LIMIT:
-                return None, ""
-    return None, ""
-
-
-def _validate_rw_mount(host_path: Path, container_path: str) -> None:
+def _validate_rw_mount(host_path: Path, container_path: str, runtime_uid: int, runtime_gid: int) -> None:
     if not host_path.exists():
         _rw_mount_preflight_error(
             host_path=host_path,
             container_path=container_path,
             reason="host path does not exist",
+            runtime_uid=runtime_uid,
+            runtime_gid=runtime_gid,
             failing_path=host_path,
         )
     if host_path.is_dir():
-        _probe_rw_directory(host_path, container_path)
-        unwritable_path, reason = _scan_rw_directory_tree(host_path)
-        if unwritable_path is not None:
-            _rw_mount_preflight_error(
-                host_path=host_path,
-                container_path=container_path,
-                reason=reason,
-                failing_path=unwritable_path,
-            )
+        _probe_rw_directory(host_path, container_path, runtime_uid, runtime_gid)
         return
     if host_path.is_file():
+        _ensure_rw_mount_owner(host_path, container_path, runtime_uid, runtime_gid)
         if not os.access(host_path, os.W_OK):
             _rw_mount_preflight_error(
                 host_path=host_path,
                 container_path=container_path,
                 reason="file mount path is not writable",
+                runtime_uid=runtime_uid,
+                runtime_gid=runtime_gid,
                 failing_path=host_path,
             )
         try:
@@ -524,6 +528,8 @@ def _validate_rw_mount(host_path: Path, container_path: str) -> None:
                 host_path=host_path,
                 container_path=container_path,
                 reason=f"cannot open file in append mode ({exc})",
+                runtime_uid=runtime_uid,
+                runtime_gid=runtime_gid,
                 failing_path=host_path,
             )
         return
@@ -531,6 +537,8 @@ def _validate_rw_mount(host_path: Path, container_path: str) -> None:
         host_path=host_path,
         container_path=container_path,
         reason="mount path must be a regular file or directory",
+        runtime_uid=runtime_uid,
+        runtime_gid=runtime_gid,
         failing_path=host_path,
     )
 
@@ -1092,7 +1100,7 @@ def main(
                 err=True,
             )
             for host_path, container_path in rw_mount_specs:
-                _validate_rw_mount(host_path, container_path)
+                _validate_rw_mount(host_path, container_path, runtime_uid=uid, runtime_gid=gid)
             _build_runtime_image(
                 base_image=ensure_selected_base_image(),
                 target_image=DEFAULT_SETUP_RUNTIME_IMAGE,
