@@ -52,12 +52,21 @@
 - UI/UX images in the PR body must always reflect the most up-to-date UI state for the current PR head commit. Remove or replace stale images immediately.
 - Use this exact workflow so image generation is deterministic and does not require rediscovery:
 - 1. Install browser tooling: `cd tools/demo && npm ci`
-- 2. Start real app server in one terminal: `UV_PROJECT_ENVIRONMENT=.venv-local uv run agent_hub --host 127.0.0.1 --port 8876 --data-dir /tmp/agent-hub-ui-evidence --frontend-build`
-- 3. Capture screenshots in another terminal using Playwright against `http://127.0.0.1:8876` (real backend) and save to `.agent-artifacts/` (or `/tmp/agent-hub-ui-evidence/`). Prefer `type: "jpeg"`/`.jpg` outputs unless PNG is explicitly needed.
-- 4. For PR body image rendering on `github.com`, use publicly reachable image URLs. Do not use local-only links such as `/api/chats/.../artifacts/...` in PR markdown.
-- 5. Programmatic upload path for public URLs (CLI-safe): `curl -fsS -F "file=@<image-path>" https://tmpfiles.org/api/v1/upload` and use the returned URL converted from `https://tmpfiles.org/<id>/<name>` to `https://tmpfiles.org/dl/<id>/<name>`.
-- 6. Update the PR body with a `## UI/UX Demo` section containing Markdown image links (`![alt](https://...)`) using `gh api repos/<owner>/<repo>/pulls/<pr-number> -X PATCH --raw-field body=\"$(cat <body-file>)\"`.
-- 7. If using GitHub web manually, drag/drop uploads in the PR editor are allowed, but the resulting images still must appear in the PR body.
+- 2. Mirror auth/config context from the active server before launching the evidence server (so screenshots reflect real connected state and do not show unrelated credential/setup errors):
+- `export SOURCE_DATA_DIR=\"${SOURCE_DATA_DIR:-$HOME/.local/share/agent-hub}\"`
+- `export UI_DATA_DIR=/tmp/agent-hub-ui-evidence`
+- `mkdir -p \"$UI_DATA_DIR\" \"$UI_DATA_DIR/secrets\" \"$HOME/.agent-home/uid-$(id -u)/.codex\"`
+- `if [ -d \"$SOURCE_DATA_DIR/secrets\" ]; then rm -rf \"$UI_DATA_DIR/secrets\" && mkdir -p \"$UI_DATA_DIR/secrets\" && cp -a \"$SOURCE_DATA_DIR/secrets/.\" \"$UI_DATA_DIR/secrets/\"; fi`
+- `if [ -f \"$HOME/.codex/auth.json\" ]; then cp \"$HOME/.codex/auth.json\" \"$HOME/.agent-home/uid-$(id -u)/.codex/auth.json\"; fi`
+- `cp config/agent.config.toml \"$UI_DATA_DIR/agent.config.toml\"`
+- `cp SYSTEM_PROMPT.md \"$UI_DATA_DIR/SYSTEM_PROMPT.md\"`
+- 3. Start real app server in one terminal with mirrored config context: `UV_PROJECT_ENVIRONMENT=.venv-local uv run agent_hub --host 127.0.0.1 --port 8876 --data-dir \"$UI_DATA_DIR\" --config-file \"$UI_DATA_DIR/agent.config.toml\" --system-prompt-file \"$UI_DATA_DIR/SYSTEM_PROMPT.md\" --frontend-build`
+- 4. Sanity-check auth before screenshots (example: `curl -fsS http://127.0.0.1:8876/api/settings/auth`) and do not proceed while unrelated credential/setup errors are visible in UI state targeted for evidence.
+- 5. Capture screenshots in another terminal using Playwright against `http://127.0.0.1:8876` (real backend) and save to `.agent-artifacts/` (or `/tmp/agent-hub-ui-evidence/`). Prefer `type: "jpeg"`/`.jpg` outputs unless PNG is explicitly needed.
+- 6. For PR body image rendering on `github.com`, use publicly reachable image URLs. Do not use local-only links such as `/api/chats/.../artifacts/...` in PR markdown.
+- 7. Programmatic upload path for public URLs (CLI-safe): `curl -fsS -F "file=@<image-path>" https://tmpfiles.org/api/v1/upload` and use the returned URL converted from `https://tmpfiles.org/<id>/<name>` to `https://tmpfiles.org/dl/<id>/<name>`.
+- 8. Update the PR body with a `## UI/UX Demo` section containing Markdown image links (`![alt](https://...)`) using `gh api repos/<owner>/<repo>/pulls/<pr-number> -X PATCH --raw-field body=\"$(cat <body-file>)\"`.
+- 9. If using GitHub web manually, drag/drop uploads in the PR editor are allowed, but the resulting images still must appear in the PR body.
 - In the PR Validation section, list the exact commands used for server start, screenshot capture, public URL upload, and PR body update, with pass/fail status.
 
 ## Git safety

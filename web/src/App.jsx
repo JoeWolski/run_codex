@@ -1892,6 +1892,25 @@ function HubApp() {
             ...prev,
             [projectId]: replace ? text : `${prev[projectId] || ""}${text}`
           }));
+          return;
+        }
+        if (eventType === "auto_config_log") {
+          const requestId = String(payload.request_id || "");
+          if (!requestId) {
+            return;
+          }
+          const text = String(payload.text || "");
+          const replace = Boolean(payload.replace);
+          setPendingAutoConfigProjects((prev) =>
+            prev.map((project) =>
+              project.id === requestId
+                ? {
+                  ...project,
+                  auto_config_log: replace ? text : `${project.auto_config_log || ""}${text}`
+                }
+                : project
+            )
+          );
         }
       });
       ws.addEventListener("close", () => {
@@ -2021,6 +2040,7 @@ function HubApp() {
       default_branch: project.default_branch,
       build_status: project.auto_config_status === "failed" ? "failed" : "building",
       build_error: project.auto_config_error || "",
+      auto_config_log: project.auto_config_log || "",
       is_auto_config_pending: true
     }));
     return [...pendingRows, ...(hubState.projects || [])];
@@ -2029,10 +2049,6 @@ function HubApp() {
 
   function updateCreateForm(patch) {
     setCreateForm((prev) => ({ ...prev, ...patch }));
-  }
-
-  function dismissPendingAutoConfigProject(projectId) {
-    setPendingAutoConfigProjects((prev) => prev.filter((project) => project.id !== projectId));
   }
 
   function updateProjectDraft(projectId, patch) {
@@ -2091,23 +2107,12 @@ function HubApp() {
     });
   }, []);
 
-  async function handleAutoConfigureCreateForm() {
-    const repoUrl = String(createForm.repoUrl || "").trim();
+  async function handleAutoConfigureCreateForm(formSnapshot) {
+    const repoUrl = String(formSnapshot.repoUrl || "").trim();
     if (!repoUrl) {
       setError("Repo URL is required before auto configure.");
       return;
     }
-
-    const formSnapshot = {
-      repoUrl,
-      name: "",
-      defaultBranch: "",
-      baseImageMode: "tag",
-      baseImageValue: "",
-      setupScript: "",
-      defaultVolumes: [],
-      defaultEnvVars: []
-    };
     let fallbackMounts;
     let fallbackEnvVars;
     try {
@@ -2128,7 +2133,8 @@ function HubApp() {
         repo_url: repoUrl,
         default_branch: pendingProjectBranch,
         auto_config_status: "running",
-        auto_config_error: ""
+        auto_config_error: "",
+        auto_config_log: "Preparing repository checkout for temporary analysis chat...\r\n"
       },
       ...prev
     ]);
@@ -2139,7 +2145,8 @@ function HubApp() {
         method: "POST",
         body: JSON.stringify({
           repo_url: repoUrl,
-          default_branch: formSnapshot.defaultBranch
+          default_branch: formSnapshot.defaultBranch,
+          request_id: pendingProjectId
         })
       });
       const recommendation = payload?.recommendation || {};
@@ -2176,7 +2183,12 @@ function HubApp() {
       setPendingAutoConfigProjects((prev) =>
         prev.map((project) =>
           project.id === pendingProjectId
-            ? { ...project, auto_config_status: "failed", auto_config_error: message }
+            ? {
+              ...project,
+              auto_config_status: "failed",
+              auto_config_error: message,
+              auto_config_log: `${project.auto_config_log || ""}${message.endsWith("\n") ? message : `${message}\n`}`
+            }
             : project
         )
       );
@@ -2187,20 +2199,36 @@ function HubApp() {
 
   async function handleCreateProject(event) {
     event.preventDefault();
+    const repoUrl = String(createForm.repoUrl || "").trim();
+    if (!repoUrl) {
+      setError("Repo URL is required.");
+      return;
+    }
+    const formSnapshot = {
+      repoUrl,
+      name: String(createForm.name || ""),
+      defaultBranch: String(createForm.defaultBranch || ""),
+      baseImageMode: normalizeBaseMode(createForm.baseImageMode),
+      baseImageValue: String(createForm.baseImageValue || ""),
+      setupScript: String(createForm.setupScript || ""),
+      defaultVolumes: (createForm.defaultVolumes || []).map((entry) => ({ ...entry })),
+      defaultEnvVars: (createForm.defaultEnvVars || []).map((entry) => ({ ...entry }))
+    };
+    setCreateForm((prev) => ({ ...prev, repoUrl: "" }));
     if (isAutoCreateProjectConfigMode(createProjectConfigMode)) {
-      await handleAutoConfigureCreateForm();
+      await handleAutoConfigureCreateForm(formSnapshot);
       return;
     }
     try {
-      const mounts = buildMountPayload(createForm.defaultVolumes);
-      const envVars = buildEnvPayload(createForm.defaultEnvVars);
+      const mounts = buildMountPayload(formSnapshot.defaultVolumes);
+      const envVars = buildEnvPayload(formSnapshot.defaultEnvVars);
       const payload = {
-        repo_url: createForm.repoUrl.trim(),
-        name: createForm.name,
-        default_branch: createForm.defaultBranch,
-        base_image_mode: createForm.baseImageMode,
-        base_image_value: createForm.baseImageValue,
-        setup_script: createForm.setupScript,
+        repo_url: formSnapshot.repoUrl,
+        name: formSnapshot.name,
+        default_branch: formSnapshot.defaultBranch,
+        base_image_mode: formSnapshot.baseImageMode,
+        base_image_value: formSnapshot.baseImageValue,
+        setup_script: formSnapshot.setupScript,
         default_ro_mounts: mounts.roMounts,
         default_rw_mounts: mounts.rwMounts,
         default_env_vars: envVars
@@ -3634,39 +3662,20 @@ function HubApp() {
                           {statusLabel}
                         </span>
                       </div>
-                      {!isFailed ? (
-                        <>
-                          <div className="meta auto-config-meta">
-                            Running temporary analysis chat, then creating a configured project entry.
-                          </div>
-                          <ProjectBuildTerminal
-                            title="Temporary analysis chat"
-                            shellClassName="auto-config-terminal-shell"
-                            viewClassName="auto-config-terminal-view"
-                            text={[
-                              "Starting temporary repository analysis chat...",
-                              `Repo: ${project.repo_url}`,
-                              `Branch: ${project.default_branch || "auto-detect"}`,
-                              "",
-                              "Waiting for recommendation output."
-                            ].join("\r\n")}
-                          />
-                        </>
-                      ) : null}
+                      <div className="meta auto-config-meta">
+                        Running temporary analysis chat, then creating a configured project entry.
+                      </div>
+                      <ProjectBuildTerminal
+                        title="Temporary analysis chat"
+                        shellClassName="auto-config-terminal-shell"
+                        viewClassName="auto-config-terminal-view"
+                        text={project.auto_config_log || "Waiting for temporary analysis chat output...\r\n"}
+                      />
                       {isFailed ? (
                         <div className="meta build-error">
                           {project.build_error || "Auto configure failed before project creation completed."}
                         </div>
                       ) : null}
-                      <div className="actions">
-                        <button
-                          type="button"
-                          className="btn-secondary btn-small"
-                          onClick={() => dismissPendingAutoConfigProject(project.id)}
-                        >
-                          Dismiss
-                        </button>
-                      </div>
                     </article>
                   );
                 }
