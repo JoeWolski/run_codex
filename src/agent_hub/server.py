@@ -42,6 +42,7 @@ from fastapi.staticfiles import StaticFiles
 
 
 STATE_FILE_NAME = "state.json"
+AGENT_CAPABILITIES_CACHE_FILE_NAME = "agent_capabilities_cache.json"
 SECRETS_DIR_NAME = "secrets"
 OPENAI_CREDENTIALS_FILE_NAME = "openai.env"
 OPENAI_CODEX_AUTH_FILE_NAME = "auth.json"
@@ -88,6 +89,42 @@ AGENT_COMMAND_BY_TYPE = {
     AGENT_TYPE_CODEX: "codex",
     AGENT_TYPE_CLAUDE: "claude",
     AGENT_TYPE_GEMINI: "gemini",
+}
+AGENT_LABEL_BY_TYPE = {
+    AGENT_TYPE_CODEX: "Codex",
+    AGENT_TYPE_CLAUDE: "Claude",
+    AGENT_TYPE_GEMINI: "Gemini CLI",
+}
+AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE = {
+    AGENT_TYPE_CODEX: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
+    AGENT_TYPE_CLAUDE: ["default", "sonnet", "opus", "haiku"],
+    AGENT_TYPE_GEMINI: ["default"],
+}
+AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE = {
+    AGENT_TYPE_CODEX: ["default", "minimal", "low", "medium", "high", "xhigh"],
+    AGENT_TYPE_CLAUDE: ["default"],
+    AGENT_TYPE_GEMINI: ["default"],
+}
+AGENT_CAPABILITY_MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,120}")
+AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS = float(
+    os.environ.get("AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS", "8.0")
+)
+AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE = {
+    AGENT_TYPE_CODEX: (
+        ("codex", "models", "--json"),
+        ("codex", "models"),
+        ("codex", "--help"),
+    ),
+    AGENT_TYPE_CLAUDE: (
+        ("claude", "models", "--json"),
+        ("claude", "models"),
+        ("claude", "--help"),
+    ),
+    AGENT_TYPE_GEMINI: (
+        ("gemini", "models", "--json"),
+        ("gemini", "models"),
+        ("gemini", "--help"),
+    ),
 }
 DEFAULT_PTY_COLS = 160
 DEFAULT_PTY_ROWS = 48
@@ -253,6 +290,7 @@ EVENT_TYPE_STATE_CHANGED = "state_changed"
 EVENT_TYPE_AUTH_CHANGED = "auth_changed"
 EVENT_TYPE_OPENAI_ACCOUNT_SESSION = "openai_account_session"
 EVENT_TYPE_PROJECT_BUILD_LOG = "project_build_log"
+EVENT_TYPE_AGENT_CAPABILITIES_CHANGED = "agent_capabilities_changed"
 
 LOGGER = logging.getLogger("agent_hub")
 LOGGER.addHandler(logging.NullHandler())
@@ -721,6 +759,221 @@ def _iso_from_timestamp(timestamp: float) -> str:
 
 def _new_state() -> dict[str, Any]:
     return {"version": 1, "projects": {}, "chats": {}}
+
+
+def _ordered_supported_agent_types() -> tuple[str, ...]:
+    return (
+        AGENT_TYPE_CODEX,
+        AGENT_TYPE_CLAUDE,
+        AGENT_TYPE_GEMINI,
+    )
+
+
+def _normalize_mode_options(raw_values: Any, fallback: list[str]) -> list[str]:
+    values = list(fallback)
+    if isinstance(raw_values, list):
+        values = [str(item or "").strip() for item in raw_values]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        value = str(raw_value or "").strip().lower()
+        if not value or value in seen:
+            continue
+        normalized.append(value)
+        seen.add(value)
+    if "default" in seen:
+        normalized = ["default", *[item for item in normalized if item != "default"]]
+    else:
+        normalized = ["default", *normalized]
+    if not normalized:
+        return ["default"]
+    return normalized
+
+
+def _agent_capability_defaults_for_type(agent_type: str) -> dict[str, Any]:
+    resolved_type = _normalize_chat_agent_type(agent_type)
+    default_models = AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE.get(
+        resolved_type,
+        AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE],
+    )
+    default_reasoning = AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE.get(
+        resolved_type,
+        AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE],
+    )
+    return {
+        "agent_type": resolved_type,
+        "label": AGENT_LABEL_BY_TYPE.get(resolved_type, resolved_type.title()),
+        "models": _normalize_mode_options(default_models, ["default"]),
+        "reasoning_modes": _normalize_mode_options(default_reasoning, ["default"]),
+        "updated_at": "",
+        "last_error": "",
+    }
+
+
+def _default_agent_capabilities_cache_payload() -> dict[str, Any]:
+    agents = [_agent_capability_defaults_for_type(agent_type) for agent_type in _ordered_supported_agent_types()]
+    return {
+        "version": 1,
+        "updated_at": "",
+        "discovery_in_progress": False,
+        "discovery_started_at": "",
+        "discovery_finished_at": "",
+        "agents": agents,
+    }
+
+
+def _normalize_agent_capabilities_payload(raw_payload: Any) -> dict[str, Any]:
+    defaults = _default_agent_capabilities_cache_payload()
+    if not isinstance(raw_payload, dict):
+        return defaults
+
+    raw_agents = raw_payload.get("agents")
+    raw_agent_map: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_agents, list):
+        for raw_agent in raw_agents:
+            if not isinstance(raw_agent, dict):
+                continue
+            resolved_type = _normalize_chat_agent_type(raw_agent.get("agent_type"))
+            raw_agent_map[resolved_type] = raw_agent
+
+    normalized_agents: list[dict[str, Any]] = []
+    for agent_type in _ordered_supported_agent_types():
+        defaults_for_type = _agent_capability_defaults_for_type(agent_type)
+        raw_agent = raw_agent_map.get(agent_type, {})
+        label = str(raw_agent.get("label") or defaults_for_type["label"]).strip() or defaults_for_type["label"]
+        models = _normalize_mode_options(raw_agent.get("models"), defaults_for_type["models"])
+        reasoning_modes = _normalize_mode_options(raw_agent.get("reasoning_modes"), defaults_for_type["reasoning_modes"])
+        updated_at = str(raw_agent.get("updated_at") or raw_payload.get("updated_at") or "").strip()
+        last_error = str(raw_agent.get("last_error") or "").strip()
+        normalized_agents.append(
+            {
+                "agent_type": agent_type,
+                "label": label,
+                "models": models,
+                "reasoning_modes": reasoning_modes,
+                "updated_at": updated_at,
+                "last_error": last_error,
+            }
+        )
+
+    return {
+        "version": 1,
+        "updated_at": str(raw_payload.get("updated_at") or "").strip(),
+        "discovery_in_progress": bool(raw_payload.get("discovery_in_progress")),
+        "discovery_started_at": str(raw_payload.get("discovery_started_at") or "").strip(),
+        "discovery_finished_at": str(raw_payload.get("discovery_finished_at") or "").strip(),
+        "agents": normalized_agents,
+    }
+
+
+def _token_is_model_candidate(agent_type: str, token: str) -> bool:
+    value = str(token or "").strip().lower()
+    if not value or value == "default":
+        return False
+    if agent_type == AGENT_TYPE_CODEX:
+        return value.startswith("gpt-") or "codex" in value
+    if agent_type == AGENT_TYPE_CLAUDE:
+        return (
+            value.startswith("claude")
+            or value.startswith("sonnet")
+            or value.startswith("opus")
+            or value.startswith("haiku")
+            or value in {"sonnet", "opus", "haiku"}
+        )
+    if agent_type == AGENT_TYPE_GEMINI:
+        return value.startswith("gemini")
+    return False
+
+
+def _extract_models_from_json_payload(payload: Any, agent_type: str) -> list[str]:
+    discovered: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        token = str(value or "").strip().lower()
+        if not _token_is_model_candidate(agent_type, token) or token in seen:
+            return
+        seen.add(token)
+        discovered.append(token)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in ("model", "name", "id"):
+                if key in node:
+                    add(node.get(key))
+            if "models" in node:
+                walk(node.get("models"))
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value)
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if isinstance(node, str):
+            add(node)
+
+    walk(payload)
+    return discovered
+
+
+def _extract_model_candidates_from_output(output_text: str, agent_type: str) -> list[str]:
+    text = str(output_text or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, (dict, list)):
+            parsed = _extract_models_from_json_payload(payload, agent_type)
+            if parsed:
+                return parsed
+    except json.JSONDecodeError:
+        pass
+
+    seen: set[str] = set()
+    discovered: list[str] = []
+    for match in AGENT_CAPABILITY_MODEL_TOKEN_RE.findall(text):
+        token = match.strip().lower()
+        if not _token_is_model_candidate(agent_type, token):
+            continue
+        if token in seen:
+            continue
+        discovered.append(token)
+        seen.add(token)
+    return discovered
+
+
+def _extract_reasoning_candidates_from_output(output_text: str) -> list[str]:
+    text = str(output_text or "").lower()
+    if not text:
+        return []
+    discovered: list[str] = []
+    known = ["minimal", "low", "medium", "high", "xhigh"]
+    for level in known:
+        if re.search(rf"\b{re.escape(level)}\b", text):
+            discovered.append(level)
+    if not discovered:
+        return []
+    return _normalize_mode_options(discovered, ["default"])
+
+
+def _run_agent_capability_probe(cmd: list[str], timeout_seconds: float) -> tuple[int, str]:
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+        output_text = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+        return result.returncode, output_text
+    except subprocess.TimeoutExpired as exc:
+        output_text = f"{exc.stdout or ''}\n{exc.stderr or ''}".strip()
+        return 124, output_text
+    except FileNotFoundError:
+        return 127, ""
 
 
 def _read_openai_api_key(path: Path) -> str | None:
@@ -2298,6 +2551,7 @@ class HubState:
             self.hub_port,
         )
         self.state_file = self.data_dir / STATE_FILE_NAME
+        self.agent_capabilities_cache_file = self.data_dir / AGENT_CAPABILITIES_CACHE_FILE_NAME
         self.project_dir = self.data_dir / "projects"
         self.chat_dir = self.data_dir / "chats"
         self.log_dir = self.data_dir / "logs"
@@ -2328,6 +2582,9 @@ class HubState:
         self._github_token_cache: dict[str, Any] = {}
         self._github_setup_lock = Lock()
         self._github_setup_session: GithubAppSetupSession | None = None
+        self._agent_capabilities_lock = Lock()
+        self._agent_capabilities = _default_agent_capabilities_cache_payload()
+        self._agent_capabilities_discovery_thread: Thread | None = None
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
@@ -2339,6 +2596,7 @@ class HubState:
         except OSError:
             pass
         self._reload_github_app_settings()
+        self._load_agent_capabilities_cache()
 
     def load(self) -> dict[str, Any]:
         with self._lock:
@@ -2439,6 +2697,167 @@ class HubState:
         payload["reason"] = str(reason or "")
         self._emit_event(EVENT_TYPE_OPENAI_ACCOUNT_SESSION, payload)
 
+    def _emit_agent_capabilities_changed(self, reason: str = "") -> None:
+        self._emit_event(EVENT_TYPE_AGENT_CAPABILITIES_CHANGED, {"reason": str(reason or "")})
+
+    def _agent_capabilities_payload_locked(self) -> dict[str, Any]:
+        return _normalize_agent_capabilities_payload(self._agent_capabilities)
+
+    def _write_agent_capabilities_cache_locked(self) -> None:
+        normalized = self._agent_capabilities_payload_locked()
+        with self.agent_capabilities_cache_file.open("w", encoding="utf-8") as fp:
+            json.dump(normalized, fp, indent=2)
+        self._agent_capabilities = normalized
+
+    def _load_agent_capabilities_cache(self) -> None:
+        with self._agent_capabilities_lock:
+            if not self.agent_capabilities_cache_file.exists():
+                self._agent_capabilities = _default_agent_capabilities_cache_payload()
+                return
+            try:
+                raw_payload = json.loads(self.agent_capabilities_cache_file.read_text(encoding="utf-8", errors="ignore"))
+            except (OSError, json.JSONDecodeError):
+                self._agent_capabilities = _default_agent_capabilities_cache_payload()
+                return
+            normalized = _normalize_agent_capabilities_payload(raw_payload)
+            normalized["discovery_in_progress"] = False
+            self._agent_capabilities = normalized
+            try:
+                self._write_agent_capabilities_cache_locked()
+            except OSError:
+                return
+
+    def agent_capabilities_payload(self) -> dict[str, Any]:
+        with self._agent_capabilities_lock:
+            return self._agent_capabilities_payload_locked()
+
+    def _discover_agent_capabilities_for_type(self, agent_type: str, previous: dict[str, Any]) -> dict[str, Any]:
+        resolved_type = _normalize_chat_agent_type(agent_type)
+        commands = AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE.get(resolved_type, ())
+        discovered_models: list[str] = []
+        discovered_reasoning_modes: list[str] = []
+        last_error = ""
+        now = _iso_now()
+
+        for raw_cmd in commands:
+            cmd = [str(token) for token in raw_cmd]
+            return_code, output_text = _run_agent_capability_probe(cmd, AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
+            if return_code == 127:
+                last_error = f"command not found: {cmd[0]}"
+                LOGGER.info("Agent capability discovery skipped for agent=%s: %s", resolved_type, last_error)
+                continue
+            if return_code == 124:
+                last_error = f"timeout running command: {' '.join(cmd)}"
+                LOGGER.warning("Agent capability discovery timeout agent=%s cmd=%s", resolved_type, cmd)
+            elif return_code != 0:
+                last_error = f"command failed ({return_code}): {' '.join(cmd)}"
+                LOGGER.info(
+                    "Agent capability discovery command failed agent=%s cmd=%s return_code=%d output=%s",
+                    resolved_type,
+                    cmd,
+                    return_code,
+                    _short_summary(output_text, max_words=60, max_chars=600),
+                )
+
+            parsed_models = _extract_model_candidates_from_output(output_text, resolved_type)
+            if parsed_models:
+                discovered_models = _normalize_mode_options(parsed_models, ["default"])
+            if resolved_type == AGENT_TYPE_CODEX:
+                parsed_reasoning = _extract_reasoning_candidates_from_output(output_text)
+                if parsed_reasoning:
+                    discovered_reasoning_modes = parsed_reasoning
+            if discovered_models and (resolved_type != AGENT_TYPE_CODEX or discovered_reasoning_modes):
+                break
+
+        if not discovered_models:
+            discovered_models = _normalize_mode_options(
+                previous.get("models"),
+                _agent_capability_defaults_for_type(resolved_type)["models"],
+            )
+        if resolved_type == AGENT_TYPE_CODEX:
+            if not discovered_reasoning_modes:
+                discovered_reasoning_modes = _normalize_mode_options(
+                    previous.get("reasoning_modes"),
+                    _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
+                )
+        else:
+            discovered_reasoning_modes = _normalize_mode_options(
+                previous.get("reasoning_modes"),
+                _agent_capability_defaults_for_type(resolved_type)["reasoning_modes"],
+            )
+
+        return {
+            "agent_type": resolved_type,
+            "label": str(previous.get("label") or AGENT_LABEL_BY_TYPE.get(resolved_type, resolved_type.title())),
+            "models": discovered_models,
+            "reasoning_modes": discovered_reasoning_modes,
+            "updated_at": now,
+            "last_error": last_error,
+        }
+
+    def _agent_capability_discovery_worker(self) -> None:
+        try:
+            with self._agent_capabilities_lock:
+                baseline_payload = self._agent_capabilities_payload_locked()
+            baseline_agents = {
+                str(agent.get("agent_type") or ""): dict(agent)
+                for agent in baseline_payload.get("agents") or []
+                if isinstance(agent, dict)
+            }
+
+            discovered_agents: list[dict[str, Any]] = []
+            for agent_type in _ordered_supported_agent_types():
+                previous = baseline_agents.get(agent_type) or _agent_capability_defaults_for_type(agent_type)
+                discovered_agents.append(self._discover_agent_capabilities_for_type(agent_type, previous))
+
+            finished_at = _iso_now()
+            with self._agent_capabilities_lock:
+                merged_payload = self._agent_capabilities_payload_locked()
+                merged_payload["updated_at"] = finished_at
+                merged_payload["discovery_in_progress"] = False
+                merged_payload["discovery_finished_at"] = finished_at
+                merged_payload["agents"] = discovered_agents
+                self._agent_capabilities = _normalize_agent_capabilities_payload(merged_payload)
+                self._write_agent_capabilities_cache_locked()
+        finally:
+            with self._agent_capabilities_lock:
+                active = self._agent_capabilities_discovery_thread
+                if active is not None and active.ident == current_thread().ident:
+                    self._agent_capabilities_discovery_thread = None
+                self._agent_capabilities["discovery_in_progress"] = False
+                if not str(self._agent_capabilities.get("discovery_finished_at") or "").strip():
+                    self._agent_capabilities["discovery_finished_at"] = _iso_now()
+                self._agent_capabilities = _normalize_agent_capabilities_payload(self._agent_capabilities)
+                try:
+                    self._write_agent_capabilities_cache_locked()
+                except OSError:
+                    pass
+            self._emit_agent_capabilities_changed(reason="discovery_finished")
+
+    def start_agent_capabilities_discovery(self) -> dict[str, Any]:
+        payload_to_return: dict[str, Any]
+        should_emit = False
+        with self._agent_capabilities_lock:
+            existing = self._agent_capabilities_discovery_thread
+            if existing is not None and existing.is_alive():
+                return self._agent_capabilities_payload_locked()
+
+            started_at = _iso_now()
+            self._agent_capabilities["discovery_in_progress"] = True
+            self._agent_capabilities["discovery_started_at"] = started_at
+            self._agent_capabilities["discovery_finished_at"] = ""
+            self._agent_capabilities = _normalize_agent_capabilities_payload(self._agent_capabilities)
+            self._write_agent_capabilities_cache_locked()
+
+            worker = Thread(target=self._agent_capability_discovery_worker, daemon=True)
+            self._agent_capabilities_discovery_thread = worker
+            worker.start()
+            payload_to_return = self._agent_capabilities_payload_locked()
+            should_emit = True
+        if should_emit:
+            self._emit_agent_capabilities_changed(reason="discovery_started")
+        return payload_to_return
+
     def attach_events(self) -> queue.Queue[dict[str, Any] | None]:
         listener: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=HUB_EVENT_QUEUE_MAX)
         with self._events_lock:
@@ -2467,6 +2886,7 @@ class HubState:
             "state": state_payload,
             "auth": self.auth_settings_payload(),
             "openai_account_session": self.openai_account_session_payload(),
+            "agent_capabilities": self.agent_capabilities_payload(),
             "project_build_logs": build_logs,
         }
 
@@ -7178,6 +7598,14 @@ def main(
     @app.get("/api/state")
     def api_state() -> dict[str, Any]:
         return state.state_payload()
+
+    @app.get("/api/agent-capabilities")
+    def api_agent_capabilities() -> dict[str, Any]:
+        return state.agent_capabilities_payload()
+
+    @app.post("/api/agent-capabilities/discover")
+    def api_discover_agent_capabilities() -> dict[str, Any]:
+        return state.start_agent_capabilities_discovery()
 
     @app.get("/api/settings/auth")
     def api_auth_settings() -> dict[str, Any]:

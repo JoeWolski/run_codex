@@ -5,6 +5,7 @@ ARG AGENT_PROVIDER=codex
 USER root
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/root
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

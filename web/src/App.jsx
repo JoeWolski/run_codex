@@ -19,65 +19,180 @@ import {
 
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const DEFAULT_AGENT_TYPE = "codex";
-const AGENT_TYPE_OPTIONS = [
-  { value: "codex", label: "Codex" },
-  { value: "claude", label: "Claude" },
-  { value: "gemini", label: "Gemini CLI" }
-];
-const START_MODEL_OPTIONS_BY_AGENT = {
-  codex: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
-  claude: ["default", "sonnet", "opus", "haiku"],
-  gemini: ["default"]
+const DEFAULT_AGENT_CAPABILITIES = {
+  version: 1,
+  updatedAt: "",
+  discoveryInProgress: false,
+  discoveryStartedAt: "",
+  discoveryFinishedAt: "",
+  agents: [
+    {
+      agentType: "codex",
+      label: "Codex",
+      models: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark"],
+      reasoningModes: ["default", "minimal", "low", "medium", "high", "xhigh"],
+      updatedAt: "",
+      lastError: ""
+    },
+    {
+      agentType: "claude",
+      label: "Claude",
+      models: ["default", "sonnet", "opus", "haiku"],
+      reasoningModes: ["default"],
+      updatedAt: "",
+      lastError: ""
+    },
+    {
+      agentType: "gemini",
+      label: "Gemini CLI",
+      models: ["default"],
+      reasoningModes: ["default"],
+      updatedAt: "",
+      lastError: ""
+    }
+  ]
 };
-const REASONING_MODE_OPTIONS = ["default", "minimal", "low", "medium", "high", "xhigh"];
 
-function normalizeAgentType(value) {
+function normalizeModeOptions(rawOptions, fallbackOptions) {
+  const source = Array.isArray(rawOptions) ? rawOptions : fallbackOptions;
+  const values = source.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
+  const unique = [];
+  const seen = new Set();
+  for (const value of values) {
+    if (seen.has(value)) {
+      continue;
+    }
+    unique.push(value);
+    seen.add(value);
+  }
+  if (!seen.has("default")) {
+    return ["default", ...unique];
+  }
+  return ["default", ...unique.filter((value) => value !== "default")];
+}
+
+function normalizeAgentType(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
   const normalized = String(value || "").trim().toLowerCase();
-  if (AGENT_TYPE_OPTIONS.some((option) => option.value === normalized)) {
+  const knownTypes = (capabilities?.agents || [])
+    .map((agent) => String(agent?.agentType || "").trim().toLowerCase())
+    .filter(Boolean);
+  if (knownTypes.includes(normalized)) {
     return normalized;
   }
   return DEFAULT_AGENT_TYPE;
 }
 
-function agentTypeLabel(agentType) {
-  const normalized = normalizeAgentType(agentType);
-  const matched = AGENT_TYPE_OPTIONS.find((option) => option.value === normalized);
+function normalizeAgentCapabilities(rawPayload) {
+  const fallbackByType = new Map(
+    (DEFAULT_AGENT_CAPABILITIES.agents || []).map((agent) => [agent.agentType, agent])
+  );
+  const rawAgents = Array.isArray(rawPayload?.agents) ? rawPayload.agents : [];
+  const rawByType = new Map();
+  for (const rawAgent of rawAgents) {
+    const agentType = String(rawAgent?.agentType || rawAgent?.agent_type || "").trim().toLowerCase();
+    if (!agentType) {
+      continue;
+    }
+    rawByType.set(agentType, rawAgent);
+  }
+  const agents = [];
+  for (const fallbackAgent of DEFAULT_AGENT_CAPABILITIES.agents) {
+    const rawAgent = rawByType.get(fallbackAgent.agentType) || {};
+    agents.push({
+      agentType: fallbackAgent.agentType,
+      label: String(rawAgent?.label || fallbackAgent.label),
+      models: normalizeModeOptions(rawAgent?.models, fallbackAgent.models),
+      reasoningModes: normalizeModeOptions(rawAgent?.reasoningModes || rawAgent?.reasoning_modes, fallbackAgent.reasoningModes),
+      updatedAt: String(rawAgent?.updatedAt || rawAgent?.updated_at || ""),
+      lastError: String(rawAgent?.lastError || rawAgent?.last_error || "")
+    });
+  }
+  for (const [agentType, rawAgent] of rawByType.entries()) {
+    if (fallbackByType.has(agentType)) {
+      continue;
+    }
+    agents.push({
+      agentType,
+      label: String(rawAgent?.label || agentType),
+      models: normalizeModeOptions(rawAgent?.models, ["default"]),
+      reasoningModes: normalizeModeOptions(rawAgent?.reasoningModes || rawAgent?.reasoning_modes, ["default"]),
+      updatedAt: String(rawAgent?.updatedAt || rawAgent?.updated_at || ""),
+      lastError: String(rawAgent?.lastError || rawAgent?.last_error || "")
+    });
+  }
+  return {
+    version: Number(rawPayload?.version || DEFAULT_AGENT_CAPABILITIES.version),
+    updatedAt: String(rawPayload?.updatedAt || rawPayload?.updated_at || ""),
+    discoveryInProgress: Boolean(rawPayload?.discoveryInProgress ?? rawPayload?.discovery_in_progress),
+    discoveryStartedAt: String(rawPayload?.discoveryStartedAt || rawPayload?.discovery_started_at || ""),
+    discoveryFinishedAt: String(rawPayload?.discoveryFinishedAt || rawPayload?.discovery_finished_at || ""),
+    agents
+  };
+}
+
+function agentCapabilityForType(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const resolvedType = normalizeAgentType(agentType, capabilities);
+  const matched = (capabilities?.agents || []).find(
+    (agent) => String(agent?.agentType || "").trim().toLowerCase() === resolvedType
+  );
+  if (matched) {
+    return matched;
+  }
+  return DEFAULT_AGENT_CAPABILITIES.agents.find((agent) => agent.agentType === DEFAULT_AGENT_TYPE);
+}
+
+function agentTypeOptions(capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  return (capabilities?.agents || []).map((agent) => ({
+    value: String(agent?.agentType || "").trim().toLowerCase(),
+    label: String(agent?.label || agent?.agentType || "")
+  })).filter((agent) => Boolean(agent.value && agent.label));
+}
+
+function agentTypeLabel(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const normalized = normalizeAgentType(agentType, capabilities);
+  const matched = agentTypeOptions(capabilities).find((option) => option.value === normalized);
   return matched ? matched.label : "Codex";
 }
 
-function startModelOptionsForAgent(agentType) {
-  const resolvedAgentType = normalizeAgentType(agentType);
-  return START_MODEL_OPTIONS_BY_AGENT[resolvedAgentType] || START_MODEL_OPTIONS_BY_AGENT[DEFAULT_AGENT_TYPE];
+function startModelOptionsForAgent(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const details = agentCapabilityForType(agentType, capabilities);
+  return normalizeModeOptions(details?.models, ["default"]);
 }
 
-function normalizeStartModel(agentType, value) {
-  const options = startModelOptionsForAgent(agentType);
-  const normalized = String(value || "").trim();
+function reasoningModeOptionsForAgent(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const details = agentCapabilityForType(agentType, capabilities);
+  return normalizeModeOptions(details?.reasoningModes, ["default"]);
+}
+
+function normalizeStartModel(agentType, value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const options = startModelOptionsForAgent(agentType, capabilities);
+  const normalized = String(value || "").trim().toLowerCase();
   if (options.includes(normalized)) {
     return normalized;
   }
   return "default";
 }
 
-function normalizeReasoningMode(value) {
+function normalizeReasoningMode(agentType, value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const options = reasoningModeOptionsForAgent(agentType, capabilities);
   const normalized = String(value || "").trim().toLowerCase();
-  if (REASONING_MODE_OPTIONS.includes(normalized)) {
+  if (options.includes(normalized)) {
     return normalized;
   }
   return "default";
 }
 
-function normalizeChatStartSettings(value) {
-  const resolvedAgentType = normalizeAgentType(value?.agentType || value?.agent_type);
+function normalizeChatStartSettings(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const resolvedAgentType = normalizeAgentType(value?.agentType || value?.agent_type, capabilities);
   return {
     agentType: resolvedAgentType,
-    model: normalizeStartModel(resolvedAgentType, value?.model),
-    reasoning: resolvedAgentType === "codex" ? normalizeReasoningMode(value?.reasoning) : "default"
+    model: normalizeStartModel(resolvedAgentType, value?.model, capabilities),
+    reasoning: normalizeReasoningMode(resolvedAgentType, value?.reasoning, capabilities)
   };
 }
 
-function buildChatStartConfig(value) {
-  const normalized = normalizeChatStartSettings(value);
+function buildChatStartConfig(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
+  const normalized = normalizeChatStartSettings(value, capabilities);
   const args = [];
   if (normalized.model !== "default") {
     args.push("--model", normalized.model);
@@ -1259,6 +1374,9 @@ function OpenAiAuthCallbackPage() {
 
 function HubApp() {
   const [hubState, setHubState] = useState({ projects: [], chats: [] });
+  const [agentCapabilities, setAgentCapabilities] = useState(() =>
+    normalizeAgentCapabilities(DEFAULT_AGENT_CAPABILITIES)
+  );
   const [error, setError] = useState("");
   const [createForm, setCreateForm] = useState(() => emptyCreateForm());
   const [pendingAutoConfigProjects, setPendingAutoConfigProjects] = useState([]);
@@ -1320,6 +1438,8 @@ function HubApp() {
   const stateRefreshQueuedRef = useRef(false);
   const authRefreshInFlightRef = useRef(false);
   const authRefreshQueuedRef = useRef(false);
+  const capabilitiesRefreshInFlightRef = useRef(false);
+  const capabilitiesRefreshQueuedRef = useRef(false);
   const githubSetupResolutionRef = useRef("");
 
   const applyStatePayload = useCallback((payload) => {
@@ -1380,6 +1500,25 @@ function HubApp() {
     setOpenAiAccountSession(normalizeOpenAiAccountSession(sessionPayload?.session));
     setOpenAiAuthLoaded(true);
   }, []);
+
+  const applyAgentCapabilitiesPayload = useCallback((payload) => {
+    setAgentCapabilities(normalizeAgentCapabilities(payload));
+  }, []);
+
+  const refreshAgentCapabilities = useCallback(async () => {
+    const payload = await fetchJson("/api/agent-capabilities");
+    applyAgentCapabilitiesPayload(payload);
+  }, [applyAgentCapabilitiesPayload]);
+
+  const startAgentCapabilitiesDiscovery = useCallback(async () => {
+    try {
+      const payload = await fetchJson("/api/agent-capabilities/discover", { method: "POST" });
+      applyAgentCapabilitiesPayload(payload);
+    } catch (err) {
+      // Background refresh should not block primary UI.
+      console.warn("Agent capability discovery start failed", err);
+    }
+  }, [applyAgentCapabilitiesPayload]);
 
   const refreshGithubInstallations = useCallback(async () => {
     setGithubInstallationsLoading(true);
@@ -1486,6 +1625,25 @@ function HubApp() {
       });
   }, [refreshAuthSettings]);
 
+  const queueAgentCapabilitiesRefresh = useCallback(() => {
+    if (capabilitiesRefreshInFlightRef.current) {
+      capabilitiesRefreshQueuedRef.current = true;
+      return;
+    }
+    capabilitiesRefreshInFlightRef.current = true;
+    refreshAgentCapabilities()
+      .catch((err) => {
+        console.warn("Agent capability refresh failed", err);
+      })
+      .finally(() => {
+        capabilitiesRefreshInFlightRef.current = false;
+        if (capabilitiesRefreshQueuedRef.current) {
+          capabilitiesRefreshQueuedRef.current = false;
+          queueAgentCapabilitiesRefresh();
+        }
+      });
+  }, [refreshAgentCapabilities]);
+
   const visibleChats = useMemo(() => {
     const serverChats = hubState.chats || [];
     const serverChatById = new Map(serverChats.map((chat) => [chat.id, chat]));
@@ -1528,7 +1686,7 @@ function HubApp() {
         is_pending_start: true,
         project_id: session.project_id,
         project_name: session.project_name || "Unknown",
-        agent_type: normalizeAgentType(session.agent_type),
+        agent_type: normalizeAgentType(session.agent_type, agentCapabilities),
         workspace: "",
         container_workspace: "",
         ro_mounts: [],
@@ -1544,11 +1702,12 @@ function HubApp() {
     }
 
     return merged;
-  }, [hubState.chats, pendingSessions]);
+  }, [hubState.chats, pendingSessions, agentCapabilities]);
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([refreshState(), refreshAuthSettings()])
+    startAgentCapabilitiesDiscovery().catch(() => {});
+    Promise.all([refreshState(), refreshAuthSettings(), refreshAgentCapabilities()])
       .then(() => {
         if (!cancelled) {
           setError("");
@@ -1562,7 +1721,7 @@ function HubApp() {
     return () => {
       cancelled = true;
     };
-  }, [refreshState, refreshAuthSettings]);
+  }, [refreshState, refreshAuthSettings, refreshAgentCapabilities, startAgentCapabilitiesDiscovery]);
 
   useEffect(() => {
     let stopped = false;
@@ -1641,6 +1800,9 @@ function HubApp() {
           if (payload.auth) {
             applyAuthPayload(payload.auth);
           }
+          if (payload.agent_capabilities) {
+            applyAgentCapabilitiesPayload(payload.agent_capabilities);
+          }
           if (payload.openai_account_session) {
             applyOpenAiSessionPayload(payload.openai_account_session);
           }
@@ -1655,6 +1817,10 @@ function HubApp() {
         }
         if (eventType === "auth_changed") {
           queueAuthRefresh();
+          return;
+        }
+        if (eventType === "agent_capabilities_changed") {
+          queueAgentCapabilitiesRefresh();
           return;
         }
         if (eventType === "openai_account_session") {
@@ -1697,7 +1863,13 @@ function HubApp() {
         ws.close();
       }
     };
-  }, [applyStatePayload, queueAuthRefresh, queueStateRefresh]);
+  }, [
+    applyAgentCapabilitiesPayload,
+    applyStatePayload,
+    queueAgentCapabilitiesRefresh,
+    queueAuthRefresh,
+    queueStateRefresh
+  ]);
 
   useEffect(() => {
     setProjectDrafts((prev) => {
@@ -1755,11 +1927,11 @@ function HubApp() {
       const next = {};
       for (const project of hubState.projects) {
         const current = prev[project.id] || { agentType: DEFAULT_AGENT_TYPE };
-        next[project.id] = normalizeChatStartSettings(current);
+        next[project.id] = normalizeChatStartSettings(current, agentCapabilities);
       }
       return next;
     });
-  }, [hubState.projects]);
+  }, [hubState.projects, agentCapabilities]);
 
   useEffect(() => {
     const activeProjectIds = new Set(
@@ -1817,12 +1989,15 @@ function HubApp() {
 
   function updateProjectChatStartSettings(projectId, patch) {
     setChatStartSettingsByProject((prev) => {
-      const current = normalizeChatStartSettings(prev[projectId] || { agentType: DEFAULT_AGENT_TYPE });
+      const current = normalizeChatStartSettings(
+        prev[projectId] || { agentType: DEFAULT_AGENT_TYPE },
+        agentCapabilities
+      );
       const candidate = {
         ...current,
         ...patch
       };
-      const normalized = normalizeChatStartSettings(candidate);
+      const normalized = normalizeChatStartSettings(candidate, agentCapabilities);
       return {
         ...prev,
         [projectId]: normalized
@@ -2048,9 +2223,10 @@ function HubApp() {
     const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const project = projectsById.get(projectId);
     const selectedStartSettings = normalizeChatStartSettings(
-      startSettings || chatStartSettingsByProject[projectId] || { agentType: DEFAULT_AGENT_TYPE }
+      startSettings || chatStartSettingsByProject[projectId] || { agentType: DEFAULT_AGENT_TYPE },
+      agentCapabilities
     );
-    const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings);
+    const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings, agentCapabilities);
     const knownServerChatIds = (hubState.chats || [])
       .filter((chat) => String(chat.project_id || "") === String(projectId))
       .map((chat) => chat.id);
@@ -3106,7 +3282,7 @@ function HubApp() {
                 <div className="meta">Title status: {titleStatus || "idle"}</div>
                 {chat.title_error ? <div className="meta build-error">Title generation error: {chat.title_error}</div> : null}
                 <div className="meta">Chat ID: {resolvedChatId || "starting..."}</div>
-                <div className="meta">Agent: {agentTypeLabel(chat.agent_type)}</div>
+                <div className="meta">Agent: {agentTypeLabel(chat.agent_type, agentCapabilities)}</div>
                 <div className="meta">Workspace: {chat.workspace}</div>
                 <div className="meta">Container folder: {chat.container_workspace || "not started yet"}</div>
                 {chat.setup_snapshot_image ? (
@@ -3590,10 +3766,13 @@ function HubApp() {
                 const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
                 const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
                 const projectStartSettings = normalizeChatStartSettings(
-                  chatStartSettingsByProject[project.id] || { agentType: DEFAULT_AGENT_TYPE }
+                  chatStartSettingsByProject[project.id] || { agentType: DEFAULT_AGENT_TYPE },
+                  agentCapabilities
                 );
-                const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType);
-                const projectSupportsReasoning = projectStartSettings.agentType === "codex";
+                const projectAgentOptions = agentTypeOptions(agentCapabilities);
+                const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
+                const projectReasoningOptions = reasoningModeOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
+                const projectSupportsReasoning = projectReasoningOptions.length > 1;
                 return (
                   <article className="card project-chat-group" key={`group-${project.id}`}>
                     <div
@@ -3623,7 +3802,7 @@ function HubApp() {
                                 updateProjectChatStartSettings(project.id, { agentType: event.target.value });
                               }}
                             >
-                              {AGENT_TYPE_OPTIONS.map((option) => (
+                              {projectAgentOptions.map((option) => (
                                 <option key={`${project.id}-agent-${option.value}`} value={option.value}>
                                   {option.label}
                                 </option>
@@ -3658,7 +3837,7 @@ function HubApp() {
                                   updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
                                 }}
                               >
-                                {REASONING_MODE_OPTIONS.map((reasoningMode) => (
+                                {projectReasoningOptions.map((reasoningMode) => (
                                   <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
                                     {reasoningMode}
                                   </option>

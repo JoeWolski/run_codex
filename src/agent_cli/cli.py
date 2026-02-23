@@ -707,6 +707,27 @@ def _read_openai_api_key(path: Path) -> str | None:
     return None
 
 
+def _ensure_claude_json_file(path: Path) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise click.ClickException(f"Unable to create parent directory for Claude config file {path}: {exc}") from exc
+
+    if path.exists():
+        if not path.is_file():
+            raise click.ClickException(f"Claude config path exists but is not a file: {path}")
+        try:
+            if path.stat().st_size > 0:
+                return
+        except OSError as exc:
+            raise click.ClickException(f"Unable to inspect Claude config file {path}: {exc}") from exc
+
+    try:
+        path.write_text("{}\n", encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"Unable to initialize Claude config file {path}: {exc}") from exc
+
+
 def _normalize_git_credential_host(raw_value: str) -> str:
     host = str(raw_value or "").strip().lower()
     if not host:
@@ -980,7 +1001,7 @@ def main(
     host_gemini_dir = host_agent_home / ".gemini"
     host_codex_dir.mkdir(parents=True, exist_ok=True)
     host_claude_dir.mkdir(parents=True, exist_ok=True)
-    host_claude_json_file.touch(exist_ok=True)
+    _ensure_claude_json_file(host_claude_json_file)
     host_claude_config_dir.mkdir(parents=True, exist_ok=True)
     host_gemini_dir.mkdir(parents=True, exist_ok=True)
     (host_agent_home / "projects").mkdir(parents=True, exist_ok=True)
