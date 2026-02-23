@@ -979,6 +979,8 @@ Gemini CLI
         cmd = captured["cmd"]
         self.assertIn("--network", cmd)
         self.assertIn("host", cmd)
+        self.assertIn("--tmpfs", cmd)
+        self.assertIn(hub_server.TMP_DIR_TMPFS_SPEC, cmd)
         self.assertIn("--user", cmd)
         self.assertIn(f"{self.state.local_uid}:{self.state.local_gid}", cmd)
         self.assertIn("codex", cmd)
@@ -5270,6 +5272,8 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             self.assertIn("--volume", run_cmd)
             self.assertIn(f"{image_cli.DOCKER_SOCKET_PATH}:{image_cli.DOCKER_SOCKET_PATH}", run_cmd)
+            self.assertIn("--tmpfs", run_cmd)
+            self.assertIn(image_cli.TMP_DIR_TMPFS_SPEC, run_cmd)
 
     def test_cli_mounts_project_under_workspace_with_project_directory_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

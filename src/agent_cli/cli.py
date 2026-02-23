@@ -37,6 +37,7 @@ DEFAULT_GEMINI_APPROVAL_MODE = "yolo"
 GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
 SYSTEM_PROMPT_FILE_NAME = "SYSTEM_PROMPT.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 
@@ -1246,6 +1247,8 @@ def main(
         "--rm",
         "-i",
         "-t",
+        "--tmpfs",
+        TMP_DIR_TMPFS_SPEC,
         *run_args,
         runtime_image,
         *command,

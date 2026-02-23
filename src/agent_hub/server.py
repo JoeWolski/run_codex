@@ -73,6 +73,7 @@ GITHUB_OWNER_SCOPE_MAX_ITEMS = 64
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_CONTAINER_HOME = "/workspace"
+TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777"
 ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_HUB_ARTIFACT_BASE_URL"
 DEFAULT_ARTIFACT_PUBLISH_HOST = "host.docker.internal"
 TERMINAL_QUEUE_MAX = 256
@@ -5372,6 +5373,8 @@ class HubState:
             "host",
             "--workdir",
             container_home,
+            "--tmpfs",
+            TMP_DIR_TMPFS_SPEC,
             "--volume",
             f"{self.host_codex_dir}:{container_home}/.codex",
             "--volume",

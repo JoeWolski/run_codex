@@ -41,6 +41,8 @@ RUN if ! id -u agent >/dev/null 2>&1; then \
  && agent_group="$(id -gn agent)" \
  && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
  && chown -R "agent:${agent_group}" /home/agent \
+ && mkdir -p /tmp \
+ && chmod 1777 /tmp \
  && mkdir -p /workspace/.cache/uv /workspace/.codex \
  && chmod -R 0777 /workspace
 

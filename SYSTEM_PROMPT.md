@@ -10,6 +10,8 @@ Use a repo-relative path when possible.
 If the user asks for a file, do not stop after creating it: publish it in the same turn and report the artifact.
 Do not bundle multiple files into zip/tar archives by default; publish original files individually.
 Only publish archive files when the user explicitly requests an archive.
+Create temporary or intermediate files that will not be committed under `/tmp`.
+These temporary files do not need to be deleted or cleaned up after the task.
 Never push to the default branch unless the user explicitly asks in the current conversation.
 You may create, commit, and push feature branches as needed.
 Before creating a new branch, examine recent local branch history to identify established naming patterns.
