@@ -4319,16 +4319,7 @@ class CliEnvVarTests(unittest.TestCase):
             system_prompt = tmp_path / "SYSTEM_PROMPT.md"
             gemini_context_file.parent.mkdir(parents=True, exist_ok=True)
             gemini_context_file.write_text(
-                "\n".join(
-                    [
-                        "User-owned Gemini context section.",
-                        "",
-                        image_cli.MANAGED_GEMINI_CONTEXT_START,
-                        "outdated shared context",
-                        image_cli.MANAGED_GEMINI_CONTEXT_END,
-                        "",
-                    ]
-                ),
+                "Pre-existing Gemini-only context that should be replaced.\n",
                 encoding="utf-8",
             )
             config = tmp_path / "agent.config.toml"
@@ -4377,15 +4368,60 @@ class CliEnvVarTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
             updated_context = gemini_context_file.read_text(encoding="utf-8")
-            self.assertIn("User-owned Gemini context section.", updated_context)
-            self.assertNotIn("outdated shared context", updated_context)
-            self.assertIn("Always run deterministic integration tests before final output.", updated_context)
-            self.assertIn("AGENTS.md", updated_context)
-            self.assertIn("README.md", updated_context)
-            self.assertIn("docs/agent-setup.md", updated_context)
-            self.assertIn("4096 bytes", updated_context)
-            self.assertEqual(updated_context.count(image_cli.MANAGED_GEMINI_CONTEXT_START), 1)
-            self.assertEqual(updated_context.count(image_cli.MANAGED_GEMINI_CONTEXT_END), 1)
+            expected_context = image_cli._shared_prompt_context_from_config(
+                config,
+                core_system_prompt=system_prompt.read_text(encoding="utf-8").strip(),
+            )
+            self.assertEqual(updated_context, f"{expected_context}\n")
+            self.assertNotIn("Pre-existing Gemini-only context that should be replaced.", updated_context)
+            self.assertNotIn("agent_cli managed shared context", updated_context)
+
+    def test_gemini_runtime_removes_context_file_when_shared_prompt_context_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            agent_home = tmp_path / "agent-home"
+            gemini_context_file = agent_home / ".gemini" / "GEMINI.md"
+            system_prompt = tmp_path / "SYSTEM_PROMPT.md"
+            gemini_context_file.parent.mkdir(parents=True, exist_ok=True)
+            gemini_context_file.write_text("Pre-existing Gemini-only context.\n", encoding="utf-8")
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            system_prompt.write_text("\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--system-prompt-file",
+                        str(system_prompt),
+                        "--agent-home-path",
+                        str(agent_home),
+                        "--agent-command",
+                        "gemini",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            self.assertFalse(gemini_context_file.exists())
 
     def test_codex_runtime_flags_respect_explicit_cli_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
