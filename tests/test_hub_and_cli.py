@@ -872,6 +872,9 @@ class HubStateTests(unittest.TestCase):
         self.assertIn(str(self.state.host_agent_home), cmd)
         self.assertIn("--agent-command", cmd)
         self.assertIn("codex", cmd)
+        self.assertIn("--container-project-name", cmd)
+        container_name_index = cmd.index("--container-project-name")
+        self.assertEqual(cmd[container_name_index + 1], "repo")
         self.assertIn("--no-alt-screen", cmd)
         self.assertIn("--ro-mount", cmd)
         self.assertIn(f"{self.host_ro}:/ro_data", cmd)
@@ -895,6 +898,10 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(
             started_chat["artifact_publish_token_hash"],
             hub_server._hash_artifact_publish_token("artifact-token-test"),
+        )
+        self.assertEqual(
+            started_chat["container_workspace"],
+            f"{hub_server.DEFAULT_CONTAINER_HOME}/repo",
         )
 
     def test_start_chat_builds_cmd_with_repo_dockerfile_uses_workspace_context(self) -> None:
@@ -1693,6 +1700,9 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("--prepare-snapshot-only", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn("--setup-script", cmd)
+        self.assertIn("--container-project-name", cmd)
+        container_name_index = cmd.index("--container-project-name")
+        self.assertEqual(cmd[container_name_index + 1], "repo")
         self.assertIn("--agent-home-path", cmd)
         self.assertIn(str(self.state.host_agent_home), cmd)
         self.assertIn("--credentials-file", cmd)
@@ -1707,6 +1717,26 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(cmd[base_index + 1], str(workspace / "docker" / "base"))
         self.assertNotIn("--base-docker-context", cmd)
         self.assertNotIn("--base-dockerfile", cmd)
+
+    def test_delete_path_retries_after_permission_repair(self) -> None:
+        path = self.tmp_path / "workspace-delete"
+        path.mkdir(parents=True, exist_ok=True)
+
+        attempts = {"count": 0}
+
+        def fake_rmtree(target_path: Path) -> None:
+            self.assertEqual(target_path, path)
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise PermissionError("permission denied")
+
+        with patch("agent_hub.server.shutil.rmtree", side_effect=fake_rmtree) as rmtree_call, patch(
+            "agent_hub.server._docker_fix_path_ownership"
+        ) as repair_call:
+            self.state._delete_path(path)
+
+        self.assertEqual(rmtree_call.call_count, 2)
+        repair_call.assert_called_once_with(path, self.state.local_uid, self.state.local_gid)
 
     def test_ensure_project_setup_snapshot_uses_repo_root_context_for_repo_dockerfile(self) -> None:
         self._connect_github_app()
@@ -1900,6 +1930,7 @@ class HubStateTests(unittest.TestCase):
         workspace = Path(chat["workspace"])
         self.assertEqual(workspace.name, f"Demo_Project_{chat['id']}")
         self.assertEqual(self.state.chat_workdir(chat["id"]), workspace)
+        self.assertEqual(chat["container_workspace"], f"{hub_server.DEFAULT_CONTAINER_HOME}/Demo_Project")
 
     def test_close_chat_stops_runtime_and_keeps_workspace_and_chat_record(self) -> None:
         project = self.state.add_project(
@@ -4500,6 +4531,88 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             self.assertIn("--volume", run_cmd)
             self.assertIn(f"{image_cli.DOCKER_SOCKET_PATH}:{image_cli.DOCKER_SOCKET_PATH}", run_cmd)
+
+    def test_cli_mounts_project_under_workspace_with_project_directory_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "demo-project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            expected_container_project = f"{image_cli.DEFAULT_CONTAINER_HOME}/demo-project"
+            self.assertIn("--workdir", run_cmd)
+            self.assertIn(expected_container_project, run_cmd)
+            self.assertIn(f"{project.resolve()}:{expected_container_project}", run_cmd)
+            self.assertIn("CONTAINER_PROJECT_PATH=/workspace/demo-project", run_cmd)
+
+    def test_cli_rejects_mount_targets_inside_project_mount_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            rw_mount = tmp_path / "rw-cache"
+            rw_mount.mkdir(parents=True, exist_ok=True)
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--rw-mount",
+                        f"{rw_mount}:/workspace/project/.cache/sccache",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("inside the project mount path", result.output)
+            self.assertEqual(commands, [])
 
     def test_cli_sets_runtime_user_and_group_adds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

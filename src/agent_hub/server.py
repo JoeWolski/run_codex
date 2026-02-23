@@ -29,7 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from string import Template
 from threading import Lock, Thread, current_thread
 from typing import Any, Callable
@@ -1278,6 +1278,14 @@ def _sanitize_workspace_component(value: str) -> str:
     return cleaned or "project"
 
 
+def _container_project_name(value: Any) -> str:
+    return _sanitize_workspace_component(str(value or ""))
+
+
+def _container_workspace_path_for_project(value: Any) -> str:
+    return str(PurePosixPath(DEFAULT_CONTAINER_HOME) / _container_project_name(value))
+
+
 def _short_summary(text: str, max_words: int = 10, max_chars: int = 80) -> str:
     words = [part for part in text.strip().split() if part]
     if not words:
@@ -2042,10 +2050,12 @@ def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
     if not path.exists():
         return
     if shutil.which("docker") is None:
-        return
+        raise RuntimeError("docker command not found in PATH")
     if not _docker_image_exists(DEFAULT_AGENT_IMAGE):
-        return
-    subprocess.run(
+        raise RuntimeError(
+            f"Runtime image '{DEFAULT_AGENT_IMAGE}' is not available for ownership repair."
+        )
+    result = subprocess.run(
         [
             "docker",
             "run",
@@ -2056,12 +2066,16 @@ def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
             f"{path}:/target",
             DEFAULT_AGENT_IMAGE,
             "-lc",
-            f"chown -R {uid}:{gid} /target || true; chmod -R u+rwX /target || true",
+            f"chown -R {uid}:{gid} /target && chmod -R u+rwX /target",
         ],
         check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
     )
+    if result.returncode != 0:
+        combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
+        detail = combined or f"docker run exited with code {result.returncode}"
+        raise RuntimeError(f"Failed to repair path ownership for {path}: {detail}")
 
 
 def _detect_default_branch(repo_url: str, env: dict[str, str] | None = None) -> str:
@@ -5190,7 +5204,9 @@ class HubState:
 
         chat_id = uuid.uuid4().hex
         now = _iso_now()
-        workspace_path = self.chat_dir / f"{_sanitize_workspace_component(project.get('name') or project_id)}_{chat_id}"
+        sanitized_project_name = _sanitize_workspace_component(project.get("name") or project_id)
+        workspace_path = self.chat_dir / f"{sanitized_project_name}_{chat_id}"
+        container_workspace = _container_workspace_path_for_project(project.get("name") or project_id)
         chat = {
             "id": chat_id,
             "project_id": project_id,
@@ -5204,6 +5220,7 @@ class HubState:
             "status": "stopped",
             "pid": None,
             "workspace": str(workspace_path),
+            "container_workspace": container_workspace,
             "title_user_prompts": [],
             "title_cached": "",
             "title_prompt_fingerprint": "",
@@ -5297,7 +5314,30 @@ class HubState:
     def _delete_path(self, path: Path) -> None:
         if not path.exists():
             return
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError as exc:
+            try:
+                _docker_fix_path_ownership(path, self.local_uid, self.local_gid)
+            except Exception as repair_exc:  # pragma: no cover - exercised in tests via patched helper
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Failed to delete path {path}: permission denied and ownership repair failed: "
+                        f"{repair_exc}"
+                    ),
+                ) from repair_exc
+            try:
+                shutil.rmtree(path)
+                return
+            except Exception as retry_exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to delete path {path} after ownership repair: {retry_exc}",
+                ) from retry_exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to delete path {path}: {exc}") from exc
 
     @staticmethod
     def _queue_put(listener: queue.Queue[str | None], value: str | None) -> None:
@@ -5764,11 +5804,7 @@ class HubState:
 
         for path in [self.chat_dir, self.project_dir, self.log_dir]:
             if path.exists():
-                try:
-                    shutil.rmtree(path)
-                except PermissionError:
-                    _docker_fix_path_ownership(path, os.getuid(), os.getgid())
-                    shutil.rmtree(path)
+                self._delete_path(path)
             path.mkdir(parents=True, exist_ok=True)
 
         self.save(state)
@@ -5946,6 +5982,8 @@ class HubState:
             "agent_cli",
             "--project",
             str(workspace),
+            "--container-project-name",
+            _container_project_name(project.get("name") or project.get("id")),
             "--agent-home-path",
             str(self.host_agent_home),
             "--config-file",
@@ -6063,6 +6101,8 @@ class HubState:
             ):
                 state["chats"][chat_id]["artifact_prompt_history"] = cleaned_artifact_prompt_history
                 should_save = True
+            project_for_chat = project_map.get(chat_copy["project_id"], {})
+            project_name = str(project_for_chat.get("name") or chat_copy["project_id"] or "project")
             chat_copy["artifacts"] = [self._chat_artifact_public_payload(chat_id, artifact) for artifact in reversed(cleaned_artifacts)]
             chat_copy["artifact_current_ids"] = cleaned_current_artifact_ids
             chat_copy["artifact_prompt_history"] = [
@@ -6089,8 +6129,10 @@ class HubState:
                         state["chats"][chat_id]["status"] = "stopped"
                         should_save = True
             chat_copy["is_running"] = running
-            chat_copy["container_workspace"] = DEFAULT_CONTAINER_HOME
-            chat_copy["project_name"] = project_map.get(chat_copy["project_id"], {}).get("name", "Unknown")
+            chat_copy["container_workspace"] = str(chat_copy.get("container_workspace") or "") or _container_workspace_path_for_project(
+                project_name
+            )
+            chat_copy["project_name"] = project_name
             subtitle = _chat_subtitle_from_log(self.chat_log(chat_id))
             cached_title = _truncate_title(str(chat_copy.get("title_cached") or ""), CHAT_TITLE_MAX_CHARS)
             if cached_title and _looks_like_terminal_control_payload(cached_title):
@@ -6168,6 +6210,7 @@ class HubState:
         agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
         agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
         chat["agent_type"] = agent_type
+        container_workspace = _container_workspace_path_for_project(project.get("name") or project.get("id"))
 
         cmd = [
             "uv",
@@ -6179,6 +6222,8 @@ class HubState:
             agent_command,
             "--project",
             str(workspace),
+            "--container-project-name",
+            _container_project_name(project.get("name") or project.get("id")),
             "--agent-home-path",
             str(self.host_agent_home),
             "--config-file",
@@ -6211,7 +6256,7 @@ class HubState:
         chat["status"] = "running"
         chat["pid"] = proc.pid
         chat["setup_snapshot_image"] = snapshot_tag or ""
-        chat["container_workspace"] = DEFAULT_CONTAINER_HOME
+        chat["container_workspace"] = container_workspace
         chat["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
         chat["artifact_publish_token_issued_at"] = _iso_now()
         chat["last_started_at"] = _iso_now()

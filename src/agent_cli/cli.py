@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable, Tuple
 
 import click
@@ -377,6 +378,48 @@ def _parse_mount(spec: str, label: str) -> Tuple[str, str]:
     return str(host_path), container
 
 
+def _normalize_container_project_name(raw_value: str | None, fallback_name: str) -> str:
+    candidate = str(raw_value or "").strip() or str(fallback_name or "").strip()
+    if not candidate:
+        raise click.ClickException("Unable to resolve container project directory name.")
+    if "/" in candidate or candidate in {".", ".."}:
+        raise click.ClickException(
+            f"Invalid container project directory name: {candidate!r} "
+            "(must be a single path component)."
+        )
+    return candidate
+
+
+def _normalize_container_path(raw_path: str) -> PurePosixPath:
+    normalized = posixpath.normpath(str(raw_path or "").strip())
+    if not normalized.startswith("/"):
+        raise click.ClickException(f"Invalid container path: {raw_path} (must be absolute)")
+    return PurePosixPath(normalized)
+
+
+def _container_path_is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
+    if path == root:
+        return True
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _reject_mount_inside_project_path(*, spec: str, label: str, container_project_path: PurePosixPath) -> None:
+    if ":" not in spec:
+        return
+    _host, container = spec.split(":", 1)
+    container_path = _normalize_container_path(container)
+    if _container_path_is_within(container_path, container_project_path):
+        raise click.ClickException(
+            f"Invalid {label}: {spec}. Container path '{container_path}' is inside the project mount path "
+            f"'{container_project_path}', which can cause Docker to create root-owned directories in the checkout. "
+            "Mount shared/system paths outside the checkout (for example /workspace/.cache/sccache)."
+        )
+
+
 def _path_metadata(path: Path) -> str:
     try:
         info = path.stat()
@@ -679,6 +722,11 @@ def _resolve_base_image(
     help="Agent executable launched inside the container (for example codex, claude, or gemini)",
 )
 @click.option("--container-home", default=None, help="Container home path for mapped user")
+@click.option(
+    "--container-project-name",
+    default=None,
+    help="Container-side project directory name under --container-home (defaults to host project directory name).",
+)
 @click.option("--agent-home-path", default=None, help="Host path for persistent agent state")
 @click.option(
     "--config-file",
@@ -751,6 +799,7 @@ def main(
     project: str,
     agent_command: str,
     container_home: str | None,
+    container_project_name: str | None,
     agent_home_path: str | None,
     config_file: str,
     openai_api_key: str | None,
@@ -835,8 +884,12 @@ def main(
     ):
         supplemental_group_ids.append(docker_socket_gid)
 
-    container_home_path = container_home or DEFAULT_CONTAINER_HOME
-    container_project_path = container_home_path
+    container_home_path = str(container_home or DEFAULT_CONTAINER_HOME).strip() or DEFAULT_CONTAINER_HOME
+    if not container_home_path.startswith("/"):
+        raise click.ClickException(f"Invalid --container-home: {container_home_path} (must be absolute)")
+    resolved_container_project_name = _normalize_container_project_name(container_project_name, project_path.name)
+    container_project_path = str(_normalize_container_path(str(PurePosixPath(container_home_path) / resolved_container_project_name)))
+    container_project_root = _normalize_container_path(container_project_path)
 
     host_agent_home = Path(agent_home_path or (Path.home() / ".agent-home" / user)).resolve()
     host_codex_dir = host_agent_home / ".codex"
@@ -900,10 +953,12 @@ def main(
     rw_mount_specs: list[tuple[Path, str]] = []
 
     for mount in ro_mounts:
+        _reject_mount_inside_project_path(spec=mount, label="--ro-mount", container_project_path=container_project_root)
         host, container = _parse_mount(mount, "--ro-mount")
         ro_mount_flags.append(f"{host}:{container}:ro")
 
     for mount in rw_mounts:
+        _reject_mount_inside_project_path(spec=mount, label="--rw-mount", container_project_path=container_project_root)
         host, container = _parse_mount(mount, "--rw-mount")
         rw_mount_flags.append(f"{host}:{container}")
         rw_mount_specs.append((Path(host), container))
