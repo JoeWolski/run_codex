@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 from types import SimpleNamespace
 
+from click import ClickException
 from click.testing import CliRunner
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -3486,6 +3487,52 @@ class CliEnvVarTests(unittest.TestCase):
 
         self.assertIn("USER root", content)
         self.assertLess(content.index("USER root"), content.index("RUN apt-get update"))
+
+    def test_agent_cli_dockerfile_sets_root_home_before_provider_install_layers(self) -> None:
+        content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
+
+        self.assertIn("ENV HOME=/root", content)
+        self.assertLess(
+            content.index("ENV HOME=/root"),
+            content.index("RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"),
+        )
+
+    def test_ensure_claude_json_file_initializes_missing_file_with_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_json_file = Path(tmp) / ".claude.json"
+
+            image_cli._ensure_claude_json_file(claude_json_file)
+
+            self.assertTrue(claude_json_file.is_file())
+            self.assertEqual(json.loads(claude_json_file.read_text(encoding="utf-8")), {})
+
+    def test_ensure_claude_json_file_rewrites_empty_file_with_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_json_file = Path(tmp) / ".claude.json"
+            claude_json_file.write_text("", encoding="utf-8")
+
+            image_cli._ensure_claude_json_file(claude_json_file)
+
+            self.assertEqual(json.loads(claude_json_file.read_text(encoding="utf-8")), {})
+
+    def test_ensure_claude_json_file_preserves_existing_non_empty_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_json_file = Path(tmp) / ".claude.json"
+            claude_json_file.write_text('{"existing":"value"}\n', encoding="utf-8")
+
+            image_cli._ensure_claude_json_file(claude_json_file)
+
+            self.assertEqual(claude_json_file.read_text(encoding="utf-8"), '{"existing":"value"}\n')
+
+    def test_ensure_claude_json_file_fails_when_path_is_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            claude_json_dir = Path(tmp) / ".claude.json"
+            claude_json_dir.mkdir(parents=True, exist_ok=True)
+
+            with self.assertRaises(ClickException) as ctx:
+                image_cli._ensure_claude_json_file(claude_json_dir)
+
+            self.assertIn("not a file", str(ctx.exception))
 
     def test_default_config_uses_developer_instructions_for_file_artifacts(self) -> None:
         config_path = ROOT / "config" / "agent.config.toml"
