@@ -3354,6 +3354,79 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(recommendation["base_image_mode"], "tag")
         self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
 
+    def test_auto_configure_project_emits_live_logs_for_request_id(self) -> None:
+        emitted_logs: list[tuple[str, str, bool]] = []
+
+        def fake_run(
+            cmd: list[str],
+            cwd: Path | None = None,
+            capture: bool = False,
+            check: bool = True,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess:
+            del cwd, capture, check, env
+            if cmd[:2] == ["git", "clone"]:
+                Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(cmd, 0, "Cloning into 'repo'...\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def fake_temporary_chat(
+            workspace: Path,
+            repo_url: str,
+            branch: str,
+            on_output: Callable[[str], None] | None = None,
+        ) -> dict[str, Any]:
+            self.assertTrue(workspace.exists())
+            self.assertEqual(repo_url, "https://example.com/org/repo.git")
+            self.assertEqual(branch, "main")
+            if on_output is not None:
+                on_output("assistant> analyzing repository layout...\n")
+            return {
+                "payload": {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                "model": "chatgpt-account-codex",
+            }
+
+        def capture_live_log(request_id: str, text: str, replace: bool = False) -> None:
+            emitted_logs.append((request_id, text, replace))
+
+        with patch("agent_hub.server._detect_default_branch", return_value="main"), patch(
+            "agent_hub.server._run",
+            side_effect=fake_run,
+        ), patch.object(
+            self.state,
+            "_run_temporary_auto_config_chat",
+            side_effect=fake_temporary_chat,
+        ), patch.object(
+            self.state,
+            "_emit_auto_config_log",
+            side_effect=capture_live_log,
+        ):
+            recommendation = self.state.auto_configure_project(
+                repo_url="https://example.com/org/repo.git",
+                default_branch="",
+                request_id="pending-auto-123",
+            )
+
+        self.assertEqual(recommendation["default_branch"], "main")
+        self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
+        self.assertTrue(emitted_logs)
+        self.assertTrue(all(request_id == "pending-auto-123" for request_id, _text, _replace in emitted_logs))
+        self.assertTrue(any(replace for _request_id, _text, replace in emitted_logs))
+        self.assertTrue(
+            any(
+                "assistant> analyzing repository layout..." in text
+                for _request_id, text, _replace in emitted_logs
+            )
+        )
+
     def test_apply_auto_config_repository_hints_prefers_ci_dockerfile_and_make_target(self) -> None:
         workspace = self.tmp_path / "workspace-hints"
         (workspace / "ci" / "x86_docker").mkdir(parents=True, exist_ok=True)
@@ -5474,7 +5547,11 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.post(
                     "/api/projects/auto-configure",
-                    json={"repo_url": "https://example.com/org/repo.git", "default_branch": "main"},
+                    json={
+                        "repo_url": "https://example.com/org/repo.git",
+                        "default_branch": "main",
+                        "request_id": "pending-auto-123",
+                    },
                 )
 
         self.assertEqual(response.status_code, 200, msg=response.text)
@@ -5483,6 +5560,7 @@ class HubApiAsyncRouteTests(unittest.TestCase):
         auto_config.assert_called_once_with(
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
+            request_id="pending-auto-123",
         )
 
     def test_create_project_route_runs_state_call_in_worker_thread(self) -> None:

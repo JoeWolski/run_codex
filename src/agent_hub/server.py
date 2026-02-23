@@ -165,6 +165,7 @@ AUTO_CONFIG_MISSING_OUTPUT_ERROR = "Temporary auto-config chat did not return a 
 AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid JSON."
 AUTO_CONFIG_NOTES_MAX_CHARS = 400
 AUTO_CONFIG_REPO_DOCKERFILE_MIN_SCORE = 70
+AUTO_CONFIG_REQUEST_ID_MAX_CHARS = 120
 AUTO_CONFIG_CACHE_SIGNAL_MAX_FILES = 3000
 AUTO_CONFIG_CACHE_SIGNAL_IGNORED_DIRS = {
     ".git",
@@ -298,6 +299,7 @@ EVENT_TYPE_STATE_CHANGED = "state_changed"
 EVENT_TYPE_AUTH_CHANGED = "auth_changed"
 EVENT_TYPE_OPENAI_ACCOUNT_SESSION = "openai_account_session"
 EVENT_TYPE_PROJECT_BUILD_LOG = "project_build_log"
+EVENT_TYPE_AUTO_CONFIG_LOG = "auto_config_log"
 EVENT_TYPE_AGENT_CAPABILITIES_CHANGED = "agent_capabilities_changed"
 
 LOGGER = logging.getLogger("agent_hub")
@@ -2874,6 +2876,16 @@ class HubState:
             },
         )
 
+    def _emit_auto_config_log(self, request_id: str, text: str, replace: bool = False) -> None:
+        self._emit_event(
+            EVENT_TYPE_AUTO_CONFIG_LOG,
+            {
+                "request_id": str(request_id),
+                "text": str(text or ""),
+                "replace": bool(replace),
+            },
+        )
+
     def _emit_openai_account_session_changed(self, reason: str = "") -> None:
         payload = self.openai_account_session_payload()
         payload["reason"] = str(reason or "")
@@ -4771,7 +4783,24 @@ class HubState:
         next_recommendation["notes"] = notes
         return next_recommendation
 
-    def _run_temporary_auto_config_chat(self, workspace: Path, repo_url: str, branch: str) -> dict[str, Any]:
+    def _run_temporary_auto_config_chat(
+        self,
+        workspace: Path,
+        repo_url: str,
+        branch: str,
+        on_output: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        def emit(chunk: str) -> None:
+            if on_output is None:
+                return
+            text = str(chunk or "")
+            if not text:
+                return
+            try:
+                on_output(text)
+            except Exception:
+                LOGGER.exception("Auto-config output callback failed.")
+
         account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
         if not account_connected:
             raise HTTPException(status_code=409, detail=AUTO_CONFIG_NOT_CONNECTED_ERROR)
@@ -4797,20 +4826,54 @@ class HubState:
             str(output_file),
             prompt,
         ]
+        emit("Launching temporary repository analysis chat...\n")
+        emit(f"Working directory: {workspace}\n")
+        emit(f"Repository URL: {repo_url}\n")
+        emit(f"Branch: {branch}\n\n")
+
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
-                check=False,
                 text=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
                 env=env,
-                timeout=max(20.0, float(AUTO_CONFIG_CHAT_TIMEOUT_SECONDS)),
             )
+        except OSError as exc:
+            raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed to start: {exc}") from exc
+
+        output_chunks: list[str] = []
+
+        def consume_output() -> None:
+            stdout = process.stdout
+            if stdout is None:
+                return
+            try:
+                for line in iter(stdout.readline, ""):
+                    if line == "":
+                        break
+                    output_chunks.append(line)
+                    emit(line)
+            finally:
+                stdout.close()
+
+        try:
+            consumer = Thread(target=consume_output, daemon=True)
+            consumer.start()
+            return_code = process.wait(timeout=max(20.0, float(AUTO_CONFIG_CHAT_TIMEOUT_SECONDS)))
+            consumer.join(timeout=2.0)
         except subprocess.TimeoutExpired as exc:
+            process.kill()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+            emit("\nTemporary auto-config chat timed out.\n")
             raise HTTPException(status_code=504, detail="Temporary auto-config chat timed out.") from exc
 
-        output_text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
-        if result.returncode != 0:
+        output_text = "".join(output_chunks).strip()
+        if return_code != 0:
             detail = _codex_exec_error_message(output_text)
             raise HTTPException(status_code=502, detail=f"Temporary auto-config chat failed: {detail}")
 
@@ -4832,10 +4895,21 @@ class HubState:
             raise HTTPException(status_code=502, detail=AUTO_CONFIG_INVALID_OUTPUT_ERROR) from exc
         return {"payload": parsed_payload, "model": AUTO_CONFIG_MODEL}
 
-    def auto_configure_project(self, repo_url: Any, default_branch: Any = None) -> dict[str, Any]:
+    def auto_configure_project(
+        self,
+        repo_url: Any,
+        default_branch: Any = None,
+        request_id: Any = None,
+    ) -> dict[str, Any]:
         normalized_repo_url = str(repo_url or "").strip()
         if not normalized_repo_url:
             raise HTTPException(status_code=400, detail="repo_url is required.")
+        normalized_request_id = str(request_id or "").strip()[:AUTO_CONFIG_REQUEST_ID_MAX_CHARS]
+
+        def emit_auto_config_log(text: str, replace: bool = False) -> None:
+            if not normalized_request_id:
+                return
+            self._emit_auto_config_log(normalized_request_id, text, replace=replace)
 
         requested_branch = str(default_branch or "").strip()
         git_env = self._github_git_env_for_repo(normalized_repo_url)
@@ -4856,73 +4930,96 @@ class HubState:
             if public_branch:
                 resolved_branch = public_branch
 
-        with tempfile.TemporaryDirectory(prefix="agent-hub-auto-config-", dir=str(self.data_dir)) as temp_dir:
-            workspace = Path(temp_dir) / "repo"
-            env_candidates: list[dict[str, str]] = [authenticated_git_env]
-            if git_env:
-                env_candidates.append(sanitized_git_env)
+        emit_auto_config_log("", replace=True)
+        emit_auto_config_log("Preparing repository checkout for temporary analysis chat...\n")
+        emit_auto_config_log(f"Repository URL: {normalized_repo_url}\n")
+        emit_auto_config_log(f"Requested branch: {requested_branch or 'auto-detect'}\n")
 
-            def run_clone(cmd: list[str]) -> subprocess.CompletedProcess:
-                last_result = subprocess.CompletedProcess(cmd, 1, "", "")
-                for env_candidate in env_candidates:
-                    if workspace.exists():
-                        self._delete_path(workspace)
-                    result = _run(cmd, capture=True, check=False, env=env_candidate)
-                    if result.returncode == 0:
-                        return result
-                    last_result = result
-                return last_result
+        try:
+            with tempfile.TemporaryDirectory(prefix="agent-hub-auto-config-", dir=str(self.data_dir)) as temp_dir:
+                workspace = Path(temp_dir) / "repo"
+                env_candidates: list[dict[str, str]] = [authenticated_git_env]
+                if git_env:
+                    env_candidates.append(sanitized_git_env)
 
-            clone_cmd_with_branch = [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                resolved_branch,
-                normalized_repo_url,
-                str(workspace),
-            ]
-            clone_result = run_clone(clone_cmd_with_branch)
-            if clone_result.returncode != 0:
-                if requested_branch:
-                    detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Unable to clone repository branch '{requested_branch}'. "
-                            f"{detail or 'git clone failed.'}"
-                        ),
-                    )
+                def run_clone(cmd: list[str]) -> subprocess.CompletedProcess:
+                    last_result = subprocess.CompletedProcess(cmd, 1, "", "")
+                    for env_candidate in env_candidates:
+                        if workspace.exists():
+                            self._delete_path(workspace)
+                        emit_auto_config_log(f"\n$ {' '.join(cmd)}\n")
+                        result = _run(cmd, capture=True, check=False, env=env_candidate)
+                        command_output = ((result.stdout or "") + (result.stderr or "")).strip()
+                        if command_output:
+                            emit_auto_config_log(f"{command_output}\n")
+                        elif result.returncode != 0:
+                            emit_auto_config_log(f"Command exited with code {result.returncode}.\n")
+                        if result.returncode == 0:
+                            return result
+                        last_result = result
+                    return last_result
 
-                clone_cmd_default = ["git", "clone", "--depth", "1", normalized_repo_url, str(workspace)]
-                clone_result = run_clone(clone_cmd_default)
+                clone_cmd_with_branch = [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--branch",
+                    resolved_branch,
+                    normalized_repo_url,
+                    str(workspace),
+                ]
+                clone_result = run_clone(clone_cmd_with_branch)
                 if clone_result.returncode != 0:
-                    detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unable to clone repository for auto-configure. {detail or 'git clone failed.'}",
+                    if requested_branch:
+                        detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Unable to clone repository branch '{requested_branch}'. "
+                                f"{detail or 'git clone failed.'}"
+                            ),
+                        )
+
+                    clone_cmd_default = ["git", "clone", "--depth", "1", normalized_repo_url, str(workspace)]
+                    clone_result = run_clone(clone_cmd_default)
+                    if clone_result.returncode != 0:
+                        detail = ((clone_result.stdout or "") + (clone_result.stderr or "")).strip()
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unable to clone repository for auto-configure. {detail or 'git clone failed.'}",
+                        )
+
+                    head_result = _run_for_repo(
+                        ["rev-parse", "--abbrev-ref", "HEAD"],
+                        workspace,
+                        capture=True,
+                        check=False,
+                        env=sanitized_git_env,
                     )
+                    if head_result.returncode == 0 and head_result.stdout.strip():
+                        resolved_branch = head_result.stdout.strip()
 
-                head_result = _run_for_repo(
-                    ["rev-parse", "--abbrev-ref", "HEAD"],
+                emit_auto_config_log("\nRepository checkout complete. Starting temporary analysis chat...\n")
+                chat_result = self._run_temporary_auto_config_chat(
                     workspace,
-                    capture=True,
-                    check=False,
-                    env=sanitized_git_env,
+                    normalized_repo_url,
+                    resolved_branch,
+                    on_output=emit_auto_config_log if normalized_request_id else None,
                 )
-                if head_result.returncode == 0 and head_result.stdout.strip():
-                    resolved_branch = head_result.stdout.strip()
-
-            chat_result = self._run_temporary_auto_config_chat(workspace, normalized_repo_url, resolved_branch)
-            recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
-            recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
-            recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
+                recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
+                recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
+                recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
+        except HTTPException as exc:
+            detail = str(exc.detail or f"HTTP {exc.status_code}")
+            emit_auto_config_log(f"\nAuto-config failed: {detail}\n")
+            raise
 
         recommendation["default_branch"] = resolved_branch
         recommendation["analysis_model"] = str(chat_result.get("model") or "")
         recommendation["analysis_auth_mode"] = CHAT_TITLE_AUTH_MODE_ACCOUNT
         recommendation["analyzed_repo_url"] = normalized_repo_url
+        emit_auto_config_log("\nAuto-config completed successfully.\n")
         return recommendation
 
     def connect_openai(self, api_key: Any, verify: bool = True) -> dict[str, Any]:
@@ -8018,6 +8115,7 @@ def main(
             state.auto_configure_project,
             repo_url=payload.get("repo_url"),
             default_branch=payload.get("default_branch"),
+            request_id=payload.get("request_id"),
         )
         return {"recommendation": recommendation}
 
