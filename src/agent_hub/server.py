@@ -185,6 +185,8 @@ AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid 
 AUTO_CONFIG_NOTES_MAX_CHARS = 400
 AUTO_CONFIG_REPO_DOCKERFILE_MIN_SCORE = 70
 AUTO_CONFIG_REQUEST_ID_MAX_CHARS = 120
+AUTO_CONFIG_BUILD_MAX_ATTEMPTS = 5
+AUTO_CONFIG_BUILD_LOG_EXCERPT_MAX_CHARS = 12_000
 AUTO_CONFIG_CACHE_SIGNAL_MAX_FILES = 3000
 AUTO_CONFIG_CACHE_SIGNAL_IGNORED_DIRS = {
     ".git",
@@ -4902,12 +4904,102 @@ class HubState:
         next_recommendation["notes"] = notes
         return next_recommendation
 
+    @staticmethod
+    def _auto_config_validation_project_id(repo_url: str, branch: str) -> str:
+        seed = f"{repo_url}::{branch}"
+        digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8]
+        return f"auto-config-{digest}"
+
+    @staticmethod
+    def _extract_auto_config_build_command(build_log: str) -> str:
+        for line in str(build_log or "").splitlines():
+            cleaned = line.strip()
+            if cleaned.startswith("$ "):
+                return cleaned[2:].strip()
+        return ""
+
+    @staticmethod
+    def _auto_config_build_log_excerpt(build_log: str) -> str:
+        cleaned = ANSI_ESCAPE_RE.sub("", str(build_log or "")).replace("\r", "\n").strip()
+        if not cleaned:
+            return "No build log output captured."
+        if len(cleaned) <= AUTO_CONFIG_BUILD_LOG_EXCERPT_MAX_CHARS:
+            return cleaned
+        tail_chars = max(1, AUTO_CONFIG_BUILD_LOG_EXCERPT_MAX_CHARS - 4)
+        return "...\n" + cleaned[-tail_chars:]
+
+    @staticmethod
+    def _auto_config_build_failure_summary(build_log: str, fallback_detail: str) -> str:
+        summary = _codex_exec_error_message(build_log)
+        if summary and summary != "Unknown error.":
+            return summary
+        fallback = _short_summary(str(fallback_detail or ""), max_words=32, max_chars=240)
+        return fallback or "Snapshot build failed with an unknown error."
+
+    def _attempt_auto_config_recommendation_build(
+        self,
+        workspace: Path,
+        repo_url: str,
+        branch: str,
+        recommendation: dict[str, Any],
+        attempt: int,
+        on_output: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        validation_project = {
+            "id": self._auto_config_validation_project_id(repo_url, branch),
+            "name": _extract_repo_name(repo_url) or "auto-config",
+            "repo_url": repo_url,
+            "default_branch": branch,
+            "base_image_mode": recommendation.get("base_image_mode"),
+            "base_image_value": recommendation.get("base_image_value"),
+            "setup_script": recommendation.get("setup_script"),
+            "default_ro_mounts": list(recommendation.get("default_ro_mounts") or []),
+            "default_rw_mounts": list(recommendation.get("default_rw_mounts") or []),
+            "default_env_vars": list(recommendation.get("default_env_vars") or []),
+        }
+        log_path = workspace / f".agent-hub-auto-config-build-attempt-{attempt}.log"
+        try:
+            log_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        try:
+            snapshot_tag = self._ensure_project_setup_snapshot(
+                workspace,
+                validation_project,
+                log_path=log_path,
+                project_id=None,
+                on_output=on_output,
+            )
+        except HTTPException as exc:
+            build_log = ""
+            try:
+                build_log = log_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                pass
+            detail = str(exc.detail or f"HTTP {exc.status_code}")
+            summary = self._auto_config_build_failure_summary(build_log, detail)
+            return {
+                "ok": False,
+                "status_code": exc.status_code,
+                "detail": detail,
+                "summary": summary,
+                "failing_command": self._extract_auto_config_build_command(build_log),
+                "build_log_excerpt": self._auto_config_build_log_excerpt(build_log),
+            }
+
+        return {
+            "ok": True,
+            "snapshot_tag": snapshot_tag,
+        }
+
     def _run_temporary_auto_config_chat(
         self,
         workspace: Path,
         repo_url: str,
         branch: str,
         on_output: Callable[[str], None] | None = None,
+        retry_feedback: str = "",
     ) -> dict[str, Any]:
         def emit(chunk: str) -> None:
             if on_output is None:
@@ -4929,6 +5021,16 @@ class HubState:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
         prompt = self._auto_config_prompt(repo_url, branch)
+        retry_feedback_text = str(retry_feedback or "").strip()
+        if retry_feedback_text:
+            prompt = (
+                f"{prompt}\n\n"
+                "Previous recommendation failed a real snapshot build. "
+                "Use this exact failure context to revise the recommendation so the next build succeeds.\n"
+                "Failure context:\n"
+                f"{retry_feedback_text}\n\n"
+                "Return exactly one JSON object with the required schema."
+            )
         output_file = self.host_codex_dir / f"auto-config-{uuid.uuid4().hex}.json"
         env = os.environ.copy()
         env["HOME"] = str(self.host_agent_home)
@@ -4949,6 +5051,8 @@ class HubState:
         emit(f"Working directory: {workspace}\n")
         emit(f"Repository URL: {repo_url}\n")
         emit(f"Branch: {branch}\n\n")
+        if retry_feedback_text:
+            emit("Applying previous build failure context for this retry.\n\n")
 
         try:
             process = subprocess.Popen(
@@ -5120,15 +5224,88 @@ class HubState:
                         resolved_branch = head_result.stdout.strip()
 
                 emit_auto_config_log("\nRepository checkout complete. Starting temporary analysis chat...\n")
-                chat_result = self._run_temporary_auto_config_chat(
-                    workspace,
-                    normalized_repo_url,
-                    resolved_branch,
-                    on_output=emit_auto_config_log if normalized_request_id else None,
-                )
-                recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
-                recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
-                recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
+                recommendation: dict[str, Any] = {}
+                chat_result: dict[str, Any] = {}
+                retry_feedback = ""
+                for attempt in range(1, AUTO_CONFIG_BUILD_MAX_ATTEMPTS + 1):
+                    emit_auto_config_log(
+                        f"\nAuto-config recommendation attempt {attempt}/{AUTO_CONFIG_BUILD_MAX_ATTEMPTS}...\n"
+                    )
+                    if retry_feedback:
+                        chat_result = self._run_temporary_auto_config_chat(
+                            workspace,
+                            normalized_repo_url,
+                            resolved_branch,
+                            on_output=emit_auto_config_log if normalized_request_id else None,
+                            retry_feedback=retry_feedback,
+                        )
+                    else:
+                        chat_result = self._run_temporary_auto_config_chat(
+                            workspace,
+                            normalized_repo_url,
+                            resolved_branch,
+                            on_output=emit_auto_config_log if normalized_request_id else None,
+                        )
+                    recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
+                    recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
+                    recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
+                    emit_auto_config_log(
+                        "Validating recommendation by building setup snapshot image...\n"
+                    )
+                    build_result = self._attempt_auto_config_recommendation_build(
+                        workspace,
+                        normalized_repo_url,
+                        resolved_branch,
+                        recommendation,
+                        attempt=attempt,
+                        on_output=emit_auto_config_log if normalized_request_id else None,
+                    )
+                    if build_result.get("ok"):
+                        snapshot_tag = str(build_result.get("snapshot_tag") or "").strip()
+                        if snapshot_tag:
+                            emit_auto_config_log(
+                                "Build validation passed for recommended settings "
+                                f"(snapshot: {snapshot_tag}).\n"
+                            )
+                        else:
+                            emit_auto_config_log("Build validation passed for recommended settings.\n")
+                        break
+
+                    failure_summary = str(build_result.get("summary") or "Snapshot build failed.")
+                    failing_command = str(build_result.get("failing_command") or "").strip()
+                    build_log_excerpt = str(build_result.get("build_log_excerpt") or "").strip()
+                    emit_auto_config_log(
+                        f"Build validation failed on attempt {attempt}/{AUTO_CONFIG_BUILD_MAX_ATTEMPTS}: "
+                        f"{failure_summary}\n"
+                    )
+                    if failing_command:
+                        emit_auto_config_log(f"Failing command: {failing_command}\n")
+                    if attempt >= AUTO_CONFIG_BUILD_MAX_ATTEMPTS:
+                        detail_lines = [
+                            f"Auto-configure could not produce a buildable setup after {AUTO_CONFIG_BUILD_MAX_ATTEMPTS} attempts.",
+                            f"Issue summary: {failure_summary}",
+                        ]
+                        if failing_command:
+                            detail_lines.append(f"Failing command: {failing_command}")
+                        if build_log_excerpt:
+                            detail_lines.extend(["Build log:", build_log_excerpt])
+                        failure_detail = "\n".join(detail_lines)
+                        emit_auto_config_log("\nAuto-config retry budget exhausted.\n")
+                        emit_auto_config_log(f"{failure_detail}\n")
+                        raise HTTPException(status_code=422, detail=failure_detail)
+
+                    retry_feedback_lines = [
+                        f"Attempt {attempt} of {AUTO_CONFIG_BUILD_MAX_ATTEMPTS} failed.",
+                        f"Failure summary: {failure_summary}",
+                    ]
+                    if failing_command:
+                        retry_feedback_lines.append(f"Failing command: {failing_command}")
+                    if build_log_excerpt:
+                        retry_feedback_lines.extend(["Build log excerpt:", build_log_excerpt])
+                    retry_feedback = "\n".join(retry_feedback_lines)
+                    emit_auto_config_log(
+                        "Retrying temporary analysis chat with build failure feedback.\n"
+                    )
         except HTTPException as exc:
             detail = str(exc.detail or f"HTTP {exc.status_code}")
             emit_auto_config_log(f"\nAuto-config failed: {detail}\n")
@@ -6905,6 +7082,7 @@ class HubState:
         project: dict[str, Any],
         log_path: Path | None = None,
         project_id: str | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> str:
         setup_script = str(project.get("setup_script") or "").strip()
         snapshot_tag = self._project_setup_snapshot_tag(project)
@@ -6916,6 +7094,8 @@ class HubState:
                     log_file.write(line)
                 if resolved_project_id:
                     self._emit_project_build_log(resolved_project_id, line)
+                if on_output is not None:
+                    on_output(line)
             return snapshot_tag
 
         cmd = [
@@ -6962,15 +7142,20 @@ class HubState:
         if log_path is None:
             _run(cmd, check=True)
         else:
+            emit_build_output: Callable[[str], None] | None = None
+            if resolved_project_id or on_output is not None:
+
+                def emit_build_output(chunk: str) -> None:
+                    if resolved_project_id:
+                        self._emit_project_build_log(resolved_project_id, chunk)
+                    if on_output is not None:
+                        on_output(chunk)
+
             _run_logged(
                 cmd,
                 log_path=log_path,
                 check=True,
-                on_output=(
-                    (lambda chunk: self._emit_project_build_log(resolved_project_id, chunk))
-                    if resolved_project_id
-                    else None
-                ),
+                on_output=emit_build_output,
             )
         return snapshot_tag
 

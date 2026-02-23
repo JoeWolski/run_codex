@@ -3502,6 +3502,10 @@ Gemini CLI
                 },
                 "model": "chatgpt-account-codex",
             },
+        ), patch.object(
+            self.state,
+            "_attempt_auto_config_recommendation_build",
+            return_value={"ok": True, "snapshot_tag": "agent-hub-setup-autocfg"},
         ):
             recommendation = self.state.auto_configure_project(
                 repo_url="https://example.com/org/repo.git",
@@ -3539,10 +3543,12 @@ Gemini CLI
             repo_url: str,
             branch: str,
             on_output: Callable[[str], None] | None = None,
+            retry_feedback: str = "",
         ) -> dict[str, Any]:
             self.assertTrue(workspace.exists())
             self.assertEqual(repo_url, "https://example.com/org/repo.git")
             self.assertEqual(branch, "main")
+            self.assertEqual(retry_feedback, "")
             if on_output is not None:
                 on_output("assistant> analyzing repository layout...\n")
             return {
@@ -3570,6 +3576,10 @@ Gemini CLI
             side_effect=fake_temporary_chat,
         ), patch.object(
             self.state,
+            "_attempt_auto_config_recommendation_build",
+            return_value={"ok": True, "snapshot_tag": "agent-hub-setup-autocfg"},
+        ), patch.object(
+            self.state,
             "_emit_auto_config_log",
             side_effect=capture_live_log,
         ):
@@ -3590,6 +3600,159 @@ Gemini CLI
                 for _request_id, text, _replace in emitted_logs
             )
         )
+
+    def test_auto_configure_project_retries_build_failures_and_applies_feedback(self) -> None:
+        retry_feedbacks: list[str] = []
+
+        def fake_run(
+            cmd: list[str],
+            cwd: Path | None = None,
+            capture: bool = False,
+            check: bool = True,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess:
+            del cwd, capture, check, env
+            if cmd[:2] == ["git", "clone"]:
+                Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(cmd, 0, "Cloning into 'repo'...\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def fake_temporary_chat(
+            workspace: Path,
+            repo_url: str,
+            branch: str,
+            on_output: Callable[[str], None] | None = None,
+            retry_feedback: str = "",
+        ) -> dict[str, Any]:
+            self.assertTrue(workspace.exists())
+            self.assertEqual(repo_url, "https://example.com/org/repo.git")
+            self.assertEqual(branch, "main")
+            retry_feedbacks.append(retry_feedback)
+            if on_output is not None:
+                on_output("assistant> generated recommendation\n")
+            if len(retry_feedbacks) == 1:
+                return {
+                    "payload": {
+                        "base_image_mode": "tag",
+                        "base_image_value": "ubuntu:22.04",
+                        "setup_script": "apt-get install -y build-essential",
+                        "default_ro_mounts": [],
+                        "default_rw_mounts": [],
+                        "default_env_vars": [],
+                        "notes": "",
+                    },
+                    "model": "chatgpt-account-codex",
+                }
+            return {
+                "payload": {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:24.04",
+                    "setup_script": "apt-get update\napt-get install -y build-essential",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                "model": "chatgpt-account-codex",
+            }
+
+        with patch("agent_hub.server._detect_default_branch", return_value="main"), patch(
+            "agent_hub.server._run",
+            side_effect=fake_run,
+        ), patch.object(
+            self.state,
+            "_run_temporary_auto_config_chat",
+            side_effect=fake_temporary_chat,
+        ) as temporary_chat, patch.object(
+            self.state,
+            "_attempt_auto_config_recommendation_build",
+            side_effect=[
+                {
+                    "ok": False,
+                    "summary": "apt-get update was missing before apt-get install.",
+                    "failing_command": "uv run --project /workspace/agent_hub agent_cli ...",
+                    "build_log_excerpt": "$ uv run --project /workspace/agent_hub agent_cli ...\nE: Unable to locate package build-essential",
+                },
+                {
+                    "ok": True,
+                    "snapshot_tag": "agent-hub-setup-autocfg",
+                },
+            ],
+        ) as build_attempt:
+            recommendation = self.state.auto_configure_project(
+                repo_url="https://example.com/org/repo.git",
+                default_branch="",
+            )
+
+        self.assertEqual(temporary_chat.call_count, 2)
+        self.assertEqual(build_attempt.call_count, 2)
+        self.assertEqual(retry_feedbacks[0], "")
+        self.assertIn("Attempt 1 of 5 failed.", retry_feedbacks[1])
+        self.assertIn("Build log excerpt:", retry_feedbacks[1])
+        self.assertEqual(recommendation["base_image_value"], "ubuntu:24.04")
+        self.assertEqual(
+            recommendation["setup_script"],
+            "apt-get update\napt-get install -y build-essential",
+        )
+        self.assertEqual(recommendation["analysis_model"], "chatgpt-account-codex")
+
+    def test_auto_configure_project_reports_summary_and_build_log_after_max_retries(self) -> None:
+        def fake_run(
+            cmd: list[str],
+            cwd: Path | None = None,
+            capture: bool = False,
+            check: bool = True,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess:
+            del cwd, capture, check, env
+            if cmd[:2] == ["git", "clone"]:
+                Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(cmd, 0, "Cloning into 'repo'...\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch("agent_hub.server._detect_default_branch", return_value="main"), patch(
+            "agent_hub.server._run",
+            side_effect=fake_run,
+        ), patch.object(
+            self.state,
+            "_run_temporary_auto_config_chat",
+            return_value={
+                "payload": {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                "model": "chatgpt-account-codex",
+            },
+        ) as temporary_chat, patch.object(
+            self.state,
+            "_attempt_auto_config_recommendation_build",
+            return_value={
+                "ok": False,
+                "summary": "docker build failed: missing compiler toolchain.",
+                "failing_command": "uv run --project /workspace/agent_hub agent_cli ...",
+                "build_log_excerpt": "$ uv run --project /workspace/agent_hub agent_cli ...\nERROR: gcc: command not found",
+            },
+        ) as build_attempt:
+            with self.assertRaises(HTTPException) as ctx:
+                self.state.auto_configure_project(
+                    repo_url="https://example.com/org/repo.git",
+                    default_branch="",
+                )
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        detail = str(ctx.exception.detail)
+        self.assertIn("could not produce a buildable setup after 5 attempts", detail)
+        self.assertIn("Issue summary: docker build failed: missing compiler toolchain.", detail)
+        self.assertIn("Failing command: uv run --project /workspace/agent_hub agent_cli ...", detail)
+        self.assertIn("Build log:", detail)
+        self.assertIn("ERROR: gcc: command not found", detail)
+        self.assertEqual(temporary_chat.call_count, hub_server.AUTO_CONFIG_BUILD_MAX_ATTEMPTS)
+        self.assertEqual(build_attempt.call_count, hub_server.AUTO_CONFIG_BUILD_MAX_ATTEMPTS)
 
     def test_apply_auto_config_repository_hints_prefers_ci_dockerfile_and_make_target(self) -> None:
         workspace = self.tmp_path / "workspace-hints"
