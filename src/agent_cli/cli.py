@@ -439,6 +439,29 @@ def _env_var_keys(entries: Iterable[str]) -> set[str]:
     return keys
 
 
+def _agent_tools_env_from_entries(entries: Iterable[str]) -> dict[str, str]:
+    env_values: dict[str, str] = {}
+    for entry in entries:
+        key, sep, value = str(entry).partition("=")
+        normalized_key = key.strip()
+        if not normalized_key or not sep:
+            continue
+        if normalized_key in {
+            AGENT_TOOLS_URL_ENV,
+            AGENT_TOOLS_TOKEN_ENV,
+            AGENT_TOOLS_PROJECT_ID_ENV,
+            AGENT_TOOLS_CHAT_ID_ENV,
+        }:
+            env_values[normalized_key] = value.strip()
+
+    return {
+        AGENT_TOOLS_URL_ENV: env_values.get(AGENT_TOOLS_URL_ENV, ""),
+        AGENT_TOOLS_TOKEN_ENV: env_values.get(AGENT_TOOLS_TOKEN_ENV, ""),
+        AGENT_TOOLS_PROJECT_ID_ENV: env_values.get(AGENT_TOOLS_PROJECT_ID_ENV, ""),
+        AGENT_TOOLS_CHAT_ID_ENV: env_values.get(AGENT_TOOLS_CHAT_ID_ENV, ""),
+    }
+
+
 def _git_origin_repo_url(project_path: Path) -> str:
     result = subprocess.run(
         ["git", "-C", str(project_path), "remote", "get-url", "origin"],
@@ -521,7 +544,12 @@ def _resolve_existing_project_context(state: object, repo_url: str) -> tuple[str
     return "", hub_server._normalize_project_credential_binding(None)
 
 
-def _build_agent_tools_runtime_config(*, config_path: Path, host_codex_dir: Path) -> Path:
+def _build_agent_tools_runtime_config(
+    *,
+    config_path: Path,
+    host_codex_dir: Path,
+    agent_tools_env: dict[str, str],
+) -> Path:
     from agent_hub import server as hub_server
 
     source_script = hub_server._agent_tools_mcp_source_path()
@@ -549,6 +577,13 @@ def _build_agent_tools_runtime_config(*, config_path: Path, host_codex_dir: Path
     except OSError as exc:
         raise click.ClickException(f"Failed to read config file {config_path}: {exc}") from exc
 
+    agent_tools_url = str(agent_tools_env.get(AGENT_TOOLS_URL_ENV) or "").strip()
+    agent_tools_token = str(agent_tools_env.get(AGENT_TOOLS_TOKEN_ENV) or "").strip()
+    if not agent_tools_url:
+        raise click.ClickException(f"Missing required {AGENT_TOOLS_URL_ENV} for agent_tools MCP runtime config.")
+    if not agent_tools_token:
+        raise click.ClickException(f"Missing required {AGENT_TOOLS_TOKEN_ENV} for agent_tools MCP runtime config.")
+
     merged_config = _strip_mcp_server_table(base_config, "agent_tools")
     merged_config += (
         "\n[mcp_servers.agent_tools]\n"
@@ -556,6 +591,11 @@ def _build_agent_tools_runtime_config(*, config_path: Path, host_codex_dir: Path
         f"args = [{json.dumps(AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH)}]\n"
         "startup_timeout_sec = 20\n"
         "tool_timeout_sec = 120\n"
+        "\n[mcp_servers.agent_tools.env]\n"
+        f"{AGENT_TOOLS_URL_ENV} = {json.dumps(agent_tools_url)}\n"
+        f"{AGENT_TOOLS_TOKEN_ENV} = {json.dumps(agent_tools_token)}\n"
+        f"{AGENT_TOOLS_PROJECT_ID_ENV} = {json.dumps(str(agent_tools_env.get(AGENT_TOOLS_PROJECT_ID_ENV) or '').strip())}\n"
+        f"{AGENT_TOOLS_CHAT_ID_ENV} = {json.dumps(str(agent_tools_env.get(AGENT_TOOLS_CHAT_ID_ENV) or '').strip())}\n"
     )
 
     runtime_config_path = host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}.toml"
@@ -580,7 +620,11 @@ def _start_agent_tools_runtime_bridge(
             raise click.ClickException(
                 f"{AGENT_TOOLS_URL_ENV} and {AGENT_TOOLS_TOKEN_ENV} must be provided together when using --env-var."
             )
-        runtime_config_path = _build_agent_tools_runtime_config(config_path=config_path, host_codex_dir=host_codex_dir)
+        runtime_config_path = _build_agent_tools_runtime_config(
+            config_path=config_path,
+            host_codex_dir=host_codex_dir,
+            agent_tools_env=_agent_tools_env_from_entries(parsed_env_vars),
+        )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
             env_vars=[],
@@ -616,7 +660,6 @@ def _start_agent_tools_runtime_bridge(
             repo_url=repo_url,
             credential_binding=credential_binding,
         )
-        runtime_config_path = _build_agent_tools_runtime_config(config_path=config_path, host_codex_dir=host_codex_dir)
 
         class _BridgeHandler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -718,7 +761,11 @@ def _start_agent_tools_runtime_bridge(
             f"{AGENT_TOOLS_PROJECT_ID_ENV}={project_id}",
             f"{AGENT_TOOLS_CHAT_ID_ENV}=agent_cli:{session_id}",
         ]
-        assert runtime_config_path is not None
+        runtime_config_path = _build_agent_tools_runtime_config(
+            config_path=config_path,
+            host_codex_dir=host_codex_dir,
+            agent_tools_env=_agent_tools_env_from_entries(env_vars),
+        )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
             env_vars=env_vars,
