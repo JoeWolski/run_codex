@@ -5908,6 +5908,7 @@ class CliEnvVarTests(unittest.TestCase):
                     "AGENT_HUB_AGENT_TOOLS_CHAT_ID": "chat-test",
                 },
                 agent_provider=image_cli.agent_providers.CodexProvider(),
+                container_home="/workspace",
             )
 
             runtime_text = runtime_config.read_text(encoding="utf-8")

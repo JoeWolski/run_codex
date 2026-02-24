@@ -6103,6 +6103,97 @@ class HubState:
             "snapshot_tag": snapshot_tag,
         }
 
+    def _prepare_agent_cli_command(
+        self,
+        *,
+        workspace: Path,
+        container_project_name: str,
+        runtime_config_file: Path,
+        agent_type: str,
+        agent_tools_url: str,
+        agent_tools_token: str,
+        agent_tools_project_id: str = "",
+        agent_tools_chat_id: str = "",
+        repo_url: str = "",
+        project: dict[str, Any] | None = None,
+        snapshot_tag: str = "",
+        ro_mounts: list[str] | None = None,
+        rw_mounts: list[str] | None = None,
+        env_vars: list[str] | None = None,
+        artifacts_url: str = "",
+        artifacts_token: str = "",
+        resume: bool = False,
+        context_key: str = "",
+        extra_args: list[str] | None = None,
+        setup_script: str = "",
+        prepare_snapshot_only: bool = False,
+    ) -> list[str]:
+        agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
+        cmd = [
+            "uv",
+            "run",
+            "--project",
+            str(_repo_root()),
+            "agent_cli",
+            "--agent-command",
+            agent_command,
+            "--project",
+            str(workspace),
+            "--container-project-name",
+            container_project_name,
+            "--agent-home-path",
+            str(self.host_agent_home),
+            "--config-file",
+            str(runtime_config_file),
+            "--system-prompt-file",
+            str(self.system_prompt_file),
+            "--no-alt-screen",
+        ]
+        if resume and agent_type == AGENT_TYPE_CODEX:
+            cmd.append("--resume")
+        cmd.extend(self._openai_credentials_arg())
+        cmd.extend(
+            self._github_git_args_for_repo(
+                repo_url,
+                project=project,
+                context_key=context_key,
+            )
+        )
+        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url, project=project):
+            cmd.extend(["--env-var", git_identity_env])
+        if snapshot_tag:
+            self._append_project_base_args(cmd, workspace, project)
+            cmd.extend(["--snapshot-image-tag", snapshot_tag])
+        for mount in ro_mounts or []:
+            cmd.extend(["--ro-mount", mount])
+        for mount in rw_mounts or []:
+            cmd.extend(["--rw-mount", mount])
+
+        if setup_script:
+            cmd.extend(["--setup-script", setup_script])
+        if prepare_snapshot_only:
+            cmd.append("--prepare-snapshot-only")
+
+        if artifacts_url:
+            cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACTS_URL={artifacts_url}"])
+        if artifacts_token:
+            cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACT_TOKEN={artifacts_token}"])
+
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}"])
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}"])
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}"])
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}"])
+
+        for env_entry in env_vars or []:
+            if _is_reserved_env_entry(str(env_entry)):
+                continue
+            cmd.extend(["--env-var", env_entry])
+
+        if extra_args:
+            cmd.append("--")
+            cmd.extend(extra_args)
+        return cmd
+
     def _run_temporary_auto_config_chat(
         self,
         workspace: Path,
@@ -6144,7 +6235,7 @@ class HubState:
         container_project_name = _container_project_name(_extract_repo_name(repo_url) or "auto-config")
         container_workspace = str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name)
         container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
-        session_id, session_token = self._create_agent_tools_session(repo_url=repo_url)
+        session_id, session_token = self._create_agent_tools_session(repo_url=repo_url, workspace=workspace)
         agent_tools_url = f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}"
         agent_tools_chat_id = f"auto-config:{session_id}"
         runtime_config_file = self._prepare_chat_runtime_config(
@@ -6155,52 +6246,38 @@ class HubState:
             agent_tools_project_id="",
             agent_tools_chat_id=agent_tools_chat_id,
         )
-        cmd = [
-            "uv",
-            "run",
-            "--project",
-            str(_repo_root()),
-            "agent_cli",
-            "--agent-command",
-            AGENT_COMMAND_BY_TYPE[AGENT_TYPE_CODEX],
-            "--project",
-            str(workspace),
-            "--container-project-name",
-            container_project_name,
-            "--agent-home-path",
-            str(self.host_agent_home),
-            "--config-file",
-            str(runtime_config_file),
-            "--system-prompt-file",
-            str(self.system_prompt_file),
-            "--no-alt-screen",
+        artifact_publish_token = _new_artifact_publish_token()
+        with self._agent_tools_sessions_lock:
+            active_session = self._agent_tools_sessions.get(session_id)
+            if active_session is not None:
+                active_session["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
+                self._agent_tools_sessions[session_id] = active_session
+
+        extra_args = [
+            "exec",
+            "--skip-git-repo-check",
+            "--cd",
+            container_workspace,
+            "--sandbox",
+            "workspace-write",
+            "--output-last-message",
+            container_output_file,
+            prompt,
         ]
-        cmd.extend(self._openai_credentials_arg())
-        cmd.extend(
-            self._github_git_args_for_repo(
-                repo_url,
-                context_key=f"auto_config_chat:{session_id}",
-            )
-        )
-        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url):
-            cmd.extend(["--env-var", git_identity_env])
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}"])
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={session_token}"])
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}="])
-        cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}"])
-        cmd.extend(
-            [
-                "--",
-                "exec",
-                "--skip-git-repo-check",
-                "--cd",
-                container_workspace,
-                "--sandbox",
-                "workspace-write",
-                "--output-last-message",
-                container_output_file,
-                prompt,
-            ]
+        cmd = self._prepare_agent_cli_command(
+            workspace=workspace,
+            container_project_name=container_project_name,
+            runtime_config_file=runtime_config_file,
+            agent_type=AGENT_TYPE_CODEX,
+            agent_tools_url=agent_tools_url,
+            agent_tools_token=session_token,
+            agent_tools_project_id="",
+            agent_tools_chat_id=agent_tools_chat_id,
+            repo_url=repo_url,
+            artifacts_url=f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}/artifacts/publish",
+            artifacts_token=artifact_publish_token,
+            context_key=f"auto_config_chat:{session_id}",
+            extra_args=extra_args,
         )
         emit("Launching temporary repository analysis chat...\n")
         emit(f"Working directory: {workspace}\n")
@@ -7337,6 +7414,19 @@ class HubState:
             raise HTTPException(status_code=403, detail="Invalid artifact publish token.")
 
     @staticmethod
+    def _require_session_artifact_publish_token(session: dict[str, Any], token: Any) -> None:
+        expected_hash = str(session.get("artifact_publish_token_hash") or "")
+        if not expected_hash:
+            raise HTTPException(status_code=409, detail="Artifact publishing is unavailable for this session.")
+
+        submitted_token = str(token or "").strip()
+        if not submitted_token:
+            raise HTTPException(status_code=401, detail="Missing artifact publish token.")
+        submitted_hash = _hash_artifact_publish_token(submitted_token)
+        if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
+            raise HTTPException(status_code=403, detail="Invalid artifact publish token.")
+
+    @staticmethod
     def _require_agent_tools_token(chat: dict[str, Any], token: Any) -> None:
         expected_hash = str(chat.get("agent_tools_token_hash") or "")
         if not expected_hash:
@@ -7541,6 +7631,7 @@ class HubState:
         project_id: str = "",
         repo_url: str = "",
         credential_binding: dict[str, Any] | None = None,
+        workspace: Path | None = None,
     ) -> tuple[str, str]:
         session_id = uuid.uuid4().hex
         token = _new_agent_tools_token()
@@ -7550,7 +7641,11 @@ class HubState:
             "repo_url": str(repo_url or "").strip(),
             "credential_binding": _normalize_project_credential_binding(credential_binding),
             "token_hash": _hash_agent_tools_token(token),
+            "workspace": str(workspace) if workspace else "",
             "created_at": _iso_now(),
+            "artifacts": [],
+            "artifact_current_ids": [],
+            "artifact_publish_token_hash": "",
         }
         with self._agent_tools_sessions_lock:
             self._agent_tools_sessions[session_id] = payload
@@ -7768,6 +7863,148 @@ class HubState:
         state["chats"][chat_id] = chat
         self.save(state, reason="chat_artifact_published")
         return self._chat_artifact_public_payload(chat_id, stored_artifact)
+
+    def publish_session_artifact(
+        self,
+        session_id: str,
+        token: Any,
+        submitted_path: Any,
+        name: Any = None,
+    ) -> dict[str, Any]:
+        session = self._agent_tools_session(session_id)
+        self._require_session_artifact_publish_token(session, token)
+
+        workspace = Path(str(session.get("workspace") or "")).resolve()
+        if not workspace or not workspace.exists():
+            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
+
+        file_path, relative_path = self._resolve_artifact_file_in_workspace(workspace, submitted_path)
+        file_stat = file_path.stat()
+        now = _iso_now()
+        artifacts = _normalize_chat_artifacts(session.get("artifacts"))
+        normalized_name = _normalize_artifact_name(name, fallback=file_path.name)
+
+        existing_index = -1
+        for index, artifact in enumerate(artifacts):
+            if str(artifact.get("relative_path") or "") == relative_path:
+                existing_index = index
+                break
+
+        if existing_index >= 0:
+            artifact_id = str(artifacts[existing_index].get("id") or "") or uuid.uuid4().hex
+            artifacts[existing_index] = {
+                "id": artifact_id,
+                "name": normalized_name,
+                "relative_path": relative_path,
+                "size_bytes": int(file_stat.st_size),
+                "created_at": now,
+            }
+            stored_artifact = artifacts[existing_index]
+        else:
+            stored_artifact = {
+                "id": uuid.uuid4().hex,
+                "name": normalized_name,
+                "relative_path": relative_path,
+                "size_bytes": int(file_stat.st_size),
+                "created_at": now,
+            }
+            artifacts.append(stored_artifact)
+            if len(artifacts) > CHAT_ARTIFACTS_MAX_ITEMS:
+                artifacts = artifacts[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        current_ids = _normalize_chat_current_artifact_ids(session.get("artifact_current_ids"), artifacts)
+        stored_artifact_id = str(stored_artifact.get("id") or "")
+        if stored_artifact_id and stored_artifact_id not in current_ids:
+            current_ids.append(stored_artifact_id)
+        if len(current_ids) > CHAT_ARTIFACTS_MAX_ITEMS:
+            current_ids = current_ids[-CHAT_ARTIFACTS_MAX_ITEMS:]
+
+        with self._agent_tools_sessions_lock:
+            active_session = self._agent_tools_sessions.get(session_id)
+            if active_session is not None:
+                active_session["artifacts"] = artifacts
+                active_session["artifact_current_ids"] = current_ids
+                self._agent_tools_sessions[session_id] = active_session
+
+        return self._session_artifact_public_payload(session_id, stored_artifact)
+
+    def _resolve_artifact_file_in_workspace(self, workspace: Path, submitted_path: Any) -> tuple[Path, str]:
+        normalized_path = str(submitted_path or "").strip()
+        if not normalized_path:
+            raise HTTPException(status_code=400, detail="path is required.")
+
+        candidate = (workspace / normalized_path).resolve()
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Artifact path must be inside the workspace.") from exc
+
+        if not candidate.exists():
+            raise HTTPException(status_code=404, detail=f"Artifact file not found: {normalized_path}")
+        if not candidate.is_file():
+            raise HTTPException(status_code=400, detail=f"Artifact path is not a file: {normalized_path}")
+
+        relative = candidate.relative_to(workspace)
+        relative_path = _coerce_artifact_relative_path(relative.as_posix())
+        if not relative_path:
+            raise HTTPException(status_code=400, detail="Artifact path is invalid.")
+        return candidate, relative_path
+
+    def _session_artifact_public_payload(self, session_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        artifact_id = str(artifact.get("id") or "")
+        return {
+            "id": artifact_id,
+            "name": _normalize_artifact_name(artifact.get("name"), fallback=Path(str(artifact.get("relative_path") or "")).name),
+            "relative_path": str(artifact.get("relative_path") or ""),
+            "size_bytes": int(artifact.get("size_bytes") or 0),
+            "created_at": str(artifact.get("created_at") or ""),
+            "preview_url": self._session_artifact_preview_url(session_id, artifact_id),
+            "download_url": self._session_artifact_download_url(session_id, artifact_id),
+        }
+
+    def _session_artifact_publish_url(self, session_id: str) -> str:
+        return f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}/artifacts/publish"
+
+    def _session_artifact_download_url(self, session_id: str, artifact_id: str) -> str:
+        return f"/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/download"
+
+    def _session_artifact_preview_url(self, session_id: str, artifact_id: str) -> str:
+        return f"/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/preview"
+
+    def resolve_session_artifact_download(self, session_id: str, artifact_id: str) -> tuple[Path, str, str]:
+        session = self._agent_tools_session(session_id)
+        normalized_artifact_id = str(artifact_id or "").strip()
+        if not normalized_artifact_id:
+            raise HTTPException(status_code=400, detail="artifact_id is required.")
+
+        artifacts = _normalize_chat_artifacts(session.get("artifacts"))
+        match = next((entry for entry in artifacts if str(entry.get("id") or "") == normalized_artifact_id), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail="Artifact not found.")
+
+        workspace = Path(str(session.get("workspace") or "")).resolve()
+        if not workspace or not workspace.exists():
+            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
+
+        resolved = (workspace / str(match.get("relative_path") or "")).resolve()
+        try:
+            resolved.relative_to(workspace)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Artifact path is invalid.") from exc
+        if not resolved.exists() or not resolved.is_file():
+            raise HTTPException(status_code=404, detail="Artifact file is no longer available.")
+
+        filename = _normalize_artifact_name(match.get("name"), fallback=resolved.name)
+        media_type = (
+            mimetypes.guess_type(filename)[0]
+            or mimetypes.guess_type(resolved.name)[0]
+            or "application/octet-stream"
+        )
+        return resolved, filename, media_type
+
+    def resolve_session_artifact_preview(self, session_id: str, artifact_id: str) -> tuple[Path, str]:
+        artifact_path, _filename, media_type = self.resolve_session_artifact_download(session_id, artifact_id)
+        return artifact_path, media_type
 
     def resolve_chat_artifact_download(self, chat_id: str, artifact_id: str) -> tuple[Path, str, str]:
         state = self.load()
@@ -9223,52 +9460,24 @@ class HubState:
                     on_output(line)
             return snapshot_tag
 
-        cmd = [
-            "uv",
-            "run",
-            "--project",
-            str(_repo_root()),
-            "agent_cli",
-            "--project",
-            str(workspace),
-            "--container-project-name",
-            _container_project_name(project.get("name") or project.get("id")),
-            "--agent-home-path",
-            str(self.host_agent_home),
-            "--config-file",
-            str(self.config_file),
-            "--system-prompt-file",
-            str(self.system_prompt_file),
-            "--no-alt-screen",
-        ]
         repo_url = str(project.get("repo_url") or "")
-        cmd.extend(self._openai_credentials_arg())
-        cmd.extend(
-            self._github_git_args_for_repo(
-                repo_url,
-                project=project,
-                context_key=f"snapshot:{project.get('id')}",
-            )
-        )
-        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url, project=project):
-            cmd.extend(["--env-var", git_identity_env])
-        self._append_project_base_args(cmd, workspace, project)
-        for mount in project.get("default_ro_mounts") or []:
-            cmd.extend(["--ro-mount", mount])
-        for mount in project.get("default_rw_mounts") or []:
-            cmd.extend(["--rw-mount", mount])
-        for env_entry in project.get("default_env_vars") or []:
-            if _is_reserved_env_entry(str(env_entry)):
-                continue
-            cmd.extend(["--env-var", env_entry])
-        cmd.extend(
-            [
-                "--snapshot-image-tag",
-                snapshot_tag,
-                "--setup-script",
-                setup_script,
-                "--prepare-snapshot-only",
-            ]
+        cmd = self._prepare_agent_cli_command(
+            workspace=workspace,
+            container_project_name=_container_project_name(project.get("name") or project.get("id")),
+            runtime_config_file=self.config_file,
+            agent_type=DEFAULT_CHAT_AGENT_TYPE,
+            agent_tools_url=f"{self.artifact_publish_base_url}/api/projects/{resolved_project_id}/agent-tools",
+            agent_tools_token="snapshot-token",
+            agent_tools_project_id=resolved_project_id,
+            repo_url=repo_url,
+            project=project,
+            snapshot_tag=snapshot_tag,
+            ro_mounts=project.get("default_ro_mounts"),
+            rw_mounts=project.get("default_rw_mounts"),
+            env_vars=project.get("default_env_vars"),
+            setup_script=setup_script,
+            prepare_snapshot_only=True,
+            context_key=f"snapshot:{project.get('id')}",
         )
         if log_path is None:
             _run(cmd, check=True)
@@ -9595,64 +9804,34 @@ class HubState:
             chat["agent_type"] = agent_type
             container_workspace = _container_workspace_path_for_project(project.get("name") or project.get("id"))
 
-            cmd = [
-                "uv",
-                "run",
-                "--project",
-                str(_repo_root()),
-                "agent_cli",
-                "--agent-command",
-                agent_command,
-                "--project",
-                str(workspace),
-                "--container-project-name",
-                _container_project_name(project.get("name") or project.get("id")),
-                "--agent-home-path",
-                str(self.host_agent_home),
-                "--config-file",
-                str(runtime_config_file),
-                "--system-prompt-file",
-                str(self.system_prompt_file),
-                "--no-alt-screen",
-            ]
-            if resume and agent_type == AGENT_TYPE_CODEX:
-                cmd.append("--resume")
-            repo_url = str(project.get("repo_url") or "")
-            cmd.extend(self._openai_credentials_arg())
-            cmd.extend(
-                self._github_git_args_for_repo(
-                    repo_url,
-                    project=project,
-                    context_key=f"chat_start:{chat_id}",
-                )
-            )
-            for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url, project=project):
-                cmd.extend(["--env-var", git_identity_env])
-            self._append_project_base_args(cmd, workspace, project)
-            cmd.extend(["--snapshot-image-tag", snapshot_tag])
-            for mount in chat.get("ro_mounts") or []:
-                cmd.extend(["--ro-mount", mount])
-            for mount in chat.get("rw_mounts") or []:
-                cmd.extend(["--rw-mount", mount])
-            cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACTS_URL={self._chat_artifact_publish_url(chat_id)}"])
-            cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACT_TOKEN={artifact_publish_token}"])
-            cmd.extend(["--env-var", f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}"])
-            cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}"])
-            cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}"])
-            cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={chat_id}"])
-            for env_entry in chat.get("env_vars") or []:
-                if _is_reserved_env_entry(str(env_entry)):
-                    continue
-                cmd.extend(["--env-var", env_entry])
             agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
             if resume and agent_type == AGENT_TYPE_CODEX:
                 # agent_cli resume mode and explicit args are mutually exclusive.
                 agent_args = []
             elif resume:
                 agent_args = self._resume_agent_args(agent_type, agent_args)
-            if agent_args:
-                cmd.append("--")
-                cmd.extend(agent_args)
+
+            cmd = self._prepare_agent_cli_command(
+                workspace=workspace,
+                container_project_name=_container_project_name(project.get("name") or project.get("id")),
+                runtime_config_file=runtime_config_file,
+                agent_type=agent_type,
+                agent_tools_url=agent_tools_url,
+                agent_tools_token=agent_tools_token,
+                agent_tools_project_id=agent_tools_project_id,
+                agent_tools_chat_id=chat_id,
+                repo_url=str(project.get("repo_url") or ""),
+                project=project,
+                snapshot_tag=snapshot_tag,
+                ro_mounts=chat.get("ro_mounts"),
+                rw_mounts=chat.get("rw_mounts"),
+                env_vars=chat.get("env_vars"),
+                artifacts_url=self._chat_artifact_publish_url(chat_id),
+                artifacts_token=artifact_publish_token,
+                resume=resume,
+                context_key=f"chat_start:{chat_id}",
+                extra_args=agent_args,
+            )
 
             proc = self._spawn_chat_process(chat_id, cmd)
         except Exception as exc:
@@ -11166,6 +11345,39 @@ def main(
             mode=payload.get("mode"),
             credential_ids=payload.get("credential_ids"),
         )
+
+    @app.post("/api/agent-tools/sessions/{session_id}/artifacts/publish")
+    async def api_publish_session_artifact(session_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get("x-agent-hub-artifact-token") or "").strip()
+
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        artifact = state.publish_session_artifact(
+            session_id=session_id,
+            token=token,
+            submitted_path=payload.get("path"),
+            name=payload.get("name"),
+        )
+        return {"artifact": artifact}
+
+    @app.get("/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/download")
+    def api_download_session_artifact(session_id: str, artifact_id: str) -> FileResponse:
+        artifact_path, filename, media_type = state.resolve_session_artifact_download(session_id, artifact_id)
+        return FileResponse(path=str(artifact_path), filename=filename, media_type=media_type)
+
+    @app.get("/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/preview")
+    def api_preview_session_artifact(session_id: str, artifact_id: str) -> FileResponse:
+        artifact_path, media_type = state.resolve_session_artifact_preview(session_id, artifact_id)
+        return FileResponse(path=str(artifact_path), media_type=media_type)
 
     @app.get("/api/chats/{chat_id}/logs", response_class=PlainTextResponse)
     def api_chat_logs(chat_id: str) -> str:

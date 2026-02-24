@@ -552,6 +552,7 @@ def _build_agent_tools_runtime_config(
     host_codex_dir: Path,
     agent_tools_env: dict[str, str],
     agent_provider: agent_providers.AgentProvider,
+    container_home: str,
 ) -> Path:
     from agent_hub import server as hub_server
 
@@ -587,6 +588,14 @@ def _build_agent_tools_runtime_config(
     if not agent_tools_token:
         raise click.ClickException(f"Missing required {AGENT_TOOLS_TOKEN_ENV} for agent_tools MCP runtime config.")
 
+    container_home = str(PurePosixPath(agent_provider.get_mcp_config_mount_target("/")).parent.parent)
+    mcp_script_path = str(
+        PurePosixPath(container_home)
+        / ".codex"
+        / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME
+        / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
+    )
+
     merged_config = agent_provider.build_mcp_config(
         base_config_text=base_config,
         mcp_env={
@@ -595,7 +604,7 @@ def _build_agent_tools_runtime_config(
             AGENT_TOOLS_PROJECT_ID_ENV: str(agent_tools_env.get(AGENT_TOOLS_PROJECT_ID_ENV) or '').strip(),
             AGENT_TOOLS_CHAT_ID_ENV: str(agent_tools_env.get(AGENT_TOOLS_CHAT_ID_ENV) or '').strip(),
         },
-        script_path=AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH,
+        script_path=mcp_script_path,
     )
 
     ext = ".json" if isinstance(agent_provider, agent_providers.ClaudeProvider) else ".toml"
@@ -615,6 +624,7 @@ def _start_agent_tools_runtime_bridge(
     system_prompt_path: Path,
     parsed_env_vars: list[str],
     agent_provider: agent_providers.AgentProvider,
+    container_home: str,
 ) -> _AgentToolsRuntimeBridge | None:
     if AGENT_TOOLS_URL_ENV in _env_var_keys(parsed_env_vars) or AGENT_TOOLS_TOKEN_ENV in _env_var_keys(parsed_env_vars):
         keys = _env_var_keys(parsed_env_vars)
@@ -627,6 +637,7 @@ def _start_agent_tools_runtime_bridge(
             host_codex_dir=host_codex_dir,
             agent_tools_env=_agent_tools_env_from_entries(parsed_env_vars),
             agent_provider=agent_provider,
+            container_home=container_home,
         )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
@@ -769,6 +780,7 @@ def _start_agent_tools_runtime_bridge(
             host_codex_dir=host_codex_dir,
             agent_tools_env=_agent_tools_env_from_entries(env_vars),
             agent_provider=agent_provider,
+            container_home=container_home,
         )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
@@ -1866,6 +1878,7 @@ def main(
             system_prompt_path=system_prompt_path,
             parsed_env_vars=parsed_env_vars,
             agent_provider=agent_provider,
+            container_home=container_home_path,
         )
         if runtime_bridge is not None:
             runtime_run_args = list(run_args)
