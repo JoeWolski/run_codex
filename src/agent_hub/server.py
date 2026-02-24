@@ -7142,7 +7142,7 @@ class HubState:
         if not config_text:
             return ""
         escaped_name = re.escape(server_name)
-        pattern = re.compile(r"(?ms)^\[mcp_servers\." + escaped_name + r"\]\n.*?(?=^\[|\Z)")
+        pattern = re.compile(r"(?ms)^\[mcp_servers\." + escaped_name + r"(?:\.[^\]]+)?\]\n.*?(?=^\[|\Z)")
         stripped = re.sub(pattern, "", config_text)
         return stripped.rstrip() + "\n"
 
@@ -7559,8 +7559,8 @@ class HubState:
             "available_credentials": self._project_available_credentials(project),
             "effective_credential_ids": self._resolve_agent_tools_credential_ids(
                 project,
-                PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
-                [],
+                binding["mode"],
+                binding["credential_ids"],
             ),
         }
 

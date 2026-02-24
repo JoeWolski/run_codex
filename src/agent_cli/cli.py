@@ -424,7 +424,7 @@ def _strip_mcp_server_table(config_text: str, server_name: str) -> str:
     if not config_text:
         return ""
     escaped_name = re.escape(server_name)
-    pattern = re.compile(r"(?ms)^\[mcp_servers\." + escaped_name + r"\]\n.*?(?=^\[|\Z)")
+    pattern = re.compile(r"(?ms)^\[mcp_servers\." + escaped_name + r"(?:\.[^\]]+)?\]\n.*?(?=^\[|\Z)")
     stripped = re.sub(pattern, "", config_text)
     return stripped.rstrip() + "\n"
 
