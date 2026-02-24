@@ -216,12 +216,15 @@ CHAT_STATUS_FAILED = "failed"
 CHAT_STATUS_REASON_CHAT_CREATED = "chat_created"
 CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED = "chat_close_requested"
 CHAT_STATUS_REASON_USER_CLOSED_TAB = "user_closed_tab"
+CHAT_STATUS_REASON_STARTUP_RECONCILE_ORPHAN_PROCESS = "startup_reconcile_orphan_process"
+CHAT_STATUS_REASON_STARTUP_RECONCILE_PROCESS_MISSING = "startup_reconcile_process_missing"
 SUPPORTED_CHAT_STATUSES = {
     CHAT_STATUS_STARTING,
     CHAT_STATUS_RUNNING,
     CHAT_STATUS_STOPPED,
     CHAT_STATUS_FAILED,
 }
+STARTUP_STALE_DOCKER_CONTAINER_PREFIXES = ("agent-setup-", "agent-hub-openai-login-")
 CHAT_TITLE_API_TIMEOUT_SECONDS = 8.0
 CHAT_TITLE_CODEX_TIMEOUT_SECONDS = 25.0
 CHAT_TITLE_OPENAI_MODEL = os.environ.get("AGENT_HUB_CHAT_TITLE_MODEL", "gpt-4.1-mini")
@@ -2983,6 +2986,59 @@ def _docker_remove_images(prefixes: tuple[str, ...], explicit_tags: set[str]) ->
     )
 
 
+def _docker_remove_stale_containers(prefixes: tuple[str, ...]) -> int:
+    normalized_prefixes = tuple(str(prefix or "").strip() for prefix in prefixes if str(prefix or "").strip())
+    if not normalized_prefixes:
+        return 0
+    if shutil.which("docker") is None:
+        return 0
+
+    try:
+        list_result = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except OSError:
+        return 0
+    if list_result.returncode != 0:
+        return 0
+
+    stale_names: set[str] = set()
+    for raw_line in list_result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "\t" in line:
+            name, state = line.split("\t", 1)
+        else:
+            name, state = line, ""
+        normalized_name = str(name or "").strip()
+        normalized_state = str(state or "").strip().lower()
+        if not normalized_name:
+            continue
+        if not any(normalized_name.startswith(prefix) for prefix in normalized_prefixes):
+            continue
+        if normalized_state in {"running", "restarting", "paused"}:
+            continue
+        stale_names.add(normalized_name)
+
+    if not stale_names:
+        return 0
+
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", *sorted(stale_names)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return 0
+    return len(stale_names)
+
+
 def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
     if not path.exists():
         return
@@ -3228,6 +3284,9 @@ class HubState:
         self._agent_capabilities_lock = Lock()
         self._agent_capabilities = _default_agent_capabilities_cache_payload()
         self._agent_capabilities_discovery_thread: Thread | None = None
+        self._startup_reconcile_lock = Lock()
+        self._startup_reconcile_thread: Thread | None = None
+        self._startup_reconcile_scheduled = False
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
@@ -7762,6 +7821,207 @@ class HubState:
             raise HTTPException(status_code=400, detail="Invalid terminal resize request.") from exc
         _signal_process_group_winch(int(runtime.process.pid))
 
+    def _delete_fs_entry(self, path: Path) -> None:
+        if path.is_symlink():
+            try:
+                path.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to delete symlink {path}: {exc}") from exc
+        if not path.exists():
+            return
+        if path.is_dir():
+            self._delete_path(path)
+            return
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to delete file {path}: {exc}") from exc
+
+    def _managed_chat_workspace_paths(self, state: dict[str, Any]) -> set[Path]:
+        managed_paths: set[Path] = set()
+        chat_root = self.chat_dir.resolve()
+        chats = state.get("chats")
+        if not isinstance(chats, dict):
+            return managed_paths
+
+        for chat_id, chat in chats.items():
+            if not isinstance(chat, dict):
+                continue
+            workspace = Path(str(chat.get("workspace") or self.chat_dir / str(chat_id)))
+            try:
+                resolved_workspace = workspace.resolve()
+                resolved_workspace.relative_to(chat_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            managed_paths.add(resolved_workspace)
+        return managed_paths
+
+    def _managed_project_workspace_paths(self, state: dict[str, Any]) -> set[Path]:
+        managed_paths: set[Path] = set()
+        project_root = self.project_dir.resolve()
+        projects = state.get("projects")
+        if not isinstance(projects, dict):
+            return managed_paths
+
+        for project_id in projects.keys():
+            workspace = self.project_workdir(str(project_id))
+            try:
+                resolved_workspace = workspace.resolve()
+                resolved_workspace.relative_to(project_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            managed_paths.add(resolved_workspace)
+        return managed_paths
+
+    def _remove_orphan_children(self, root_dir: Path, managed_paths: set[Path]) -> int:
+        if not root_dir.exists():
+            return 0
+        removed = 0
+        for child in root_dir.iterdir():
+            try:
+                resolved_child = child.resolve()
+            except (OSError, RuntimeError):
+                resolved_child = child
+            if resolved_child in managed_paths:
+                continue
+            self._delete_fs_entry(child)
+            removed += 1
+        return removed
+
+    def _remove_orphan_log_entries(self, state: dict[str, Any]) -> int:
+        if not self.log_dir.exists():
+            return 0
+        expected_log_names: set[str] = set()
+        projects = state.get("projects")
+        if isinstance(projects, dict):
+            for project_id in projects.keys():
+                expected_log_names.add(f"project-{project_id}.log")
+        chats = state.get("chats")
+        if isinstance(chats, dict):
+            for chat_id in chats.keys():
+                expected_log_names.add(f"{chat_id}.log")
+
+        removed = 0
+        for entry in self.log_dir.iterdir():
+            if entry.name in expected_log_names and entry.is_file():
+                continue
+            self._delete_fs_entry(entry)
+            removed += 1
+        return removed
+
+    def _reconcile_startup_chat_runtime_state(self, state: dict[str, Any]) -> tuple[int, int, bool]:
+        chats = state.get("chats")
+        if not isinstance(chats, dict):
+            return 0, 0, False
+
+        stopped_chat_processes = 0
+        reconciled_chats = 0
+        changed = False
+        for chat_id, chat in chats.items():
+            if not isinstance(chat, dict):
+                continue
+            pid = chat.get("pid")
+            has_pid = isinstance(pid, int)
+            process_running = bool(has_pid and _is_process_running(pid))
+            if process_running and isinstance(pid, int):
+                _stop_process(pid)
+                stopped_chat_processes += 1
+
+            normalized_status = _normalize_chat_status(chat.get("status"))
+            status_requires_failure = normalized_status in {CHAT_STATUS_RUNNING, CHAT_STATUS_STARTING}
+            if not has_pid and not status_requires_failure:
+                continue
+
+            if status_requires_failure:
+                self._transition_chat_status(
+                    chat_id,
+                    chat,
+                    CHAT_STATUS_FAILED,
+                    CHAT_STATUS_REASON_STARTUP_RECONCILE_ORPHAN_PROCESS
+                    if has_pid
+                    else CHAT_STATUS_REASON_STARTUP_RECONCILE_PROCESS_MISSING,
+                )
+                if not str(chat.get("start_error") or "").strip():
+                    chat["start_error"] = (
+                        "Recovered from stale chat runtime state during startup."
+                        if has_pid
+                        else "Chat runtime process was missing during startup reconciliation."
+                    )
+
+            if has_pid:
+                chat["pid"] = None
+                chat["last_exit_code"] = _normalize_optional_int(chat.get("last_exit_code"))
+                chat["last_exit_at"] = _iso_now()
+            else:
+                chat["last_exit_code"] = _normalize_optional_int(chat.get("last_exit_code"))
+                if not str(chat.get("last_exit_at") or "").strip():
+                    chat["last_exit_at"] = _iso_now()
+            chat["artifact_publish_token_hash"] = ""
+            chat["artifact_publish_token_issued_at"] = ""
+            chat["stop_requested_at"] = ""
+            chat["updated_at"] = _iso_now()
+            state["chats"][chat_id] = chat
+            changed = True
+            reconciled_chats += 1
+        return stopped_chat_processes, reconciled_chats, changed
+
+    def startup_reconcile(self) -> dict[str, int]:
+        state = self.load()
+        stopped_chat_processes, reconciled_chats, state_changed = self._reconcile_startup_chat_runtime_state(state)
+        if state_changed:
+            self.save(state, reason="startup_reconcile")
+
+        removed_orphan_chat_paths = self._remove_orphan_children(
+            self.chat_dir,
+            self._managed_chat_workspace_paths(state),
+        )
+        removed_orphan_project_paths = self._remove_orphan_children(
+            self.project_dir,
+            self._managed_project_workspace_paths(state),
+        )
+        removed_orphan_log_entries = self._remove_orphan_log_entries(state)
+        removed_stale_docker_containers = _docker_remove_stale_containers(STARTUP_STALE_DOCKER_CONTAINER_PREFIXES)
+
+        return {
+            "stopped_chat_processes": stopped_chat_processes,
+            "reconciled_chats": reconciled_chats,
+            "removed_orphan_chat_paths": removed_orphan_chat_paths,
+            "removed_orphan_project_paths": removed_orphan_project_paths,
+            "removed_orphan_log_entries": removed_orphan_log_entries,
+            "removed_stale_docker_containers": removed_stale_docker_containers,
+        }
+
+    def _startup_reconcile_worker(self) -> None:
+        try:
+            summary = self.startup_reconcile()
+        except Exception:
+            LOGGER.exception("Startup reconciliation failed.")
+            return
+        LOGGER.info(
+            "Startup reconciliation completed: "
+            "stopped_chat_processes=%d reconciled_chats=%d "
+            "removed_orphan_chat_paths=%d removed_orphan_project_paths=%d "
+            "removed_orphan_log_entries=%d removed_stale_docker_containers=%d",
+            summary["stopped_chat_processes"],
+            summary["reconciled_chats"],
+            summary["removed_orphan_chat_paths"],
+            summary["removed_orphan_project_paths"],
+            summary["removed_orphan_log_entries"],
+            summary["removed_stale_docker_containers"],
+        )
+
+    def schedule_startup_reconcile(self) -> None:
+        with self._startup_reconcile_lock:
+            if self._startup_reconcile_scheduled:
+                return
+            self._startup_reconcile_scheduled = True
+            worker = Thread(target=self._startup_reconcile_worker, daemon=True, name="agent-hub-startup-reconcile")
+            self._startup_reconcile_thread = worker
+            worker.start()
+
     def clean_start(self) -> dict[str, int]:
         self.cancel_openai_account_login()
         state = self.load()
@@ -9215,6 +9475,7 @@ def main(
             f"projects_reset={summary['projects_reset']} "
             f"docker_images_requested={summary['docker_images_requested']}"
         )
+    state.schedule_startup_reconcile()
 
     app = FastAPI()
     frontend_dist = _frontend_dist_dir()

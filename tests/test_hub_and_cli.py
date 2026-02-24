@@ -2845,6 +2845,150 @@ Gemini CLI
         self.assertIn("project-snapshot", tags)
         self.assertIn("chat-snapshot", tags)
 
+    def test_startup_reconcile_resets_orphaned_chat_runtime_and_removes_orphan_paths(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        managed_chat_workspace = self.state.chat_workdir(chat["id"])
+        managed_project_workspace = self.state.project_workdir(project["id"])
+        orphan_chat_workspace = self.state.chat_dir / "orphan-chat-workspace"
+        orphan_project_workspace = self.state.project_dir / "orphan-project-workspace"
+        orphan_log = self.state.log_dir / "orphan-entry.log"
+
+        managed_chat_workspace.mkdir(parents=True, exist_ok=True)
+        managed_project_workspace.mkdir(parents=True, exist_ok=True)
+        orphan_chat_workspace.mkdir(parents=True, exist_ok=True)
+        orphan_project_workspace.mkdir(parents=True, exist_ok=True)
+        self.state.chat_log(chat["id"]).write_text("chat log\n", encoding="utf-8")
+        self.state.project_build_log(project["id"]).write_text("project log\n", encoding="utf-8")
+        orphan_log.write_text("orphan\n", encoding="utf-8")
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = hub_server.CHAT_STATUS_RUNNING
+        state_data["chats"][chat["id"]]["pid"] = 4242
+        self.state.save(state_data)
+
+        with patch(
+            "agent_hub.server._is_process_running",
+            side_effect=lambda pid: pid == 4242,
+        ), patch(
+            "agent_hub.server._stop_process",
+        ) as stop_process, patch(
+            "agent_hub.server._docker_remove_stale_containers",
+            return_value=3,
+        ) as remove_stale_containers:
+            summary = self.state.startup_reconcile()
+
+        stop_process.assert_called_once_with(4242)
+        remove_stale_containers.assert_called_once_with(hub_server.STARTUP_STALE_DOCKER_CONTAINER_PREFIXES)
+        self.assertEqual(summary["stopped_chat_processes"], 1)
+        self.assertEqual(summary["reconciled_chats"], 1)
+        self.assertEqual(summary["removed_orphan_chat_paths"], 1)
+        self.assertEqual(summary["removed_orphan_project_paths"], 1)
+        self.assertEqual(summary["removed_orphan_log_entries"], 1)
+        self.assertEqual(summary["removed_stale_docker_containers"], 3)
+
+        reloaded = self.state.load()
+        reconciled_chat = reloaded["chats"][chat["id"]]
+        self.assertEqual(reconciled_chat["status"], hub_server.CHAT_STATUS_FAILED)
+        self.assertEqual(reconciled_chat["status_reason"], hub_server.CHAT_STATUS_REASON_STARTUP_RECONCILE_ORPHAN_PROCESS)
+        self.assertEqual(
+            reconciled_chat["start_error"],
+            "Recovered from stale chat runtime state during startup.",
+        )
+        self.assertIsNone(reconciled_chat["pid"])
+        self.assertEqual(reconciled_chat["artifact_publish_token_hash"], "")
+        self.assertEqual(reconciled_chat["artifact_publish_token_issued_at"], "")
+        self.assertEqual(reconciled_chat["stop_requested_at"], "")
+        self.assertTrue(str(reconciled_chat["last_exit_at"]).strip())
+
+        self.assertTrue(managed_chat_workspace.exists())
+        self.assertTrue(managed_project_workspace.exists())
+        self.assertFalse(orphan_chat_workspace.exists())
+        self.assertFalse(orphan_project_workspace.exists())
+        self.assertFalse(orphan_log.exists())
+
+    def test_startup_reconcile_marks_starting_chat_failed_when_pid_is_missing(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = hub_server.CHAT_STATUS_STARTING
+        state_data["chats"][chat["id"]]["pid"] = None
+        self.state.save(state_data)
+
+        with patch("agent_hub.server._docker_remove_stale_containers", return_value=0):
+            summary = self.state.startup_reconcile()
+
+        self.assertEqual(summary["stopped_chat_processes"], 0)
+        self.assertEqual(summary["reconciled_chats"], 1)
+        reloaded = self.state.load()
+        reconciled_chat = reloaded["chats"][chat["id"]]
+        self.assertEqual(reconciled_chat["status"], hub_server.CHAT_STATUS_FAILED)
+        self.assertEqual(
+            reconciled_chat["status_reason"],
+            hub_server.CHAT_STATUS_REASON_STARTUP_RECONCILE_PROCESS_MISSING,
+        )
+        self.assertEqual(
+            reconciled_chat["start_error"],
+            "Chat runtime process was missing during startup reconciliation.",
+        )
+        self.assertTrue(str(reconciled_chat["last_exit_at"]).strip())
+
+    def test_docker_remove_stale_containers_removes_only_prefixed_non_running_containers(self) -> None:
+        list_result = subprocess.CompletedProcess(
+            ["docker", "ps", "-a", "--format", "{{.Names}}\\t{{.State}}"],
+            0,
+            "\n".join(
+                [
+                    "agent-setup-demo-abc\texited",
+                    "agent-hub-openai-login-def\trunning",
+                    "agent-hub-openai-login-ghi\tdead",
+                    "unrelated-container\texited",
+                ]
+            ),
+            "",
+        )
+        remove_result = subprocess.CompletedProcess(
+            ["docker", "rm", "-f", "agent-hub-openai-login-ghi", "agent-setup-demo-abc"],
+            0,
+            "",
+            "",
+        )
+
+        with patch("agent_hub.server.shutil.which", return_value="/usr/bin/docker"), patch(
+            "agent_hub.server.subprocess.run",
+            side_effect=[list_result, remove_result],
+        ) as run_mock:
+            removed = hub_server._docker_remove_stale_containers(hub_server.STARTUP_STALE_DOCKER_CONTAINER_PREFIXES)
+
+        self.assertEqual(removed, 2)
+        self.assertEqual(run_mock.call_count, 2)
+        rm_call_cmd = run_mock.call_args_list[1].args[0]
+        self.assertEqual(
+            rm_call_cmd,
+            ["docker", "rm", "-f", "agent-hub-openai-login-ghi", "agent-setup-demo-abc"],
+        )
+
     def test_ensure_project_setup_snapshot_builds_once(self) -> None:
         self._connect_github_app()
         project = self.state.add_project(
