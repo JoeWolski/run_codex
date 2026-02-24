@@ -1,15 +1,15 @@
 :root {
   color-scheme: light;
-  --bg-primary: #f7f7f8;
+  --bg-primary: #f4f7fb;
   --bg-surface: #ffffff;
-  --bg-surface-muted: #fafafa;
-  --bg-muted: #f3f4f6;
-  --bg-entry-hover: rgba(17, 24, 39, 0.03);
-  --text-primary: #111111;
-  --text-secondary: #6b7280;
-  --text-subtle: #9ca3af;
-  --border: #e5e7eb;
-  --border-strong: #d1d5db;
+  --bg-surface-muted: #f7f9fc;
+  --bg-muted: #edf2f8;
+  --bg-entry-hover: rgba(15, 23, 42, 0.05);
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-subtle: #64748b;
+  --border: #dbe3ed;
+  --border-strong: #c5d0de;
   --accent: #10a37f;
   --accent-hover: #0f8f70;
   --accent-soft: rgba(16, 163, 127, 0.16);
@@ -24,9 +24,59 @@
   --warning-border: #fed7aa;
   --ok-soft: #ecfdf3;
   --warn-soft: #fff7ed;
-  --header-bg: rgba(247, 247, 248, 0.94);
-  --log-bg: #f9fafb;
-  --log-text: #111827;
+  --header-bg: rgba(244, 247, 251, 0.94);
+  --log-bg: #f6f9fd;
+  --log-text: #0f172a;
+  --status-running-text: #0f5132;
+  --status-running-bg: #ecfdf3;
+  --status-running-border: #a7f3d0;
+  --status-starting-text: #065f46;
+  --status-starting-bg: #ecfdf8;
+  --status-starting-border: #b7ece0;
+  --status-stopped-text: #334155;
+  --status-stopped-bg: #e8eef6;
+  --status-stopped-border: #cbd5e1;
+  --status-failed-text: #7f1d1d;
+  --status-failed-bg: #fef3f2;
+  --status-failed-border: #fecaca;
+  --terminal-shell-border: #c6d4e3;
+  --terminal-shell-bg: #f8fbff;
+  --terminal-toolbar-border: rgba(15, 23, 42, 0.09);
+  --terminal-toolbar-bg: rgba(255, 255, 255, 0.78);
+  --terminal-title-color: #334155;
+  --terminal-tab-text: #526174;
+  --terminal-tab-text-active: #0f172a;
+  --terminal-tab-hover-bg: rgba(71, 85, 105, 0.14);
+  --terminal-tab-hover-border: rgba(71, 85, 105, 0.24);
+  --terminal-tab-selected-bg: rgba(71, 85, 105, 0.2);
+  --terminal-tab-selected-border: rgba(71, 85, 105, 0.3);
+  --terminal-tab-focus-ring: rgba(71, 85, 105, 0.24);
+  --terminal-toolbar-icon: #526174;
+  --terminal-toolbar-icon-hover: #0f172a;
+  --terminal-toolbar-icon-hover-border: rgba(71, 85, 105, 0.3);
+  --terminal-toolbar-icon-hover-bg: rgba(71, 85, 105, 0.14);
+  --terminal-toolbar-icon-focus-ring: rgba(71, 85, 105, 0.3);
+  --terminal-helper-border: rgba(180, 83, 9, 0.34);
+  --terminal-helper-bg: rgba(245, 158, 11, 0.2);
+  --terminal-helper-text: #92400e;
+  --terminal-helper-border-hover: rgba(180, 83, 9, 0.46);
+  --terminal-helper-bg-hover: rgba(245, 158, 11, 0.26);
+  --terminal-helper-text-hover: #78350f;
+  --terminal-status-idle-bg: #64748b;
+  --terminal-status-idle-shadow: 0 0 0 1px rgba(100, 116, 139, 0.5);
+  --terminal-status-running-bg: #10b981;
+  --terminal-status-running-shadow: 0 0 0 1px rgba(16, 185, 129, 0.45), 0 0 10px rgba(16, 185, 129, 0.28);
+  --terminal-status-starting-bg: #14b8a6;
+  --terminal-status-starting-shadow: 0 0 0 1px rgba(20, 184, 166, 0.45), 0 0 10px rgba(20, 184, 166, 0.28);
+  --terminal-status-error-bg: #e11d48;
+  --terminal-status-error-shadow: 0 0 0 1px rgba(225, 29, 72, 0.45), 0 0 10px rgba(225, 29, 72, 0.26);
+  --terminal-tabset-border: #c6d4e3;
+  --terminal-tabset-bg: rgba(239, 245, 252, 0.98);
+  --terminal-tab-close: #64748b;
+  --terminal-tab-close-bg: rgba(100, 116, 139, 0.2);
+  --terminal-tab-close-bg-unselected: rgba(100, 116, 139, 0.12);
+  --terminal-overlay-bg: rgba(15, 23, 42, 0.28);
+  --terminal-overlay-spinner-border: rgba(255, 255, 255, 0.48);
   --radius-sm: 8px;
   --radius-md: 10px;
   --radius-lg: 12px;
@@ -72,21 +122,71 @@
     --header-bg: rgba(14, 16, 19, 0.9);
     --log-bg: #11161d;
     --log-text: #d6dde6;
+    --status-running-text: #86efac;
+    --status-running-bg: rgba(34, 197, 94, 0.2);
+    --status-running-border: rgba(34, 197, 94, 0.4);
+    --status-starting-text: #5eead4;
+    --status-starting-bg: rgba(20, 184, 166, 0.18);
+    --status-starting-border: rgba(20, 184, 166, 0.36);
+    --status-stopped-text: #cbd5e1;
+    --status-stopped-bg: rgba(148, 163, 184, 0.16);
+    --status-stopped-border: rgba(148, 163, 184, 0.3);
+    --status-failed-text: #fca5a5;
+    --status-failed-bg: rgba(239, 68, 68, 0.18);
+    --status-failed-border: rgba(239, 68, 68, 0.34);
+    --terminal-shell-border: #0f172a;
+    --terminal-shell-bg: #0f172a;
+    --terminal-toolbar-border: rgba(255, 255, 255, 0.08);
+    --terminal-toolbar-bg: rgba(255, 255, 255, 0.04);
+    --terminal-title-color: #cbd5e1;
+    --terminal-tab-text: #94a3b8;
+    --terminal-tab-text-active: #e2e8f0;
+    --terminal-tab-hover-bg: rgba(148, 163, 184, 0.14);
+    --terminal-tab-hover-border: rgba(148, 163, 184, 0.26);
+    --terminal-tab-selected-bg: rgba(148, 163, 184, 0.2);
+    --terminal-tab-selected-border: rgba(148, 163, 184, 0.32);
+    --terminal-tab-focus-ring: rgba(148, 163, 184, 0.24);
+    --terminal-toolbar-icon: #94a3b8;
+    --terminal-toolbar-icon-hover: #e2e8f0;
+    --terminal-toolbar-icon-hover-border: rgba(148, 163, 184, 0.32);
+    --terminal-toolbar-icon-hover-bg: rgba(148, 163, 184, 0.14);
+    --terminal-toolbar-icon-focus-ring: rgba(148, 163, 184, 0.28);
+    --terminal-helper-border: rgba(251, 191, 36, 0.38);
+    --terminal-helper-bg: rgba(251, 191, 36, 0.2);
+    --terminal-helper-text: #fef3c7;
+    --terminal-helper-border-hover: rgba(251, 191, 36, 0.52);
+    --terminal-helper-bg-hover: rgba(251, 191, 36, 0.26);
+    --terminal-helper-text-hover: #fef9c3;
+    --terminal-status-idle-bg: #94a3b8;
+    --terminal-status-idle-shadow: 0 0 0 1px rgba(148, 163, 184, 0.5);
+    --terminal-status-running-bg: #34d399;
+    --terminal-status-running-shadow: 0 0 0 1px rgba(52, 211, 153, 0.5), 0 0 12px rgba(52, 211, 153, 0.45);
+    --terminal-status-starting-bg: #2dd4bf;
+    --terminal-status-starting-shadow: 0 0 0 1px rgba(45, 212, 191, 0.5), 0 0 12px rgba(45, 212, 191, 0.45);
+    --terminal-status-error-bg: #fb7185;
+    --terminal-status-error-shadow: 0 0 0 1px rgba(251, 113, 133, 0.52), 0 0 12px rgba(251, 113, 133, 0.4);
+    --terminal-tabset-border: #0f172a;
+    --terminal-tabset-bg: rgba(15, 23, 42, 0.96);
+    --terminal-tab-close: #64748b;
+    --terminal-tab-close-bg: rgba(148, 163, 184, 0.18);
+    --terminal-tab-close-bg-unselected: rgba(148, 163, 184, 0.1);
+    --terminal-overlay-bg: rgba(15, 23, 42, 0.5);
+    --terminal-overlay-spinner-border: rgba(255, 255, 255, 0.28);
   }
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg-primary: #f7f7f8;
+  --bg-primary: #f4f7fb;
   --bg-surface: #ffffff;
-  --bg-surface-muted: #fafafa;
-  --bg-muted: #f3f4f6;
-  --bg-entry-hover: rgba(17, 24, 39, 0.03);
-  --text-primary: #111111;
-  --text-secondary: #6b7280;
-  --text-subtle: #9ca3af;
-  --border: #e5e7eb;
-  --border-strong: #d1d5db;
+  --bg-surface-muted: #f7f9fc;
+  --bg-muted: #edf2f8;
+  --bg-entry-hover: rgba(15, 23, 42, 0.05);
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-subtle: #64748b;
+  --border: #dbe3ed;
+  --border-strong: #c5d0de;
   --accent: #10a37f;
   --accent-hover: #0f8f70;
   --accent-soft: rgba(16, 163, 127, 0.16);
@@ -101,9 +201,59 @@
   --warning-border: #fed7aa;
   --ok-soft: #ecfdf3;
   --warn-soft: #fff7ed;
-  --header-bg: rgba(247, 247, 248, 0.94);
-  --log-bg: #f9fafb;
-  --log-text: #111827;
+  --header-bg: rgba(244, 247, 251, 0.94);
+  --log-bg: #f6f9fd;
+  --log-text: #0f172a;
+  --status-running-text: #0f5132;
+  --status-running-bg: #ecfdf3;
+  --status-running-border: #a7f3d0;
+  --status-starting-text: #065f46;
+  --status-starting-bg: #ecfdf8;
+  --status-starting-border: #b7ece0;
+  --status-stopped-text: #334155;
+  --status-stopped-bg: #e8eef6;
+  --status-stopped-border: #cbd5e1;
+  --status-failed-text: #7f1d1d;
+  --status-failed-bg: #fef3f2;
+  --status-failed-border: #fecaca;
+  --terminal-shell-border: #c6d4e3;
+  --terminal-shell-bg: #f8fbff;
+  --terminal-toolbar-border: rgba(15, 23, 42, 0.09);
+  --terminal-toolbar-bg: rgba(255, 255, 255, 0.78);
+  --terminal-title-color: #334155;
+  --terminal-tab-text: #526174;
+  --terminal-tab-text-active: #0f172a;
+  --terminal-tab-hover-bg: rgba(71, 85, 105, 0.14);
+  --terminal-tab-hover-border: rgba(71, 85, 105, 0.24);
+  --terminal-tab-selected-bg: rgba(71, 85, 105, 0.2);
+  --terminal-tab-selected-border: rgba(71, 85, 105, 0.3);
+  --terminal-tab-focus-ring: rgba(71, 85, 105, 0.24);
+  --terminal-toolbar-icon: #526174;
+  --terminal-toolbar-icon-hover: #0f172a;
+  --terminal-toolbar-icon-hover-border: rgba(71, 85, 105, 0.3);
+  --terminal-toolbar-icon-hover-bg: rgba(71, 85, 105, 0.14);
+  --terminal-toolbar-icon-focus-ring: rgba(71, 85, 105, 0.3);
+  --terminal-helper-border: rgba(180, 83, 9, 0.34);
+  --terminal-helper-bg: rgba(245, 158, 11, 0.2);
+  --terminal-helper-text: #92400e;
+  --terminal-helper-border-hover: rgba(180, 83, 9, 0.46);
+  --terminal-helper-bg-hover: rgba(245, 158, 11, 0.26);
+  --terminal-helper-text-hover: #78350f;
+  --terminal-status-idle-bg: #64748b;
+  --terminal-status-idle-shadow: 0 0 0 1px rgba(100, 116, 139, 0.5);
+  --terminal-status-running-bg: #10b981;
+  --terminal-status-running-shadow: 0 0 0 1px rgba(16, 185, 129, 0.45), 0 0 10px rgba(16, 185, 129, 0.28);
+  --terminal-status-starting-bg: #14b8a6;
+  --terminal-status-starting-shadow: 0 0 0 1px rgba(20, 184, 166, 0.45), 0 0 10px rgba(20, 184, 166, 0.28);
+  --terminal-status-error-bg: #e11d48;
+  --terminal-status-error-shadow: 0 0 0 1px rgba(225, 29, 72, 0.45), 0 0 10px rgba(225, 29, 72, 0.26);
+  --terminal-tabset-border: #c6d4e3;
+  --terminal-tabset-bg: rgba(239, 245, 252, 0.98);
+  --terminal-tab-close: #64748b;
+  --terminal-tab-close-bg: rgba(100, 116, 139, 0.2);
+  --terminal-tab-close-bg-unselected: rgba(100, 116, 139, 0.12);
+  --terminal-overlay-bg: rgba(15, 23, 42, 0.28);
+  --terminal-overlay-spinner-border: rgba(255, 255, 255, 0.48);
 }
 
 :root[data-theme="dark"] {
@@ -135,6 +285,56 @@
   --header-bg: rgba(14, 16, 19, 0.9);
   --log-bg: #11161d;
   --log-text: #d6dde6;
+  --status-running-text: #86efac;
+  --status-running-bg: rgba(34, 197, 94, 0.2);
+  --status-running-border: rgba(34, 197, 94, 0.4);
+  --status-starting-text: #5eead4;
+  --status-starting-bg: rgba(20, 184, 166, 0.18);
+  --status-starting-border: rgba(20, 184, 166, 0.36);
+  --status-stopped-text: #cbd5e1;
+  --status-stopped-bg: rgba(148, 163, 184, 0.16);
+  --status-stopped-border: rgba(148, 163, 184, 0.3);
+  --status-failed-text: #fca5a5;
+  --status-failed-bg: rgba(239, 68, 68, 0.18);
+  --status-failed-border: rgba(239, 68, 68, 0.34);
+  --terminal-shell-border: #0f172a;
+  --terminal-shell-bg: #0f172a;
+  --terminal-toolbar-border: rgba(255, 255, 255, 0.08);
+  --terminal-toolbar-bg: rgba(255, 255, 255, 0.04);
+  --terminal-title-color: #cbd5e1;
+  --terminal-tab-text: #94a3b8;
+  --terminal-tab-text-active: #e2e8f0;
+  --terminal-tab-hover-bg: rgba(148, 163, 184, 0.14);
+  --terminal-tab-hover-border: rgba(148, 163, 184, 0.26);
+  --terminal-tab-selected-bg: rgba(148, 163, 184, 0.2);
+  --terminal-tab-selected-border: rgba(148, 163, 184, 0.32);
+  --terminal-tab-focus-ring: rgba(148, 163, 184, 0.24);
+  --terminal-toolbar-icon: #94a3b8;
+  --terminal-toolbar-icon-hover: #e2e8f0;
+  --terminal-toolbar-icon-hover-border: rgba(148, 163, 184, 0.32);
+  --terminal-toolbar-icon-hover-bg: rgba(148, 163, 184, 0.14);
+  --terminal-toolbar-icon-focus-ring: rgba(148, 163, 184, 0.28);
+  --terminal-helper-border: rgba(251, 191, 36, 0.38);
+  --terminal-helper-bg: rgba(251, 191, 36, 0.2);
+  --terminal-helper-text: #fef3c7;
+  --terminal-helper-border-hover: rgba(251, 191, 36, 0.52);
+  --terminal-helper-bg-hover: rgba(251, 191, 36, 0.26);
+  --terminal-helper-text-hover: #fef9c3;
+  --terminal-status-idle-bg: #94a3b8;
+  --terminal-status-idle-shadow: 0 0 0 1px rgba(148, 163, 184, 0.5);
+  --terminal-status-running-bg: #34d399;
+  --terminal-status-running-shadow: 0 0 0 1px rgba(52, 211, 153, 0.5), 0 0 12px rgba(52, 211, 153, 0.45);
+  --terminal-status-starting-bg: #2dd4bf;
+  --terminal-status-starting-shadow: 0 0 0 1px rgba(45, 212, 191, 0.5), 0 0 12px rgba(45, 212, 191, 0.45);
+  --terminal-status-error-bg: #fb7185;
+  --terminal-status-error-shadow: 0 0 0 1px rgba(251, 113, 133, 0.52), 0 0 12px rgba(251, 113, 133, 0.4);
+  --terminal-tabset-border: #0f172a;
+  --terminal-tabset-bg: rgba(15, 23, 42, 0.96);
+  --terminal-tab-close: #64748b;
+  --terminal-tab-close-bg: rgba(148, 163, 184, 0.18);
+  --terminal-tab-close-bg-unselected: rgba(148, 163, 184, 0.1);
+  --terminal-overlay-bg: rgba(15, 23, 42, 0.5);
+  --terminal-overlay-spinner-border: rgba(255, 255, 255, 0.28);
 }
 
 * {
@@ -1041,31 +1241,31 @@ button:focus-visible {
 .status.running,
 .project-build-state.ready,
 .connection-pill.connected {
-  color: #0f5132;
-  background: var(--ok-soft);
-  border-color: #a7f3d0;
+  color: var(--status-running-text);
+  background: var(--status-running-bg);
+  border-color: var(--status-running-border);
 }
 
 .status.starting,
 .project-build-state.building {
-  color: #065f46;
-  background: #ecfdf8;
-  border-color: #b7ece0;
+  color: var(--status-starting-text);
+  background: var(--status-starting-bg);
+  border-color: var(--status-starting-border);
 }
 
 .status.stopped,
 .project-build-state.pending,
 .connection-pill.disconnected {
-  color: #374151;
-  background: #f3f4f6;
-  border-color: #d1d5db;
+  color: var(--status-stopped-text);
+  background: var(--status-stopped-bg);
+  border-color: var(--status-stopped-border);
 }
 
 .status.failed,
 .project-build-state.failed {
-  color: #7f1d1d;
-  background: var(--danger-soft);
-  border-color: #fecaca;
+  color: var(--status-failed-text);
+  background: var(--status-failed-bg);
+  border-color: var(--status-failed-border);
 }
 
 .chat-card-header {
@@ -1135,15 +1335,15 @@ button:focus-visible {
 }
 
 .chat-title-state.pending {
-  color: #065f46;
-  border-color: #b7ece0;
-  background: #ecfdf8;
+  color: var(--status-starting-text);
+  border-color: var(--status-starting-border);
+  background: var(--status-starting-bg);
 }
 
 .chat-title-state.error {
-  color: #7f1d1d;
-  border-color: #fecaca;
-  background: var(--danger-soft);
+  color: var(--status-failed-text);
+  border-color: var(--status-failed-border);
+  background: var(--status-failed-bg);
 }
 
 .chat-summary {
@@ -1494,7 +1694,7 @@ button:focus-visible {
   max-height: calc(100dvh - 180px);
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
-  background: #0b1018;
+  background: var(--terminal-shell-bg);
   object-fit: contain;
 }
 
@@ -1535,31 +1735,31 @@ button:focus-visible {
 }
 
 .terminal-toolbar-actions .chat-header-icon {
-  color: #94a3b8;
+  color: var(--terminal-toolbar-icon);
   border-color: transparent;
   background: transparent;
 }
 
 .terminal-toolbar-actions .chat-header-icon:hover {
-  color: #e2e8f0;
-  border-color: rgba(148, 163, 184, 0.32);
-  background: rgba(148, 163, 184, 0.14);
+  color: var(--terminal-toolbar-icon-hover);
+  border-color: var(--terminal-toolbar-icon-hover-border);
+  background: var(--terminal-toolbar-icon-hover-bg);
 }
 
 .terminal-toolbar-actions .chat-header-icon:focus-visible {
-  box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.28);
+  box-shadow: 0 0 0 3px var(--terminal-toolbar-icon-focus-ring);
 }
 
 .terminal-toolbar-actions .chat-header-helper-button {
-  border-color: rgba(251, 191, 36, 0.38);
-  background: rgba(251, 191, 36, 0.2);
-  color: #fef3c7;
+  border-color: var(--terminal-helper-border);
+  background: var(--terminal-helper-bg);
+  color: var(--terminal-helper-text);
 }
 
 .terminal-toolbar-actions .chat-header-helper-button:hover {
-  border-color: rgba(251, 191, 36, 0.52);
-  background: rgba(251, 191, 36, 0.26);
-  color: #fef9c3;
+  border-color: var(--terminal-helper-border-hover);
+  background: var(--terminal-helper-bg-hover);
+  color: var(--terminal-helper-text-hover);
 }
 
 .chat-header-helper-button {
@@ -1876,10 +2076,10 @@ button:focus-visible {
 .chat-layout-project-shell .flexlayout__tabset_tabbar_outer_top {
   min-height: 38px;
   padding: 5px 8px 0;
-  border: 1px solid #0f172a;
+  border: 1px solid var(--terminal-tabset-border);
   border-bottom: 0;
   border-radius: var(--radius-md) var(--radius-md) 0 0;
-  background: rgba(15, 23, 42, 0.96);
+  background: var(--terminal-tabset-bg);
   pointer-events: none;
 }
 
@@ -1892,18 +2092,18 @@ button:focus-visible {
   min-height: 30px;
   padding: 4px 12px;
   border-radius: 8px 8px 0 0;
-  color: #94a3b8;
+  color: var(--terminal-tab-text);
 }
 
 .chat-layout-project-shell .flexlayout__tab_button:hover,
 .chat-layout-project-shell .flexlayout__tab_button--selected {
-  color: #e2e8f0;
-  background: rgba(148, 163, 184, 0.18);
-  border-color: rgba(148, 163, 184, 0.28);
+  color: var(--terminal-tab-text-active);
+  background: var(--terminal-tab-selected-bg);
+  border-color: var(--terminal-tab-selected-border);
 }
 
 .chat-layout-project-shell .flexlayout__tab_button--unselected {
-  color: #94a3b8;
+  color: var(--terminal-tab-text);
 }
 
 /* Use .chat-layout-project-shell prefix for higher specificity so the 10px
@@ -1950,9 +2150,9 @@ button:focus-visible {
   max-height: 10px;
   padding: 0;
   border-radius: 50%;
-  color: #64748b;
+  color: var(--terminal-tab-close);
   border-color: transparent;
-  background: rgba(148, 163, 184, 0.18);
+  background: var(--terminal-tab-close-bg);
   margin-left: 4px;
 }
 
@@ -1974,7 +2174,7 @@ button:focus-visible {
 
 .chat-layout-project-shell .flexlayout__tab_button--unselected .chat-flex-tab-close {
   opacity: 0.5;
-  background: rgba(148, 163, 184, 0.1);
+  background: var(--terminal-tab-close-bg-unselected);
 }
 
 .chat-layout-project-shell .flexlayout__tab_toolbar_sticky_buttons_container,
@@ -2121,9 +2321,9 @@ button:focus-visible {
 
 .terminal-shell {
   position: relative;
-  border: 1px solid #0f172a;
+  border: 1px solid var(--terminal-shell-border);
   border-radius: var(--radius-md) var(--radius-md) 0 0;
-  background: #0f172a;
+  background: var(--terminal-shell-bg);
   overflow: hidden;
 }
 
@@ -2146,8 +2346,8 @@ button:focus-visible {
   align-items: center;
   min-height: 38px;
   padding: 6px 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid var(--terminal-toolbar-border);
+  background: var(--terminal-toolbar-bg);
   gap: 10px;
 }
 
@@ -2177,7 +2377,7 @@ button:focus-visible {
   border: 1px solid transparent;
   border-radius: 8px 8px 0 0;
   background: transparent;
-  color: #94a3b8;
+  color: var(--terminal-tab-text);
   font: inherit;
   font-size: 0.75rem;
   line-height: 1.2;
@@ -2188,20 +2388,20 @@ button:focus-visible {
 }
 
 .terminal-toolbar-tab:hover {
-  color: #e2e8f0;
-  background: rgba(148, 163, 184, 0.14);
-  border-color: rgba(148, 163, 184, 0.26);
+  color: var(--terminal-tab-text-active);
+  background: var(--terminal-tab-hover-bg);
+  border-color: var(--terminal-tab-hover-border);
 }
 
 .terminal-toolbar-tab.selected {
-  color: #e2e8f0;
-  background: rgba(148, 163, 184, 0.2);
-  border-color: rgba(148, 163, 184, 0.32);
+  color: var(--terminal-tab-text-active);
+  background: var(--terminal-tab-selected-bg);
+  border-color: var(--terminal-tab-selected-border);
 }
 
 .terminal-toolbar-tab:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.24);
+  box-shadow: 0 0 0 3px var(--terminal-tab-focus-ring);
 }
 
 .terminal-toolbar-actions {
@@ -2221,7 +2421,7 @@ button:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #cbd5e1;
+  color: var(--terminal-title-color);
   font-size: 0.76rem;
   font-weight: 500;
 }
@@ -2230,8 +2430,8 @@ button:focus-visible {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: #94a3b8;
-  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.5);
+  background: var(--terminal-status-idle-bg);
+  box-shadow: var(--terminal-status-idle-shadow);
   cursor: help;
   transition: transform var(--transition-fast), background-color var(--transition-base),
     box-shadow var(--transition-base);
@@ -2245,61 +2445,29 @@ button:focus-visible {
 .terminal-health-dot.connected,
 .terminal-health-dot.ready,
 .terminal-health-dot.running {
-  background: #34d399;
-  box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.5), 0 0 12px rgba(52, 211, 153, 0.45);
+  background: var(--terminal-status-running-bg);
+  box-shadow: var(--terminal-status-running-shadow);
 }
 
 .terminal-health-dot.connecting,
 .terminal-health-dot.starting,
 .terminal-health-dot.building {
-  background: #2dd4bf;
-  box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.5), 0 0 12px rgba(45, 212, 191, 0.45);
+  background: var(--terminal-status-starting-bg);
+  box-shadow: var(--terminal-status-starting-shadow);
 }
 
 .terminal-health-dot.closed,
 .terminal-health-dot.offline,
 .terminal-health-dot.pending,
 .terminal-health-dot.stopped {
-  background: #94a3b8;
-  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.5);
+  background: var(--terminal-status-idle-bg);
+  box-shadow: var(--terminal-status-idle-shadow);
 }
 
 .terminal-health-dot.failed,
 .terminal-health-dot.error {
-  background: #fb7185;
-  box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.52), 0 0 12px rgba(251, 113, 133, 0.4);
-}
-
-@media (prefers-color-scheme: dark) {
-  .status.running,
-  .project-build-state.ready,
-  .connection-pill.connected {
-    color: #86efac;
-    background: rgba(34, 197, 94, 0.2);
-    border-color: rgba(34, 197, 94, 0.4);
-  }
-
-  .status.starting,
-  .project-build-state.building {
-    color: #5eead4;
-    background: rgba(20, 184, 166, 0.18);
-    border-color: rgba(20, 184, 166, 0.36);
-  }
-
-  .status.stopped,
-  .project-build-state.pending,
-  .connection-pill.disconnected {
-    color: #cbd5e1;
-    background: rgba(148, 163, 184, 0.16);
-    border-color: rgba(148, 163, 184, 0.3);
-  }
-
-  .status.failed,
-  .project-build-state.failed {
-    color: #fca5a5;
-    background: rgba(239, 68, 68, 0.18);
-    border-color: rgba(239, 68, 68, 0.34);
-  }
+  background: var(--terminal-status-error-bg);
+  box-shadow: var(--terminal-status-error-shadow);
 }
 
 .terminal-view {
@@ -2370,7 +2538,7 @@ button:focus-visible {
   inset: 0;
   display: grid;
   place-items: center;
-  background: rgba(15, 23, 42, 0.5);
+  background: var(--terminal-overlay-bg);
 }
 
 .project-build-shell {
@@ -2393,7 +2561,7 @@ button:focus-visible {
   width: 14px;
   height: 14px;
   border-radius: 999px;
-  border: 2px solid rgba(255, 255, 255, 0.28);
+  border: 2px solid var(--terminal-overlay-spinner-border);
   border-top-color: currentColor;
   animation: spin 0.8s linear infinite;
 }
@@ -2421,11 +2589,11 @@ button:focus-visible {
 }
 
 .callback-status.complete {
-  color: #0f5132;
+  color: var(--status-running-text);
 }
 
 .callback-status.error {
-  color: #b42318;
+  color: var(--status-failed-text);
 }
 
 @media (min-width: 760px) {

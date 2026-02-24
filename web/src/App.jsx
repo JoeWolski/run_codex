@@ -23,6 +23,7 @@ import {
 } from "./createProjectConfigMode";
 import { createFirstSeenOrderState, stableOrderItemsByFirstSeen } from "./stableListOrder";
 import { buildProjectChatFlexModels } from "./projectChatLayoutModels";
+import { terminalThemeForAppTheme } from "./theme";
 import {
   MdArchive,
   MdAudiotrack,
@@ -263,15 +264,19 @@ function normalizeThemePreference(value) {
   return "system";
 }
 
-function resolveEffectiveTheme(preference) {
+function resolveEffectiveTheme(preference, systemPrefersDark = false) {
   const normalized = normalizeThemePreference(preference);
   if (normalized === "light" || normalized === "dark") {
     return normalized;
   }
-  if (typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-    return "dark";
+  return systemPrefersDark ? "dark" : "light";
+}
+
+function detectSystemPrefersDark() {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return false;
   }
-  return "light";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches;
 }
 
 function loadThemePreference() {
@@ -912,11 +917,14 @@ function ChatTerminal({
   collapsed = false,
   tabs = [],
   activeTabId = "",
-  onTabSelect = null
+  onTabSelect = null,
+  effectiveTheme = "light"
 }) {
   const shellRef = useRef(null);
   const hostRef = useRef(null);
+  const terminalRef = useRef(null);
   const [status, setStatus] = useState(running ? "connecting" : "offline");
+  const terminalTheme = useMemo(() => terminalThemeForAppTheme(effectiveTheme), [effectiveTheme]);
   const statusText = String(status || "unknown").toLowerCase();
   const displayStatus = String(statusOverride || statusText || "unknown").toLowerCase();
   const hasTabs = Array.isArray(tabs) && tabs.length > 0;
@@ -937,16 +945,13 @@ function ChatTerminal({
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
       fontSize: 13,
       scrollback: 5000,
-      theme: {
-        background: "#0b1018",
-        foreground: "#e7edf7",
-        cursor: "#10a37f"
-      }
+      theme: terminalTheme
     });
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(new WebLinksAddon(openTerminalUrlInNewTab));
     terminal.open(hostRef.current);
+    terminalRef.current = terminal;
     fitAddon.fit();
     terminal.focus();
 
@@ -1102,9 +1107,17 @@ function ChatTerminal({
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
         ws.close();
       }
+      terminalRef.current = null;
       terminal.dispose();
     };
   }, [chatId, running]);
+
+  useEffect(() => {
+    if (!terminalRef.current) {
+      return;
+    }
+    terminalRef.current.options.theme = terminalTheme;
+  }, [terminalTheme]);
 
   const shellClasses = [
     "terminal-shell",
@@ -1182,10 +1195,17 @@ function ChatTerminal({
   );
 }
 
-function ProjectBuildTerminal({ text, title = "Image build output", shellClassName = "", viewClassName = "" }) {
+function ProjectBuildTerminal({
+  text,
+  title = "Image build output",
+  shellClassName = "",
+  viewClassName = "",
+  effectiveTheme = "light"
+}) {
   const hostRef = useRef(null);
   const terminalRef = useRef(null);
   const fitRef = useRef(null);
+  const terminalTheme = useMemo(() => terminalThemeForAppTheme(effectiveTheme), [effectiveTheme]);
   const shellClasses = ["terminal-shell", "project-build-shell", shellClassName].filter(Boolean).join(" ");
   const viewClasses = ["terminal-view", "project-build-view", viewClassName].filter(Boolean).join(" ");
 
@@ -1201,10 +1221,7 @@ function ProjectBuildTerminal({ text, title = "Image build output", shellClassNa
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, monospace",
       fontSize: 12,
       scrollback: 10000,
-      theme: {
-        background: "#0b1018",
-        foreground: "#e7edf7"
-      }
+      theme: terminalTheme
     });
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
@@ -1233,6 +1250,13 @@ function ProjectBuildTerminal({ text, title = "Image build output", shellClassNa
     terminal.scrollToBottom();
     fitRef.current?.fit();
   }, [text]);
+
+  useEffect(() => {
+    if (!terminalRef.current) {
+      return;
+    }
+    terminalRef.current.options.theme = terminalTheme;
+  }, [terminalTheme]);
 
   return (
     <div className={shellClasses}>
@@ -1663,6 +1687,7 @@ function HubApp() {
   const [pendingChatStarts, setPendingChatStarts] = useState({});
   const [pendingContainerRefreshes, setPendingContainerRefreshes] = useState({});
   const [themePreference, setThemePreference] = useState(() => loadThemePreference());
+  const [systemThemeIsDark, setSystemThemeIsDark] = useState(() => detectSystemPrefersDark());
   const [hubStateHydrated, setHubStateHydrated] = useState(false);
   const [defaultAgentSettingSaving, setDefaultAgentSettingSaving] = useState(false);
   const [chatLayoutEngineSettingSaving, setChatLayoutEngineSettingSaving] = useState(false);
@@ -3266,9 +3291,13 @@ function HubApp() {
     };
     return nextProjectModels;
   }, [chatFlexProjectLayoutsReconciledByProjectId]);
+  const effectiveTheme = useMemo(
+    () => resolveEffectiveTheme(themePreference, systemThemeIsDark),
+    [themePreference, systemThemeIsDark]
+  );
   const chatFlexLayoutThemeClass = useMemo(
-    () => `flexlayout__theme_${resolveEffectiveTheme(themePreference)}`,
-    [themePreference]
+    () => `flexlayout__theme_${effectiveTheme}`,
+    [effectiveTheme]
   );
 
   const openAiAccountLoginUrl = String(openAiAccountSession?.loginUrl || "").trim();
@@ -3429,6 +3458,30 @@ function HubApp() {
     refreshAuthSettings,
     refreshGithubInstallations
   ]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return undefined;
+    }
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const updateFromMediaQuery = (eventOrList) => {
+      setSystemThemeIsDark(Boolean(eventOrList?.matches));
+    };
+    updateFromMediaQuery(mediaQuery);
+    if (typeof mediaQuery.addEventListener === "function") {
+      mediaQuery.addEventListener("change", updateFromMediaQuery);
+      return () => {
+        mediaQuery.removeEventListener("change", updateFromMediaQuery);
+      };
+    }
+    if (typeof mediaQuery.addListener === "function") {
+      mediaQuery.addListener(updateFromMediaQuery);
+      return () => {
+        mediaQuery.removeListener(updateFromMediaQuery);
+      };
+    }
+    return undefined;
+  }, []);
 
   useEffect(() => {
     const normalized = normalizeThemePreference(themePreference);
@@ -4031,6 +4084,7 @@ function HubApp() {
           <ChatTerminal
             chatId={resolvedChatId}
             running={isRunning}
+            effectiveTheme={effectiveTheme}
             statusOverride={terminalStatusOverride}
             title={titleText}
             titleStateLabel={titleStateLabel}
@@ -4737,6 +4791,7 @@ function HubApp() {
                         title="Temporary analysis chat"
                         shellClassName="auto-config-terminal-shell"
                         viewClassName="auto-config-terminal-view"
+                        effectiveTheme={effectiveTheme}
                         text={project.auto_config_log || "Waiting for temporary analysis chat output...\r\n"}
                       />
                       {isFailed ? (
@@ -4873,6 +4928,7 @@ function HubApp() {
                       ) : null}
                       {isBuilding ? (
                         <ProjectBuildTerminal
+                          effectiveTheme={effectiveTheme}
                           text={projectBuildLogs[project.id] || "Preparing project image...\r\n"}
                         />
                       ) : null}
