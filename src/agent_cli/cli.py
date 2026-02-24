@@ -48,6 +48,8 @@ GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 AGENT_HUB_SECRETS_DIR_NAME = "secrets"
 AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME = "github_credentials"
+GIT_CREDENTIAL_DEFAULT_SCHEME = "https"
+GIT_CREDENTIAL_ALLOWED_SCHEMES = {"http", "https"}
 RUNTIME_IMAGE_BUILD_LOCK_DIR = Path(tempfile.gettempdir()) / "agent-cli-image-build-locks"
 
 
@@ -302,7 +304,31 @@ def _default_agent_hub_github_credentials_file() -> Path:
     return _default_agent_hub_data_dir() / AGENT_HUB_SECRETS_DIR_NAME / AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
 
 
-def _parse_git_credential_store_host(credential_line: str) -> str | None:
+def _split_host_port(host: str) -> tuple[str, int | None]:
+    candidate = str(host or "").strip().lower()
+    if not candidate:
+        return "", None
+    if ":" not in candidate:
+        return candidate, None
+    hostname, port_text = candidate.rsplit(":", 1)
+    if not hostname or not port_text.isdigit():
+        raise click.ClickException(f"Invalid git credential host: {host}")
+    port = int(port_text)
+    if port <= 0 or port > 65535:
+        raise click.ClickException(f"Invalid git credential host: {host}")
+    return hostname, port
+
+
+def _normalize_git_credential_scheme(raw_value: str) -> str:
+    scheme = str(raw_value or "").strip().lower()
+    if not scheme:
+        return GIT_CREDENTIAL_DEFAULT_SCHEME
+    if scheme not in GIT_CREDENTIAL_ALLOWED_SCHEMES:
+        raise click.ClickException(f"Invalid git credential scheme: {raw_value}")
+    return scheme
+
+
+def _parse_git_credential_store_host(credential_line: str) -> tuple[str, str] | None:
     candidate = str(credential_line or "").strip()
     if not candidate:
         return None
@@ -313,27 +339,32 @@ def _parse_git_credential_store_host(credential_line: str) -> str | None:
     host = str(parsed.hostname or "").strip().lower()
     if not host:
         return None
+    scheme = _normalize_git_credential_scheme(parsed.scheme)
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
     try:
-        return _normalize_git_credential_host(host)
+        return _normalize_git_credential_host(host), scheme
     except click.ClickException:
         return None
 
 
-def _discover_agent_hub_github_credentials() -> tuple[Path | None, str]:
+def _discover_agent_hub_github_credentials() -> tuple[Path | None, str, str]:
     credentials_path = _default_agent_hub_github_credentials_file()
     if not credentials_path.is_file():
-        return None, ""
+        return None, "", ""
 
     try:
         with credentials_path.open("r", encoding="utf-8") as handle:
             for line in handle:
-                host = _parse_git_credential_store_host(line)
-                if host:
-                    return credentials_path.resolve(), host
+                parsed = _parse_git_credential_store_host(line)
+                if parsed is None:
+                    continue
+                host, scheme = parsed
+                return credentials_path.resolve(), host, scheme
     except (OSError, UnicodeError):
-        return None, ""
+        return None, "", ""
 
-    return None, ""
+    return None, "", ""
 
 
 def _default_group_name() -> str:
@@ -810,12 +841,27 @@ def _ensure_claude_json_file(path: Path) -> None:
 
 
 def _normalize_git_credential_host(raw_value: str) -> str:
-    host = str(raw_value or "").strip().lower()
-    if not host:
+    candidate = str(raw_value or "").strip().lower()
+    if not candidate:
         raise click.ClickException("Git credential host is required.")
-    if not re.fullmatch(r"[a-z0-9.-]+", host):
+    host = candidate
+    if "://" in candidate:
+        parsed = urllib.parse.urlsplit(candidate)
+        scheme = _normalize_git_credential_scheme(parsed.scheme)
+        del scheme
+        if parsed.username or parsed.password:
+            raise click.ClickException(f"Invalid git credential host: {raw_value}")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise click.ClickException(f"Invalid git credential host: {raw_value}")
+        host_name = str(parsed.hostname or "").strip().lower()
+        if not host_name:
+            raise click.ClickException(f"Invalid git credential host: {raw_value}")
+        host = f"{host_name}:{parsed.port}" if parsed.port else host_name
+
+    host_name, port = _split_host_port(host)
+    if not re.fullmatch(r"[a-z0-9.-]+", host_name):
         raise click.ClickException(f"Invalid git credential host: {raw_value}")
-    return host
+    return f"{host_name}:{port}" if port else host_name
 
 
 def _resolve_base_image(
@@ -923,6 +969,11 @@ def _resolve_base_image(
     help="Git host matched by the credential file (for example github.com)",
 )
 @click.option(
+    "--git-credential-scheme",
+    default=None,
+    help="Git credential scheme matched by the credential file (http or https).",
+)
+@click.option(
     "--base",
     "base_docker_path",
     default=None,
@@ -978,6 +1029,7 @@ def main(
     credentials_file: str,
     git_credential_file: str | None,
     git_credential_host: str | None,
+    git_credential_scheme: str | None,
     base_docker_path: str | None,
     base_docker_context: str | None,
     base_dockerfile: str | None,
@@ -1031,6 +1083,7 @@ def main(
 
     git_credential_path: Path | None = None
     git_credential_host_value = ""
+    git_credential_scheme_value = ""
 
     if git_credential_file:
         git_credential_path = _to_absolute(git_credential_file, cwd)
@@ -1038,16 +1091,25 @@ def main(
             raise click.ClickException(f"Git credential file does not exist: {git_credential_path}")
     if git_credential_host:
         git_credential_host_value = _normalize_git_credential_host(git_credential_host)
+    if git_credential_scheme:
+        git_credential_scheme_value = _normalize_git_credential_scheme(git_credential_scheme)
 
     if git_credential_path is None and not git_credential_host_value:
-        discovered_path, discovered_host = _discover_agent_hub_github_credentials()
+        discovered_path, discovered_host, discovered_scheme = _discover_agent_hub_github_credentials()
         if discovered_path is not None and discovered_host:
             git_credential_path = discovered_path
             git_credential_host_value = discovered_host
+            git_credential_scheme_value = discovered_scheme or GIT_CREDENTIAL_DEFAULT_SCHEME
 
     if bool(git_credential_path) != bool(git_credential_host_value):
         raise click.ClickException(
             "--git-credential-file and --git-credential-host must be provided together"
+        )
+    if git_credential_host_value and not git_credential_scheme_value:
+        git_credential_scheme_value = GIT_CREDENTIAL_DEFAULT_SCHEME
+    if git_credential_scheme_value and not git_credential_host_value:
+        raise click.ClickException(
+            "--git-credential-scheme requires --git-credential-host"
         )
 
     uid = local_uid if local_uid is not None else os.getuid()
@@ -1261,19 +1323,21 @@ def main(
         run_args.extend(["--env", f"OPENAI_API_KEY={api_key}"])
 
     if git_credential_path is not None and git_credential_host_value:
-        https_prefix = f"https://{git_credential_host_value}/"
+        git_prefix = f"{git_credential_scheme_value}://{git_credential_host_value}/"
+        git_credential_ssh_host = git_credential_host_value.split(":", 1)[0]
         run_args.extend(["--volume", f"{git_credential_path}:{GIT_CREDENTIALS_SOURCE_PATH}:ro"])
         run_args.extend(["--env", "GIT_TERMINAL_PROMPT=0"])
         run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIALS_SOURCE={GIT_CREDENTIALS_SOURCE_PATH}"])
         run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIALS_FILE={GIT_CREDENTIALS_FILE_PATH}"])
         run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIAL_HOST={git_credential_host_value}"])
+        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIAL_SCHEME={git_credential_scheme_value}"])
         run_args.extend(["--env", "GIT_CONFIG_COUNT=3"])
         run_args.extend(["--env", "GIT_CONFIG_KEY_0=credential.helper"])
         run_args.extend(["--env", f"GIT_CONFIG_VALUE_0=store --file={GIT_CREDENTIALS_FILE_PATH}"])
-        run_args.extend(["--env", f"GIT_CONFIG_KEY_1=url.{https_prefix}.insteadOf"])
-        run_args.extend(["--env", f"GIT_CONFIG_VALUE_1=git@{git_credential_host_value}:"])
-        run_args.extend(["--env", f"GIT_CONFIG_KEY_2=url.{https_prefix}.insteadOf"])
-        run_args.extend(["--env", f"GIT_CONFIG_VALUE_2=ssh://git@{git_credential_host_value}/"])
+        run_args.extend(["--env", f"GIT_CONFIG_KEY_1=url.{git_prefix}.insteadOf"])
+        run_args.extend(["--env", f"GIT_CONFIG_VALUE_1=git@{git_credential_ssh_host}:"])
+        run_args.extend(["--env", f"GIT_CONFIG_KEY_2=url.{git_prefix}.insteadOf"])
+        run_args.extend(["--env", f"GIT_CONFIG_VALUE_2=ssh://git@{git_credential_ssh_host}/"])
 
     for env_entry in parsed_env_vars:
         run_args.extend(["--env", env_entry])

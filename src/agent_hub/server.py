@@ -71,6 +71,10 @@ GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN = "personal_access_token"
 GITHUB_PERSONAL_ACCESS_TOKEN_MIN_CHARS = 20
 GITHUB_PERSONAL_ACCESS_TOKEN_ID_MAX_CHARS = 120
 GITHUB_OWNER_SCOPE_MAX_ITEMS = 64
+GIT_CREDENTIAL_DEFAULT_SCHEME = "https"
+GIT_CREDENTIAL_ALLOWED_SCHEMES = {"http", "https"}
+GIT_PROVIDER_GITHUB = "github"
+GIT_PROVIDER_GITLAB = "gitlab"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_CONTAINER_HOME = "/workspace"
@@ -1743,12 +1747,70 @@ def _normalize_github_installation_id(raw_value: Any) -> int:
     return installation_id
 
 
-def _normalize_github_credential_host(raw_value: Any, field_name: str = "host") -> str:
-    host = str(raw_value or "").strip().lower()
-    if not host:
-        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
-    if not re.fullmatch(r"[a-z0-9.-]+", host):
+def _split_host_port(host: str) -> tuple[str, int | None]:
+    candidate = str(host or "").strip().lower()
+    if not candidate:
+        return "", None
+    if ":" not in candidate:
+        return candidate, None
+    hostname, port_text = candidate.rsplit(":", 1)
+    if not hostname or not port_text.isdigit():
+        raise HTTPException(status_code=400, detail=f"Invalid host: {host}")
+    port_value = int(port_text)
+    if port_value <= 0 or port_value > 65535:
+        raise HTTPException(status_code=400, detail=f"Invalid host: {host}")
+    return hostname, port_value
+
+
+def _normalize_github_credential_scheme(raw_value: Any, field_name: str = "scheme") -> str:
+    scheme = str(raw_value or "").strip().lower() or GIT_CREDENTIAL_DEFAULT_SCHEME
+    if scheme not in GIT_CREDENTIAL_ALLOWED_SCHEMES:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+    return scheme
+
+
+def _normalize_github_credential_endpoint(
+    raw_value: Any,
+    field_name: str = "host",
+    default_scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME,
+) -> tuple[str, str]:
+    candidate = str(raw_value or "").strip()
+    if not candidate:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
+
+    default_scheme_value = _normalize_github_credential_scheme(default_scheme, field_name=f"{field_name}_scheme")
+    scheme = default_scheme_value
+    host_value = candidate
+
+    if "://" in candidate:
+        parsed = urllib.parse.urlsplit(candidate)
+        scheme = _normalize_github_credential_scheme(parsed.scheme, field_name=f"{field_name}_scheme")
+        if parsed.username or parsed.password:
+            raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+        hostname = str(parsed.hostname or "").strip().lower()
+        if not hostname:
+            raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}") from exc
+        host_value = f"{hostname}:{port}" if port else hostname
+    else:
+        host_value = candidate.lower()
+
+    hostname, port = _split_host_port(host_value)
+    if not hostname:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+    if not re.fullmatch(r"[a-z0-9.-]+", hostname):
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}: {raw_value}")
+    normalized_host = f"{hostname}:{port}" if port else hostname
+    return scheme, normalized_host
+
+
+def _normalize_github_credential_host(raw_value: Any, field_name: str = "host") -> str:
+    _scheme, host = _normalize_github_credential_endpoint(raw_value, field_name=field_name)
     return host
 
 
@@ -1890,7 +1952,12 @@ def _git_repo_host(repo_url: str) -> str:
 
     parsed = urllib.parse.urlsplit(candidate)
     if parsed.hostname:
-        return parsed.hostname.lower()
+        host = parsed.hostname.lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        return f"{host}:{port}" if port else host
 
     scp_match = re.match(r"^[^@]+@([^:]+):", candidate)
     if scp_match:
@@ -1900,6 +1967,20 @@ def _git_repo_host(repo_url: str) -> str:
     if ssh_match:
         return ssh_match.group(1).lower().strip()
 
+    return ""
+
+
+def _git_repo_scheme(repo_url: str) -> str:
+    candidate = str(repo_url or "").strip()
+    if not candidate:
+        return ""
+
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.scheme:
+        return parsed.scheme.lower().strip()
+
+    if re.match(r"^[^@]+@[^:]+:", candidate):
+        return "ssh"
     return ""
 
 
@@ -4065,15 +4146,27 @@ class HubState:
             return None
 
         host_value = raw_record.get("host") or default_host
+        default_scheme = str(raw_record.get("scheme") or GIT_CREDENTIAL_DEFAULT_SCHEME).strip() or GIT_CREDENTIAL_DEFAULT_SCHEME
         try:
-            host = _normalize_github_credential_host(host_value, field_name="host")
+            scheme, host = _normalize_github_credential_endpoint(
+                host_value,
+                field_name="host",
+                default_scheme=default_scheme,
+            )
         except HTTPException:
             return None
 
         account_name = str(raw_record.get("account_name") or account_login).strip() or account_login
         account_email = str(raw_record.get("account_email") or "").strip()
+        provider = str(raw_record.get("provider") or raw_record.get("service") or GIT_PROVIDER_GITHUB).strip().lower()
+        if provider not in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}:
+            provider = GIT_PROVIDER_GITHUB
+        host_name, _port = _split_host_port(host)
+        noreply_domain = "github.com"
+        if provider == GIT_PROVIDER_GITLAB:
+            noreply_domain = host_name or "gitlab.com"
         if not account_email:
-            account_email = f"{account_login}@users.noreply.github.com"
+            account_email = f"{account_login}@users.noreply.{noreply_domain}"
         git_user_name = str(raw_record.get("git_user_name") or account_name).strip() or account_name
         git_user_email = str(raw_record.get("git_user_email") or account_email).strip() or account_email
         account_id = str(raw_record.get("account_id") or "").strip()
@@ -4099,6 +4192,8 @@ class HubState:
         return {
             "token_id": token_id,
             "host": host,
+            "scheme": scheme,
+            "provider": provider,
             "personal_access_token": token,
             "account_login": account_login,
             "account_name": account_name,
@@ -4159,6 +4254,15 @@ class HubState:
                 {
                     "token_id": str(record.get("token_id") or "").strip(),
                     "host": str(record.get("host") or "").strip(),
+                    "scheme": _normalize_github_credential_scheme(
+                        record.get("scheme"),
+                        field_name="scheme",
+                    ),
+                    "provider": (
+                        str(record.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
+                        if str(record.get("provider") or "").strip().lower() in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}
+                        else GIT_PROVIDER_GITHUB
+                    ),
                     "personal_access_token": str(record.get("personal_access_token") or "").strip(),
                     "account_login": str(record.get("account_login") or "").strip(),
                     "account_name": str(record.get("account_name") or "").strip(),
@@ -4185,6 +4289,7 @@ class HubState:
         repo_host = _git_repo_host(repo_url)
         if not repo_host:
             return None
+        repo_scheme = _git_repo_scheme(repo_url)
         repo_owner = _git_repo_owner(repo_url)
         matching_host = [
             token
@@ -4193,6 +4298,14 @@ class HubState:
         ]
         if not matching_host:
             return None
+        if repo_scheme in GIT_CREDENTIAL_ALLOWED_SCHEMES:
+            matching_scheme = [
+                token
+                for token in matching_host
+                if str(token.get("scheme") or GIT_CREDENTIAL_DEFAULT_SCHEME).strip().lower() == repo_scheme
+            ]
+            if matching_scheme:
+                matching_host = matching_scheme
 
         if repo_owner:
             for token in matching_host:
@@ -4205,91 +4318,187 @@ class HubState:
                 return token
         return matching_host[0]
 
-    def _github_api_base_url_for_host(self, host: str) -> str:
+    def _github_api_base_url_for_host(self, host: str, scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME) -> str:
+        normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
         normalized_host = _normalize_github_credential_host(host, field_name="host")
-        if self.github_app_settings is not None and self._github_provider_host() == normalized_host:
+        if (
+            normalized_scheme == "https"
+            and self.github_app_settings is not None
+            and self._github_provider_host() == normalized_host
+        ):
             return self.github_app_settings.api_base_url
-        if normalized_host == "github.com":
+        if normalized_scheme == "https" and normalized_host == "github.com":
             return GITHUB_APP_DEFAULT_API_BASE_URL
+        if normalized_scheme != "https":
+            return f"{normalized_scheme}://{normalized_host}/api/v3"
         return f"https://{normalized_host}/api/v3"
 
-    def _verify_github_personal_access_token(self, token: str, host: str) -> dict[str, str]:
-        api_base_url = self._github_api_base_url_for_host(host)
-        request = urllib.request.Request(
-            f"{api_base_url}/user",
-            headers={
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "agent-hub",
-                "Authorization": f"Bearer {token}",
-            },
-            method="GET",
-        )
+    @staticmethod
+    def _gitlab_api_base_url_for_host(host: str, scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME) -> str:
+        normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
+        normalized_host = _normalize_github_credential_host(host, field_name="host")
+        return f"{normalized_scheme}://{normalized_host}/api/v4"
 
-        oauth_scopes = ""
+    @staticmethod
+    def _pat_verification_request(
+        request: urllib.request.Request,
+        provider_label: str,
+    ) -> tuple[int, str, dict[str, str]]:
         try:
             with urllib.request.urlopen(request, timeout=GITHUB_APP_API_TIMEOUT_SECONDS) as response:
                 status = int(response.getcode() or 0)
                 payload_text = response.read().decode("utf-8", errors="ignore")
-                oauth_scopes = str(response.headers.get("X-OAuth-Scopes") or "").strip()
+                response_headers = {str(key): str(value) for key, value in response.headers.items()}
+                return status, payload_text, response_headers
         except urllib.error.HTTPError as exc:
             status = int(exc.code or 0)
             payload_text = exc.read().decode("utf-8", errors="ignore")
-            oauth_scopes = str(exc.headers.get("X-OAuth-Scopes") or "").strip() if exc.headers else ""
-            detail = f"GitHub personal access token verification failed with status {status}."
-            message = _github_api_error_message(payload_text)
-            if message:
-                detail = f"{detail} {message}"
-            if status in {401, 403}:
-                raise HTTPException(status_code=400, detail=detail) from exc
-            raise HTTPException(status_code=502, detail=detail) from exc
+            response_headers = {str(key): str(value) for key, value in (exc.headers.items() if exc.headers else [])}
+            return status, payload_text, response_headers
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise HTTPException(
                 status_code=502,
-                detail="GitHub personal access token verification failed due to a network error.",
+                detail=f"{provider_label} personal access token verification failed due to a network error.",
             ) from exc
 
-        if not (200 <= status < 300):
-            detail = f"GitHub personal access token verification failed with status {status}."
+    @staticmethod
+    def _header_value(headers: dict[str, str], *keys: str) -> str:
+        if not headers:
+            return ""
+        for key in keys:
+            for header_name, value in headers.items():
+                if header_name.lower() == key.lower():
+                    return str(value or "").strip()
+        return ""
+
+    def _verify_github_personal_access_token(self, token: str, host: str, scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME) -> dict[str, str]:
+        normalized_host = _normalize_github_credential_host(host, field_name="host")
+        normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
+        host_name, _port = _split_host_port(normalized_host)
+        preferred_provider = GIT_PROVIDER_GITLAB if "gitlab" in host_name else GIT_PROVIDER_GITHUB
+        providers = (
+            [GIT_PROVIDER_GITLAB, GIT_PROVIDER_GITHUB]
+            if preferred_provider == GIT_PROVIDER_GITLAB
+            else [GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB]
+        )
+
+        failures: list[tuple[str, int, str]] = []
+        for provider in providers:
+            if provider == GIT_PROVIDER_GITHUB:
+                api_base_url = self._github_api_base_url_for_host(normalized_host, normalized_scheme)
+                request = urllib.request.Request(
+                    f"{api_base_url}/user",
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                        "User-Agent": "agent-hub",
+                        "Authorization": f"Bearer {token}",
+                    },
+                    method="GET",
+                )
+                provider_label = "GitHub"
+            else:
+                api_base_url = self._gitlab_api_base_url_for_host(normalized_host, normalized_scheme)
+                request = urllib.request.Request(
+                    f"{api_base_url}/user",
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "agent-hub",
+                        "Authorization": f"Bearer {token}",
+                        "PRIVATE-TOKEN": token,
+                    },
+                    method="GET",
+                )
+                provider_label = "GitLab"
+
+            status, payload_text, response_headers = self._pat_verification_request(request, provider_label)
+            if 200 <= status < 300:
+                try:
+                    payload = json.loads(payload_text) if payload_text else {}
+                except json.JSONDecodeError as exc:
+                    failures.append((provider_label, 502, "returned invalid PAT verification payload."))
+                    continue
+                if not isinstance(payload, dict):
+                    failures.append((provider_label, 502, "returned invalid PAT verification payload."))
+                    continue
+
+                if provider == GIT_PROVIDER_GITHUB:
+                    account_login = str(payload.get("login") or "").strip()
+                    account_name = str(payload.get("name") or "").strip()
+                    raw_account_id = payload.get("id")
+                    account_email = str(payload.get("email") or "").strip()
+                    token_scopes = self._header_value(response_headers, "X-OAuth-Scopes")
+                    if not account_login:
+                        failures.append(("GitHub", 502, "did not return a user login for this token."))
+                        continue
+                    account_id = 0
+                    if isinstance(raw_account_id, int) and raw_account_id > 0:
+                        account_id = raw_account_id
+                    elif isinstance(raw_account_id, str) and raw_account_id.isdigit():
+                        account_id = int(raw_account_id)
+                    if not account_email:
+                        if account_id > 0:
+                            account_email = f"{account_id}+{account_login}@users.noreply.github.com"
+                        else:
+                            account_email = f"{account_login}@users.noreply.github.com"
+                    return {
+                        "provider": GIT_PROVIDER_GITHUB,
+                        "account_login": account_login,
+                        "account_name": account_name or account_login,
+                        "account_email": account_email,
+                        "account_id": str(account_id) if account_id > 0 else "",
+                        "token_scopes": token_scopes,
+                    }
+
+                account_login = str(payload.get("username") or payload.get("login") or "").strip()
+                account_name = str(payload.get("name") or "").strip()
+                account_email = str(payload.get("email") or "").strip()
+                raw_account_id = payload.get("id")
+                if not account_login:
+                    failures.append(("GitLab", 502, "did not return a user login for this token."))
+                    continue
+                account_id = 0
+                if isinstance(raw_account_id, int) and raw_account_id > 0:
+                    account_id = raw_account_id
+                elif isinstance(raw_account_id, str) and raw_account_id.isdigit():
+                    account_id = int(raw_account_id)
+                if not account_email:
+                    account_email = f"{account_login}@users.noreply.{host_name or 'gitlab.com'}"
+                token_scopes = self._header_value(
+                    response_headers,
+                    "X-Gitlab-Scopes",
+                    "X-GitLab-Scopes",
+                    "X-OAuth-Scopes",
+                    "X-Oauth-Scopes",
+                )
+                return {
+                    "provider": GIT_PROVIDER_GITLAB,
+                    "account_login": account_login,
+                    "account_name": account_name or account_login,
+                    "account_email": account_email,
+                    "account_id": str(account_id) if account_id > 0 else "",
+                    "token_scopes": token_scopes,
+                }
+
             message = _github_api_error_message(payload_text)
+            failures.append((provider_label, status, message))
+
+        unauthorized_failures = [failure for failure in failures if failure[1] in {401, 403}]
+        if unauthorized_failures:
+            provider_label, status, message = unauthorized_failures[0]
+            detail = f"{provider_label} personal access token verification failed with status {status}."
             if message:
                 detail = f"{detail} {message}"
-            if status in {401, 403}:
-                raise HTTPException(status_code=400, detail=detail)
+            raise HTTPException(status_code=400, detail=detail)
+
+        if failures:
+            provider_label, status, message = failures[0]
+            detail = f"{provider_label} personal access token verification failed with status {status}."
+            if message:
+                detail = f"{detail} {message}"
             raise HTTPException(status_code=502, detail=detail)
 
-        try:
-            payload = json.loads(payload_text) if payload_text else {}
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=502, detail="GitHub returned invalid PAT verification payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=502, detail="GitHub returned invalid PAT verification payload.")
-
-        account_login = str(payload.get("login") or "").strip()
-        account_name = str(payload.get("name") or "").strip()
-        if not account_login:
-            raise HTTPException(status_code=502, detail="GitHub did not return a user login for this token.")
-        raw_account_id = payload.get("id")
-        account_id = 0
-        if isinstance(raw_account_id, int) and raw_account_id > 0:
-            account_id = raw_account_id
-        elif isinstance(raw_account_id, str) and raw_account_id.isdigit():
-            account_id = int(raw_account_id)
-
-        account_email = str(payload.get("email") or "").strip()
-        if not account_email:
-            if account_id > 0:
-                account_email = f"{account_id}+{account_login}@users.noreply.github.com"
-            else:
-                account_email = f"{account_login}@users.noreply.github.com"
-
-        return {
-            "account_login": account_login,
-            "account_name": account_name or account_login,
-            "account_email": account_email,
-            "account_id": str(account_id) if account_id > 0 else "",
-            "token_scopes": oauth_scopes,
-        }
+        raise HTTPException(status_code=502, detail="Git provider personal access token verification failed.")
 
     def _github_api_request(
         self,
@@ -4395,9 +4604,17 @@ class HubState:
             host=host,
             username="x-access-token",
             secret=token,
+            scheme=GIT_CREDENTIAL_DEFAULT_SCHEME,
         )
 
-    def _write_github_git_credentials(self, host: str, username: str, secret: str) -> str:
+    def _write_github_git_credentials(
+        self,
+        host: str,
+        username: str,
+        secret: str,
+        scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME,
+    ) -> str:
+        normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
         normalized_host = _normalize_github_credential_host(host, field_name="host")
         resolved_username = str(username or "").strip()
         resolved_secret = str(secret or "").strip()
@@ -4409,7 +4626,7 @@ class HubState:
         encoded_secret = urllib.parse.quote(resolved_secret, safe="")
         _write_private_env_file(
             self.github_git_credentials_file,
-            f"https://{encoded_username}:{encoded_secret}@{normalized_host}\n",
+            f"{normalized_scheme}://{encoded_username}:{encoded_secret}@{normalized_host}\n",
         )
         return str(self.github_git_credentials_file)
 
@@ -4418,26 +4635,35 @@ class HubState:
         token: str,
         host: str,
         account_login: str,
+        scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME,
     ) -> str:
         return self._write_github_git_credentials(
             host=host,
             username=account_login,
             secret=token,
+            scheme=scheme,
         )
 
     @staticmethod
-    def _git_env_for_credentials_file(credential_file: str, host: str) -> dict[str, str]:
+    def _git_env_for_credentials_file(
+        credential_file: str,
+        host: str,
+        scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME,
+    ) -> dict[str, str]:
+        normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
         normalized_host = str(host or "github.com").strip().lower()
-        https_prefix = f"https://{normalized_host}/"
+        host_name, _port = _split_host_port(normalized_host)
+        normalized_ssh_host = host_name or normalized_host
+        git_prefix = f"{normalized_scheme}://{normalized_host}/"
         return {
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "credential.helper",
             "GIT_CONFIG_VALUE_0": f"store --file={credential_file}",
-            "GIT_CONFIG_KEY_1": f"url.{https_prefix}.insteadOf",
-            "GIT_CONFIG_VALUE_1": f"git@{normalized_host}:",
-            "GIT_CONFIG_KEY_2": f"url.{https_prefix}.insteadOf",
-            "GIT_CONFIG_VALUE_2": f"ssh://git@{normalized_host}/",
+            "GIT_CONFIG_KEY_1": f"url.{git_prefix}.insteadOf",
+            "GIT_CONFIG_VALUE_1": f"git@{normalized_ssh_host}:",
+            "GIT_CONFIG_KEY_2": f"url.{git_prefix}.insteadOf",
+            "GIT_CONFIG_VALUE_2": f"ssh://git@{normalized_ssh_host}/",
         }
 
     def _github_repo_auth_context(self, repo_url: str) -> tuple[str, str, dict[str, Any]] | None:
@@ -4468,6 +4694,7 @@ class HubState:
         if context is None:
             return {}
         mode, host, auth_payload = context
+        scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
         if mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
             installation_id = int(auth_payload.get("installation_id") or 0)
             if installation_id <= 0:
@@ -4476,22 +4703,31 @@ class HubState:
         elif mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
             token = str(auth_payload.get("personal_access_token") or "").strip()
             account_login = str(auth_payload.get("account_login") or "").strip()
+            try:
+                scheme = _normalize_github_credential_scheme(
+                    auth_payload.get("scheme"),
+                    field_name="scheme",
+                )
+            except HTTPException:
+                scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
             if not token or not account_login:
                 return {}
             credentials_file = self._refresh_github_git_credentials_for_personal_access_token(
                 token=token,
                 host=host,
                 account_login=account_login,
+                scheme=scheme,
             )
         else:
             return {}
-        return self._git_env_for_credentials_file(credentials_file, host)
+        return self._git_env_for_credentials_file(credentials_file, host, scheme=scheme)
 
     def _github_git_args_for_repo(self, repo_url: str) -> list[str]:
         context = self._github_repo_auth_context(repo_url)
         if context is None:
             return []
         mode, host, auth_payload = context
+        scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
         if mode == GITHUB_CONNECTION_MODE_GITHUB_APP:
             installation_id = int(auth_payload.get("installation_id") or 0)
             if installation_id <= 0:
@@ -4500,12 +4736,20 @@ class HubState:
         elif mode == GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
             token = str(auth_payload.get("personal_access_token") or "").strip()
             account_login = str(auth_payload.get("account_login") or "").strip()
+            try:
+                scheme = _normalize_github_credential_scheme(
+                    auth_payload.get("scheme"),
+                    field_name="scheme",
+                )
+            except HTTPException:
+                scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
             if not token or not account_login:
                 return []
             credentials_file = self._refresh_github_git_credentials_for_personal_access_token(
                 token=token,
                 host=host,
                 account_login=account_login,
+                scheme=scheme,
             )
         else:
             return []
@@ -4514,6 +4758,8 @@ class HubState:
             credentials_file,
             "--git-credential-host",
             host,
+            "--git-credential-scheme",
+            scheme,
         ]
 
     def _github_git_identity_env_vars_for_repo(self, repo_url: str) -> list[str]:
@@ -4580,6 +4826,16 @@ class HubState:
         repository_selection = str(installation.get("repository_selection") or "") if installation else ""
         personal_access_token = str(personal_access.get("personal_access_token") or "") if personal_access else ""
         personal_access_host = str(personal_access.get("host") or "") if personal_access else ""
+        personal_access_scheme = (
+            _normalize_github_credential_scheme(personal_access.get("scheme"), field_name="scheme")
+            if personal_access
+            else GIT_CREDENTIAL_DEFAULT_SCHEME
+        )
+        personal_access_provider = (
+            str(personal_access.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
+            if personal_access
+            else GIT_PROVIDER_GITHUB
+        )
         personal_access_login = str(personal_access.get("account_login") or "") if personal_access else ""
         personal_access_name = str(personal_access.get("account_name") or "") if personal_access else ""
         personal_access_email = str(personal_access.get("account_email") or "") if personal_access else ""
@@ -4625,6 +4881,12 @@ class HubState:
                     "token_id": str(token_record.get("token_id") or "").strip(),
                     "token_hint": _mask_secret(token_value) if token_value else "",
                     "host": str(token_record.get("host") or "").strip(),
+                    "scheme": _normalize_github_credential_scheme(token_record.get("scheme"), field_name="scheme"),
+                    "provider": (
+                        str(token_record.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
+                        if str(token_record.get("provider") or "").strip().lower() in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}
+                        else GIT_PROVIDER_GITHUB
+                    ),
                     "account_login": str(token_record.get("account_login") or "").strip(),
                     "account_name": str(token_record.get("account_name") or "").strip(),
                     "account_email": str(token_record.get("account_email") or "").strip(),
@@ -4652,6 +4914,8 @@ class HubState:
             "repository_selection": repository_selection,
             "personal_access_token_hint": _mask_secret(personal_access_token) if personal_access_token else "",
             "personal_access_token_host": personal_access_host,
+            "personal_access_token_scheme": personal_access_scheme,
+            "personal_access_token_provider": personal_access_provider,
             "personal_access_token_user_login": personal_access_login,
             "personal_access_token_user_name": personal_access_name,
             "personal_access_token_user_email": personal_access_email,
@@ -5906,9 +6170,17 @@ class HubState:
         host_candidate = str(host or "").strip()
         if not host_candidate:
             host_candidate = self._github_provider_host()
-        normalized_host = _normalize_github_credential_host(host_candidate, field_name="host")
+        normalized_scheme, normalized_host = _normalize_github_credential_endpoint(
+            host_candidate,
+            field_name="host",
+            default_scheme=GIT_CREDENTIAL_DEFAULT_SCHEME,
+        )
         normalized_owner_scopes = _normalize_github_owner_scopes(owner_scopes, field_name="owner_scopes")
-        verification = self._verify_github_personal_access_token(normalized_token, normalized_host)
+        verification = self._verify_github_personal_access_token(
+            normalized_token,
+            normalized_host,
+            normalized_scheme,
+        )
         account_login = verification["account_login"]
 
         self._clear_github_installation_state(remove_credentials=True)
@@ -5916,14 +6188,20 @@ class HubState:
             token=normalized_token,
             host=normalized_host,
             account_login=account_login,
+            scheme=normalized_scheme,
         )
         account_name = str(verification.get("account_name") or account_login).strip() or account_login
         account_email = str(verification.get("account_email") or "").strip()
         account_id = str(verification.get("account_id") or "").strip()
         connected_at = _iso_now()
+        provider = str(verification.get("provider") or GIT_PROVIDER_GITHUB).strip().lower()
+        if provider not in {GIT_PROVIDER_GITHUB, GIT_PROVIDER_GITLAB}:
+            provider = GIT_PROVIDER_GITHUB
         record = {
             "token_id": uuid.uuid4().hex,
             "host": normalized_host,
+            "scheme": normalized_scheme,
+            "provider": provider,
             "personal_access_token": normalized_token,
             "account_login": account_login,
             "account_name": account_name,
@@ -5941,6 +6219,13 @@ class HubState:
         filtered_existing: list[dict[str, Any]] = []
         for existing_record in existing:
             existing_host = str(existing_record.get("host") or "").strip().lower()
+            try:
+                existing_scheme = _normalize_github_credential_scheme(
+                    existing_record.get("scheme"),
+                    field_name="scheme",
+                )
+            except HTTPException:
+                existing_scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
             existing_login = str(existing_record.get("account_login") or "").strip().lower()
             existing_owner_scopes = _normalize_github_owner_scopes(
                 existing_record.get("owner_scopes"),
@@ -5948,6 +6233,7 @@ class HubState:
             )
             if (
                 existing_host == normalized_host
+                and existing_scheme == normalized_scheme
                 and existing_login == account_login.lower()
                 and existing_owner_scopes == normalized_owner_scopes
             ):
@@ -5982,12 +6268,17 @@ class HubState:
             primary = remaining[0]
             token = str(primary.get("personal_access_token") or "").strip()
             host = str(primary.get("host") or "").strip()
+            try:
+                scheme = _normalize_github_credential_scheme(primary.get("scheme"), field_name="scheme")
+            except HTTPException:
+                scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
             account_login = str(primary.get("account_login") or "").strip()
             if token and host and account_login:
                 self._refresh_github_git_credentials_for_personal_access_token(
                     token=token,
                     host=host,
                     account_login=account_login,
+                    scheme=scheme,
                 )
             else:
                 self._clear_github_personal_access_token_state(remove_credentials=True)
