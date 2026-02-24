@@ -212,6 +212,9 @@ CHAT_STATUS_STARTING = "starting"
 CHAT_STATUS_RUNNING = "running"
 CHAT_STATUS_STOPPED = "stopped"
 CHAT_STATUS_FAILED = "failed"
+CHAT_STATUS_REASON_CHAT_CREATED = "chat_created"
+CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED = "chat_close_requested"
+CHAT_STATUS_REASON_USER_CLOSED_TAB = "user_closed_tab"
 SUPPORTED_CHAT_STATUSES = {
     CHAT_STATUS_STARTING,
     CHAT_STATUS_RUNNING,
@@ -3733,7 +3736,12 @@ class HubState:
         normalized_status = _normalize_chat_status(chat.get("status"))
         stop_requested = bool(str(chat.get("stop_requested_at") or "").strip())
         if stop_requested:
-            self._transition_chat_status(chat_id, chat, CHAT_STATUS_STOPPED, f"{normalized_reason}:stop_requested")
+            requested_reason = _compact_whitespace(str(chat.get("status_reason") or "")).strip()
+            if requested_reason in {CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED, CHAT_STATUS_REASON_USER_CLOSED_TAB}:
+                stop_reason = requested_reason
+            else:
+                stop_reason = f"{normalized_reason}:stop_requested"
+            self._transition_chat_status(chat_id, chat, CHAT_STATUS_STOPPED, stop_reason)
             chat["start_error"] = ""
             chat["stop_requested_at"] = ""
         elif normalized_status in {CHAT_STATUS_RUNNING, CHAT_STATUS_STARTING}:
@@ -7079,7 +7087,7 @@ class HubState:
             "agent_args": agent_args or [],
             "agent_type": _normalize_chat_agent_type(agent_type),
             "status": CHAT_STATUS_STOPPED,
-            "status_reason": "chat_created",
+            "status_reason": CHAT_STATUS_REASON_CHAT_CREATED,
             "last_status_transition_at": now,
             "start_error": "",
             "last_exit_code": None,
@@ -7103,13 +7111,13 @@ class HubState:
             "updated_at": now,
         }
         state["chats"][chat_id] = chat
-        self.save(state, reason="chat_created")
+        self.save(state, reason=CHAT_STATUS_REASON_CHAT_CREATED)
         LOGGER.info(
             "Chat state transition chat_id=%s from=%s to=%s reason=%s",
             chat_id,
             "missing",
             CHAT_STATUS_STOPPED,
-            "chat_created",
+            CHAT_STATUS_REASON_CHAT_CREATED,
         )
         return chat
 
@@ -7191,6 +7199,12 @@ class HubState:
 
         pid = chat.get("pid")
         if isinstance(pid, int):
+            stop_requested_at = _iso_now()
+            chat["stop_requested_at"] = stop_requested_at
+            chat["status_reason"] = CHAT_STATUS_REASON_USER_CLOSED_TAB
+            chat["updated_at"] = stop_requested_at
+            local_state["chats"][chat_id] = chat
+            self.save(local_state, reason=CHAT_STATUS_REASON_USER_CLOSED_TAB)
             _stop_process(pid)
         self._close_runtime(chat_id)
 
@@ -8338,9 +8352,12 @@ class HubState:
         if chat is None:
             raise HTTPException(status_code=404, detail="Chat not found.")
 
-        chat["stop_requested_at"] = _iso_now()
+        stop_requested_at = _iso_now()
+        chat["stop_requested_at"] = stop_requested_at
+        chat["status_reason"] = CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED
+        chat["updated_at"] = stop_requested_at
         state["chats"][chat_id] = chat
-        self.save(state, reason="chat_close_requested")
+        self.save(state, reason=CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED)
         pid = chat.get("pid")
         if isinstance(pid, int):
             _stop_process(pid)
@@ -8349,7 +8366,7 @@ class HubState:
             self._chat_input_buffers.pop(chat_id, None)
             self._chat_input_ansi_carry.pop(chat_id, None)
 
-        self._transition_chat_status(chat_id, chat, CHAT_STATUS_STOPPED, "chat_close_requested")
+        self._transition_chat_status(chat_id, chat, CHAT_STATUS_STOPPED, CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED)
         chat["start_error"] = ""
         chat["pid"] = None
         chat["artifact_publish_token_hash"] = ""
@@ -8358,7 +8375,7 @@ class HubState:
         chat["last_exit_at"] = _iso_now()
         chat["stop_requested_at"] = ""
         state["chats"][chat_id] = chat
-        self.save(state, reason="chat_close_requested")
+        self.save(state, reason=CHAT_STATUS_REASON_CHAT_CLOSE_REQUESTED)
         return dict(chat)
 
 

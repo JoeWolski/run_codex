@@ -3077,11 +3077,50 @@ Gemini CLI
         stop_process.assert_called_once_with(9876)
         close_runtime.assert_called_once_with(chat["id"])
         self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["status_reason"], "chat_close_requested")
         self.assertIsNone(result["pid"])
         self.assertEqual(result["artifact_publish_token_hash"], "")
         self.assertTrue(workspace.exists())
         self.assertTrue((workspace / "sentinel.txt").exists())
         self.assertIn(chat["id"], self.state.load()["chats"])
+
+    def test_delete_chat_running_process_race_records_user_closed_tab_reason(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+        state_data = self.state.load()
+        state_data["chats"][chat["id"]]["status"] = "running"
+        state_data["chats"][chat["id"]]["pid"] = 24680
+        state_data["chats"][chat["id"]]["status_reason"] = "chat_start_succeeded"
+        self.state.save(state_data)
+
+        def fake_stop_process(pid: int) -> None:
+            self.assertEqual(pid, 24680)
+            self.state._record_chat_runtime_exit(
+                chat["id"],
+                0,
+                reason="chat_runtime_reader_completed",
+            )
+
+        with patch("agent_hub.server._stop_process", side_effect=fake_stop_process), patch.object(
+            hub_server.HubState,
+            "_close_runtime",
+        ), self.assertLogs("agent_hub", level="INFO") as captured:
+            self.state.delete_chat(chat["id"])
+
+        self.assertNotIn(chat["id"], self.state.load()["chats"])
+        transition_logs = "\n".join(captured.output)
+        self.assertIn("from=running to=stopped reason=user_closed_tab", transition_logs)
+        self.assertNotIn("unexpected_exit", transition_logs)
 
     def test_state_payload_marks_finished_running_chat_failed(self) -> None:
         project = self.state.add_project(
