@@ -3,7 +3,7 @@ export const TERMINAL_THEME_LIGHT = Object.freeze({
   foreground: "#0f172a",
   cursor: "#0f8f70",
   selectionBackground: "rgba(15, 23, 42, 0.2)",
-  black: "#0f172a",
+  black: "#d0dae6",
   red: "#b42318",
   green: "#0f8f70",
   yellow: "#b45309",

@@ -45,6 +45,7 @@
 
 - Never commit screenshot files to the repository. Keep UI evidence files untracked and attach them to the PR.
 - For UI/UX PRs, capture every state changed by the PR (for example: default, toggled, loading, success, error, empty, and responsive/mobile variants when relevant).
+- Evidence scope rule: capture sufficient images to cover every UI state changed by the PR, but do not spend extra cycles polishing or expanding evidence beyond what is needed for reviewer verification.
 - Prefer JPG/JPEG for PR UI evidence uploads to reduce file size and improve review loading speed. Use PNG only when PNG is required (for example transparency or lossless detail checks).
 - In the development Docker image, use Playwright Firefox for UI evidence capture (`firefox` browser type). This is the browser runtime expected to be available in-container by default.
 - Prefer Playwright scripts that explicitly launch Firefox (`const { firefox } = await import("playwright");`) when generating PR screenshots from the real app.
@@ -67,6 +68,10 @@
 - 3. Start real app server in one terminal with mirrored config context: `UV_PROJECT_ENVIRONMENT=.venv-local uv run agent_hub --host 127.0.0.1 --port 8876 --data-dir \"$UI_DATA_DIR\" --config-file \"$UI_DATA_DIR/agent.config.toml\" --system-prompt-file \"$UI_DATA_DIR/SYSTEM_PROMPT.md\" --frontend-build`
 - 4. Sanity-check auth before screenshots (example: `curl -fsS http://127.0.0.1:8876/api/settings/auth`) and do not proceed while unrelated credential/setup errors are visible in UI state targeted for evidence.
 - 5. Capture screenshots in another terminal using Playwright against `http://127.0.0.1:8876` (real backend) and save to `.agent-artifacts/` (or `/tmp/agent-hub-ui-evidence/`). Prefer `type: "jpeg"`/`.jpg` outputs unless PNG is explicitly needed.
+- Docker-in-Docker gotcha: ensure `UI_DATA_DIR` and any `--config-file` path used for screenshot runs are bind-mountable from the Docker daemon host perspective, not only visible inside the current container.
+- Failure signature for the path issue above: Codex chat startup fails with `Failed to read config file ... config.toml: Is a directory`.
+- Practical fix before evidence capture: verify `<UI_DATA_DIR>/agent.config.toml` is a regular file from the daemon view (not a directory), and clear stale failed chats so `.build-error` banners from older attempts are not mistaken for current UI state.
+- Timing guidance from this environment: after chat reaches `running`/`is_running`, wait about 8-12 seconds before screenshot so terminal content is rendered; if the Codex runtime image is rebuilding, the interactive prompt can take roughly 60-90 seconds to appear.
 - 6. For PR body image rendering on `github.com`, use publicly reachable image URLs. Do not use local-only links such as `/api/chats/.../artifacts/...` in PR markdown.
 - 7. Programmatic upload path for public URLs (CLI-safe): `curl -fsS -F "file=@<image-path>" https://tmpfiles.org/api/v1/upload` and use the returned URL converted from `https://tmpfiles.org/<id>/<name>` to `https://tmpfiles.org/dl/<id>/<name>`.
 - 8. Update the PR body with a `## UI/UX Demo` section containing Markdown image links (`![alt](https://...)`) using `gh api repos/<owner>/<repo>/pulls/<pr-number> -X PATCH --raw-field body=\"$(cat <body-file>)\"`.
