@@ -4963,13 +4963,11 @@ function HubApp() {
                         text={project.auto_config_log || "Waiting for temporary analysis chat output...\r\n"}
                       />
                       {isFailed ? (
-                        <>
-                          <div className="meta build-error">
-                            {isCancelled
-                              ? (project.build_error || AUTO_CONFIG_CANCELLED_ERROR_TEXT)
-                              : (project.build_error || "Auto configure failed before project creation completed.")}
-                          </div>
-                        </>
+                        <div className="meta build-error">
+                          {isCancelled
+                            ? (project.build_error || AUTO_CONFIG_CANCELLED_ERROR_TEXT)
+                            : (project.build_error || "Auto configure failed before project creation completed.")}
+                        </div>
                       ) : null}
                       <div className="actions project-collapsed-actions">
                         {isFailed ? (
@@ -4989,7 +4987,7 @@ function HubApp() {
                           >
                             {isCancelling ? <SpinnerLabel text="Canceling..." /> : "Cancel"}
                           </button>
-                        </>
+                        )}
                       </div>
                     </article>
                   );
