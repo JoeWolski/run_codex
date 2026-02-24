@@ -6114,6 +6114,7 @@ class HubState:
         agent_tools_chat_id = f"auto-config:{session_id}"
         runtime_config_file = self._prepare_chat_runtime_config(
             f"auto-config-{session_id}",
+            agent_type=AGENT_TYPE_CODEX,
             agent_tools_url=agent_tools_url,
             agent_tools_token=session_token,
             agent_tools_project_id="",
@@ -7156,12 +7157,14 @@ class HubState:
     def _prepare_chat_runtime_config(
         self,
         chat_id: str,
+        agent_type: str,
         *,
         agent_tools_url: str,
         agent_tools_token: str,
         agent_tools_project_id: str,
         agent_tools_chat_id: str,
     ) -> Path:
+        from agent_cli import providers as agent_providers
         try:
             base_text = self.config_file.read_text(encoding="utf-8", errors="ignore")
         except OSError as exc:
@@ -7182,21 +7185,21 @@ class HubState:
 
         self._ensure_agent_tools_mcp_runtime_script()
 
-        merged_text = self._strip_mcp_server_table(base_text, "agent_tools")
-        merged_text += (
-            "\n[mcp_servers.agent_tools]\n"
-            'command = "python3"\n'
-            f"args = [{json.dumps(AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH)}]\n"
-            "startup_timeout_sec = 20\n"
-            "tool_timeout_sec = 120\n"
-            "\n[mcp_servers.agent_tools.env]\n"
-            f"{AGENT_TOOLS_URL_ENV} = {json.dumps(normalized_agent_tools_url)}\n"
-            f"{AGENT_TOOLS_TOKEN_ENV} = {json.dumps(normalized_agent_tools_token)}\n"
-            f"{AGENT_TOOLS_PROJECT_ID_ENV} = {json.dumps(str(agent_tools_project_id or '').strip())}\n"
-            f"{AGENT_TOOLS_CHAT_ID_ENV} = {json.dumps(str(agent_tools_chat_id or '').strip())}\n"
+        agent_provider = agent_providers.get_provider(agent_type)
+        mcp_env = {
+            AGENT_TOOLS_URL_ENV: normalized_agent_tools_url,
+            AGENT_TOOLS_TOKEN_ENV: normalized_agent_tools_token,
+            AGENT_TOOLS_PROJECT_ID_ENV: str(agent_tools_project_id or '').strip(),
+            AGENT_TOOLS_CHAT_ID_ENV: str(agent_tools_chat_id or '').strip(),
+        }
+        merged_text = agent_provider.build_mcp_config(
+            base_config_text=base_text,
+            mcp_env=mcp_env,
+            script_path=AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH,
         )
 
-        runtime_config_path = self._chat_runtime_config_path(chat_id)
+        ext = ".json" if isinstance(agent_provider, agent_providers.ClaudeProvider) else ".toml"
+        runtime_config_path = self.chat_runtime_configs_dir / f"{chat_id}{ext}"
         _write_private_env_file(runtime_config_path, merged_text)
         return runtime_config_path
 
@@ -9545,14 +9548,15 @@ class HubState:
             agent_tools_token = _new_agent_tools_token()
             agent_tools_url = self._chat_agent_tools_url(chat_id)
             agent_tools_project_id = str(project.get("id") or "")
+            agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
             runtime_config_file = self._prepare_chat_runtime_config(
                 chat_id,
+                agent_type=agent_type,
                 agent_tools_url=agent_tools_url,
                 agent_tools_token=agent_tools_token,
                 agent_tools_project_id=agent_tools_project_id,
                 agent_tools_chat_id=chat_id,
             )
-            agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
             agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
             chat["agent_type"] = agent_type
             container_workspace = _container_workspace_path_for_project(project.get("name") or project.get("id"))

@@ -1623,6 +1623,7 @@ Gemini CLI
 
         runtime_config_file = self.state._prepare_chat_runtime_config(
             "chat-mcp-test",
+            agent_type="codex",
             agent_tools_url="http://host.docker.internal:8765/api/chats/chat-mcp-test/agent-tools",
             agent_tools_token="mcp-token-test",
             agent_tools_project_id="project-mcp-test",
@@ -5906,6 +5907,7 @@ class CliEnvVarTests(unittest.TestCase):
                     "AGENT_HUB_AGENT_TOOLS_PROJECT_ID": "project-test",
                     "AGENT_HUB_AGENT_TOOLS_CHAT_ID": "chat-test",
                 },
+                agent_provider=image_cli.agent_providers.CodexProvider(),
             )
 
             runtime_text = runtime_config.read_text(encoding="utf-8")
@@ -6867,7 +6869,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("developer_instructions=", resume_script)
             self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
 
-    def test_resume_rejects_non_codex_agent_command(self) -> None:
+    def test_resume_supports_claude_agent_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -6896,8 +6898,7 @@ class CliEnvVarTests(unittest.TestCase):
                     ],
                 )
 
-            self.assertNotEqual(result.exit_code, 0)
-            self.assertIn("--resume is currently only supported when --agent-command is codex.", result.output)
+            self.assertEqual(result.exit_code, 0)
 
     def test_cli_mounts_codex_claude_and_gemini_dirs_for_container_home_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

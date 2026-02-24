@@ -24,6 +24,8 @@ from typing import Iterable, Iterator, Tuple
 
 import click
 
+from agent_cli import providers as agent_providers
+
 
 DEFAULT_BASE_IMAGE = "ubuntu:24.04"
 DEFAULT_SETUP_RUNTIME_IMAGE = "agent-ubuntu2204-setup:latest"
@@ -549,6 +551,7 @@ def _build_agent_tools_runtime_config(
     config_path: Path,
     host_codex_dir: Path,
     agent_tools_env: dict[str, str],
+    agent_provider: agent_providers.AgentProvider,
 ) -> Path:
     from agent_hub import server as hub_server
 
@@ -584,21 +587,19 @@ def _build_agent_tools_runtime_config(
     if not agent_tools_token:
         raise click.ClickException(f"Missing required {AGENT_TOOLS_TOKEN_ENV} for agent_tools MCP runtime config.")
 
-    merged_config = _strip_mcp_server_table(base_config, "agent_tools")
-    merged_config += (
-        "\n[mcp_servers.agent_tools]\n"
-        'command = "python3"\n'
-        f"args = [{json.dumps(AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH)}]\n"
-        "startup_timeout_sec = 20\n"
-        "tool_timeout_sec = 120\n"
-        "\n[mcp_servers.agent_tools.env]\n"
-        f"{AGENT_TOOLS_URL_ENV} = {json.dumps(agent_tools_url)}\n"
-        f"{AGENT_TOOLS_TOKEN_ENV} = {json.dumps(agent_tools_token)}\n"
-        f"{AGENT_TOOLS_PROJECT_ID_ENV} = {json.dumps(str(agent_tools_env.get(AGENT_TOOLS_PROJECT_ID_ENV) or '').strip())}\n"
-        f"{AGENT_TOOLS_CHAT_ID_ENV} = {json.dumps(str(agent_tools_env.get(AGENT_TOOLS_CHAT_ID_ENV) or '').strip())}\n"
+    merged_config = agent_provider.build_mcp_config(
+        base_config_text=base_config,
+        mcp_env={
+            AGENT_TOOLS_URL_ENV: agent_tools_url,
+            AGENT_TOOLS_TOKEN_ENV: agent_tools_token,
+            AGENT_TOOLS_PROJECT_ID_ENV: str(agent_tools_env.get(AGENT_TOOLS_PROJECT_ID_ENV) or '').strip(),
+            AGENT_TOOLS_CHAT_ID_ENV: str(agent_tools_env.get(AGENT_TOOLS_CHAT_ID_ENV) or '').strip(),
+        },
+        script_path=AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH,
     )
 
-    runtime_config_path = host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}.toml"
+    ext = ".json" if isinstance(agent_provider, agent_providers.ClaudeProvider) else ".toml"
+    runtime_config_path = host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}{ext}"
     try:
         _write_private_text_file(runtime_config_path, merged_config)
     except OSError as exc:
@@ -613,6 +614,7 @@ def _start_agent_tools_runtime_bridge(
     config_path: Path,
     system_prompt_path: Path,
     parsed_env_vars: list[str],
+    agent_provider: agent_providers.AgentProvider,
 ) -> _AgentToolsRuntimeBridge | None:
     if AGENT_TOOLS_URL_ENV in _env_var_keys(parsed_env_vars) or AGENT_TOOLS_TOKEN_ENV in _env_var_keys(parsed_env_vars):
         keys = _env_var_keys(parsed_env_vars)
@@ -624,6 +626,7 @@ def _start_agent_tools_runtime_bridge(
             config_path=config_path,
             host_codex_dir=host_codex_dir,
             agent_tools_env=_agent_tools_env_from_entries(parsed_env_vars),
+            agent_provider=agent_provider,
         )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
@@ -765,6 +768,7 @@ def _start_agent_tools_runtime_bridge(
             config_path=config_path,
             host_codex_dir=host_codex_dir,
             agent_tools_env=_agent_tools_env_from_entries(env_vars),
+            agent_provider=agent_provider,
         )
         return _AgentToolsRuntimeBridge(
             runtime_config_path=runtime_config_path,
@@ -1660,50 +1664,36 @@ def main(
         config_path,
         core_system_prompt=core_system_prompt,
     )
-    codex_runtime_flags = _codex_default_runtime_flags(
-        no_alt_screen=no_alt_screen,
-        explicit_args=explicit_container_args,
+    
+    agent_provider = agent_providers.get_provider(selected_agent_provider)
+    agent_provider.sync_shared_context_file(
+        host_agent_home=host_agent_home / f".{agent_provider.name}",
         shared_prompt_context=shared_prompt_context,
     )
-    if selected_agent_command == AGENT_PROVIDER_GEMINI:
-        _sync_gemini_shared_context_file(
-            host_gemini_dir=host_gemini_dir,
-            shared_prompt_context=shared_prompt_context,
-        )
+
+    runtime_flags = agent_provider.default_runtime_flags(
+        explicit_args=explicit_container_args,
+        shared_prompt_context=shared_prompt_context,
+        no_alt_screen=no_alt_screen,
+    )
 
     command = [selected_agent_command]
-    if selected_agent_command == DEFAULT_AGENT_COMMAND:
-        command.extend(codex_runtime_flags)
-    elif selected_agent_command == AGENT_PROVIDER_CLAUDE:
-        command.extend(
-            _claude_default_runtime_flags(
-                explicit_args=explicit_container_args,
-                shared_prompt_context=shared_prompt_context,
-            )
-        )
-    elif selected_agent_command == AGENT_PROVIDER_GEMINI:
-        command.extend(
-            _gemini_default_runtime_flags(
-                explicit_args=explicit_container_args,
-            )
-        )
+    command.extend(runtime_flags)
 
     if container_args:
         command.extend(explicit_container_args)
     elif resume:
-        if selected_agent_command != DEFAULT_AGENT_COMMAND:
-            raise click.ClickException("--resume is currently only supported when --agent-command is codex.")
         command = [
             "bash",
             "-lc",
-            _resume_shell_command(
+            agent_provider.resume_shell_command(
                 no_alt_screen=no_alt_screen,
-                agent_command=selected_agent_command,
-                codex_runtime_flags=codex_runtime_flags,
+                runtime_flags=runtime_flags,
             ),
         ]
 
     config_mount_target = f"{container_home_path}/.codex/config.toml:ro"
+    mcp_config_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path) + ":ro"
     config_mount_entry = f"{config_path}:{config_mount_target}"
     run_args = [
         "--init",
@@ -1869,20 +1859,23 @@ def main(
     runtime_bridge: _AgentToolsRuntimeBridge | None = None
     runtime_run_args = list(run_args)
     try:
-        if selected_agent_command == DEFAULT_AGENT_COMMAND:
-            runtime_bridge = _start_agent_tools_runtime_bridge(
-                project_path=project_path,
-                host_codex_dir=host_codex_dir,
-                config_path=config_path,
-                system_prompt_path=system_prompt_path,
-                parsed_env_vars=parsed_env_vars,
-            )
-            if runtime_bridge is not None:
-                runtime_run_args = list(run_args)
+        runtime_bridge = _start_agent_tools_runtime_bridge(
+            project_path=project_path,
+            host_codex_dir=host_agent_home / f".{agent_provider.name}",
+            config_path=config_path,
+            system_prompt_path=system_prompt_path,
+            parsed_env_vars=parsed_env_vars,
+            agent_provider=agent_provider,
+        )
+        if runtime_bridge is not None:
+            runtime_run_args = list(run_args)
+            if config_mount_entry in runtime_run_args and isinstance(agent_provider, agent_providers.CodexProvider):
                 mount_index = runtime_run_args.index(config_mount_entry)
-                runtime_run_args[mount_index] = f"{runtime_bridge.runtime_config_path}:{config_mount_target}"
-                for runtime_env in runtime_bridge.env_vars:
-                    runtime_run_args.extend(["--env", runtime_env])
+                runtime_run_args[mount_index] = f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"
+            else:
+                runtime_run_args.extend(["--volume", f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}"])
+            for runtime_env in runtime_bridge.env_vars:
+                runtime_run_args.extend(["--env", runtime_env])
 
         cmd = [
             "docker",
