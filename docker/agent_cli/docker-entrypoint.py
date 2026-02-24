@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import urllib.parse
 
 
 def _run(command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -27,39 +26,15 @@ def _configure_git_identity() -> None:
     _run(["git", "config", "--global", "user.email", git_user_email])
 
 
-def _read_git_credential_secret(credentials_path: Path, host: str) -> str | None:
-    normalized_host = str(host or "").strip().lower()
-    if not normalized_host or not credentials_path.is_file():
-        return None
-    try:
-        lines = credentials_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return None
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parsed = urllib.parse.urlparse(line)
-        if parsed.scheme != "https":
-            continue
-        if str(parsed.hostname or "").strip().lower() != normalized_host:
-            continue
-        if parsed.password is None:
-            continue
-        secret = urllib.parse.unquote(parsed.password).strip()
-        if secret:
-            return secret
-    return None
-
-
 def _prepare_git_credentials() -> None:
+    # Keep runtime git auth deterministic: only credential helper entries are allowed.
+    os.environ.pop("GH_TOKEN", None)
+    os.environ.pop("GITHUB_TOKEN", None)
+    os.environ.pop("GH_HOST", None)
+
     source_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_SOURCE", "").strip()
     target_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_FILE", "").strip()
-    host_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIAL_HOST", "").strip()
     if not source_raw:
-        if os.environ.get("GH_TOKEN") and not os.environ.get("GITHUB_TOKEN"):
-            os.environ["GITHUB_TOKEN"] = str(os.environ["GH_TOKEN"])
         return
 
     source_path = Path(source_raw)
@@ -83,17 +58,6 @@ def _prepare_git_credentials() -> None:
                 target_path.chmod(0o600)
             except OSError:
                 pass
-
-        if not os.environ.get("GH_TOKEN"):
-            secret = _read_git_credential_secret(source_path, host_raw)
-            if secret:
-                os.environ["GH_TOKEN"] = secret
-
-    if os.environ.get("GH_TOKEN") and not os.environ.get("GITHUB_TOKEN"):
-        os.environ["GITHUB_TOKEN"] = str(os.environ["GH_TOKEN"])
-    normalized_host = host_raw.strip().lower()
-    if normalized_host and normalized_host != "github.com" and not os.environ.get("GH_HOST"):
-        os.environ["GH_HOST"] = normalized_host
 
 
 def _set_umask() -> None:

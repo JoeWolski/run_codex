@@ -3534,6 +3534,10 @@ class HubState:
         if not normalized_request_id:
             return
         with self._auto_config_requests_lock:
+            # Keep existing request state so cancellation/process tracking cannot be reset
+            # by repeated registration calls for the same request id.
+            if normalized_request_id in self._auto_config_requests:
+                return
             self._auto_config_requests[normalized_request_id] = AutoConfigRequestState(request_id=normalized_request_id)
 
     def _set_auto_config_request_process(self, request_id: str, process: subprocess.Popen[str] | None = None) -> None:
@@ -6267,6 +6271,9 @@ class HubState:
         normalized_request_id = str(request_id or "").strip()[:AUTO_CONFIG_REQUEST_ID_MAX_CHARS]
         if normalized_request_id:
             self._register_auto_config_request(normalized_request_id)
+            if self._is_auto_config_request_cancelled(normalized_request_id):
+                self._clear_auto_config_request(normalized_request_id)
+                raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
 
         def emit_auto_config_log(text: str, replace: bool = False) -> None:
             if not normalized_request_id:
