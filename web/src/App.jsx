@@ -22,6 +22,7 @@ import {
   shouldShowManualProjectConfigInputs
 } from "./createProjectConfigMode";
 import { createFirstSeenOrderState, stableOrderItemsByFirstSeen } from "./stableListOrder";
+import { buildProjectChatFlexModels } from "./projectChatLayoutModels";
 import {
   MdArchive,
   MdAudiotrack,
@@ -3226,6 +3227,17 @@ function HubApp() {
       return null;
     }
   }, [chatFlexOuterLayoutReconciledJson]);
+  const chatFlexProjectModelsByProjectId = useMemo(
+    () =>
+      buildProjectChatFlexModels(
+        chatFlexProjectLayoutsReconciledByProjectId,
+        (projectLayoutJson) => Model.fromJson(projectLayoutJson),
+        (projectId, err) => {
+          console.error(`Failed to parse project chat flex layout model for ${projectId}.`, err);
+        }
+      ),
+    [chatFlexProjectLayoutsReconciledByProjectId]
+  );
   const chatFlexLayoutThemeClass = useMemo(
     () => `flexlayout__theme_${resolveEffectiveTheme(themePreference)}`,
     [themePreference]
@@ -3933,6 +3945,7 @@ function HubApp() {
     const previewableCurrentArtifacts = currentArtifactItems.filter(({ artifactInfo }) => artifactInfo.canPreview);
     const moveTerminalControlsToTabRow = Boolean(options?.moveTerminalControlsToTabRow) && !isFullscreenChat;
     const terminalToolbarActions = moveTerminalControlsToTabRow ? null : renderChatTerminalControlGroup(chat);
+    const terminalOverlay = !isRunning && isStarting ? <span className="inline-spinner" aria-hidden="true" /> : null;
 
     return (
       <article className={containerClassName} key={chat.id}>
@@ -3987,39 +4000,21 @@ function HubApp() {
             </section>
           ) : null}
 
-          {isRunning ? (
-            <ChatTerminal
-              key={`${resolvedChatId}-${isFullscreenChat ? "fullscreen" : "inline"}`}
-              chatId={resolvedChatId}
-              running={isRunning}
-              title={titleText}
-              titleStateLabel={titleStateLabel}
-              titleStateClassName={titleStatus}
-              toolbarActions={terminalToolbarActions}
-              showToolbar={!moveTerminalControlsToTabRow}
-              collapsed={terminalCollapsed}
-              tabs={terminalTabs}
-              activeTabId={activeTerminalTabId}
-              onTabSelect={onSelectTerminalTab}
-            />
-          ) : (
-            <ChatTerminal
-              key={`offline-${chat.id}-${isFullscreenChat ? "fullscreen" : "inline"}`}
-              chatId={resolvedChatId}
-              running={false}
-              statusOverride={terminalStatusOverride}
-              title={titleText}
-              titleStateLabel={titleStateLabel}
-              titleStateClassName={titleStatus}
-              toolbarActions={terminalToolbarActions}
-              showToolbar={!moveTerminalControlsToTabRow}
-              overlay={isStarting ? <span className="inline-spinner" aria-hidden="true" /> : null}
-              collapsed={terminalCollapsed}
-              tabs={terminalTabs}
-              activeTabId={activeTerminalTabId}
-              onTabSelect={onSelectTerminalTab}
-            />
-          )}
+          <ChatTerminal
+            chatId={resolvedChatId}
+            running={isRunning}
+            statusOverride={terminalStatusOverride}
+            title={titleText}
+            titleStateLabel={titleStateLabel}
+            titleStateClassName={titleStatus}
+            toolbarActions={terminalToolbarActions}
+            showToolbar={!moveTerminalControlsToTabRow}
+            overlay={terminalOverlay}
+            collapsed={terminalCollapsed}
+            tabs={terminalTabs}
+            activeTabId={activeTerminalTabId}
+            onTabSelect={onSelectTerminalTab}
+          />
 
           {!terminalCollapsed && !isRunning && chatHasServer && !isStarting ? (
             <div className="stack compact">
@@ -4362,11 +4357,8 @@ function HubApp() {
     if (!projectChatLayoutJson || !projectChatLayoutJson.layout || typeof projectChatLayoutJson.layout !== "object") {
       return <div className="empty">No chats yet for this project.</div>;
     }
-    let projectChatModel;
-    try {
-      projectChatModel = Model.fromJson(projectChatLayoutJson);
-    } catch (err) {
-      console.error(`Failed to parse project chat flex layout model for ${project.id}.`, err);
+    const projectChatModel = chatFlexProjectModelsByProjectId[project.id];
+    if (!projectChatModel) {
       return <div className="empty">Unable to load saved chat layout for this project.</div>;
     }
     const chatsById = new Map(projectChats.map((chat) => [String(chat.id || ""), chat]));
