@@ -41,6 +41,8 @@ GEMINI_CONTEXT_FILE_NAME = "GEMINI.md"
 SYSTEM_PROMPT_FILE_NAME = "SYSTEM_PROMPT.md"
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777,exec"
+DEFAULT_RUNTIME_TERM = "xterm-256color"
+DEFAULT_RUNTIME_COLORTERM = "truecolor"
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 AGENT_HUB_SECRETS_DIR_NAME = "secrets"
@@ -75,6 +77,22 @@ def _has_codex_config_override(args: Iterable[str], *, key: str) -> bool:
         if config_key.strip() == key:
             return True
     return False
+
+
+def _resolved_runtime_term(env: dict[str, str] | None = None) -> str:
+    source = os.environ if env is None else env
+    candidate = str(source.get("TERM", "")).strip()
+    if not candidate or candidate.lower() == "dumb":
+        return DEFAULT_RUNTIME_TERM
+    return candidate
+
+
+def _resolved_runtime_colorterm(env: dict[str, str] | None = None) -> str:
+    source = os.environ if env is None else env
+    candidate = str(source.get("COLORTERM", "")).strip()
+    if not candidate:
+        return DEFAULT_RUNTIME_COLORTERM
+    return candidate
 
 
 def _toml_basic_string_literal(value: str) -> str:
@@ -1216,6 +1234,10 @@ def main(
         f"CONTAINER_HOME={container_home_path}",
         "--env",
         f"PATH={container_home_path}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--env",
+        f"TERM={_resolved_runtime_term()}",
+        "--env",
+        f"COLORTERM={_resolved_runtime_colorterm()}",
         "--env",
         "NVIDIA_VISIBLE_DEVICES=all",
         "--env",

@@ -6154,6 +6154,102 @@ class CliEnvVarTests(unittest.TestCase):
                 env_values,
             )
 
+    def test_cli_replaces_dumb_term_with_xterm_256color_in_runtime_container(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch.dict(os.environ, {"TERM": "dumb"}, clear=False), patch(
+                "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("TERM=xterm-256color", env_values)
+            self.assertIn("COLORTERM=truecolor", env_values)
+
+    def test_cli_preserves_host_terminal_env_in_runtime_container(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch.dict(
+                os.environ,
+                {"TERM": "screen-256color", "COLORTERM": "24bit"},
+                clear=False,
+            ), patch(
+                "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("TERM=screen-256color", env_values)
+            self.assertIn("COLORTERM=24bit", env_values)
+
     def test_cli_rejects_mount_targets_inside_project_mount_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
