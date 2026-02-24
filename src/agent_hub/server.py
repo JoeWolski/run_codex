@@ -35,6 +35,7 @@ from threading import Lock, Thread, current_thread
 from typing import Any, Callable
 
 import click
+from agent_cli import cli as agent_cli_image
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
@@ -153,6 +154,8 @@ AGENT_CAPABILITY_HELP_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,80}")
 AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS = float(
     os.environ.get("AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS", "8.0")
 )
+AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE_ENV = "AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE"
+AGENT_CAPABILITY_DISCOVERY_RUNTIME_IMAGE_PREFIX = "agent-hub-capability"
 AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE = {
     AGENT_TYPE_CODEX: (
         ("codex", "--help"),
@@ -1345,9 +1348,23 @@ def _extract_reasoning_candidates_from_output(output_text: str, agent_type: str)
 
 
 def _run_agent_capability_probe(cmd: list[str], timeout_seconds: float) -> tuple[int, str]:
+    tokens = [str(token).strip() for token in cmd if str(token).strip()]
+    if not tokens:
+        return 2, "empty capability probe command"
+
+    provider = _agent_capability_provider_for_command(tokens[0])
+    if not provider:
+        return 2, f"unsupported capability probe command: {tokens[0]}"
+
+    try:
+        runtime_image = _ensure_agent_capability_runtime_image(provider)
+    except RuntimeError as exc:
+        return 125, str(exc)
+
+    docker_cmd = ["docker", "run", "--rm", runtime_image, *tokens]
     try:
         result = subprocess.run(
-            cmd,
+            docker_cmd,
             check=False,
             text=True,
             capture_output=True,
@@ -1359,7 +1376,61 @@ def _run_agent_capability_probe(cmd: list[str], timeout_seconds: float) -> tuple
         output_text = f"{exc.stdout or ''}\n{exc.stderr or ''}".strip()
         return 124, output_text
     except FileNotFoundError:
-        return 127, ""
+        return 125, "docker command not found in PATH"
+
+
+def _agent_capability_provider_for_command(command: str) -> str:
+    normalized_command = Path(str(command or "").strip()).name.lower()
+    for agent_type, agent_command in AGENT_COMMAND_BY_TYPE.items():
+        if normalized_command == str(agent_command).strip().lower():
+            return agent_type
+    return ""
+
+
+def _agent_capability_discovery_base_image() -> str:
+    configured = str(os.environ.get(AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE_ENV, "")).strip()
+    if configured:
+        return configured
+    return DEFAULT_AGENT_IMAGE
+
+
+def _agent_capability_runtime_image_tag(agent_provider: str, base_image: str) -> str:
+    safe_provider = re.sub(r"[^a-z0-9_.-]+", "-", str(agent_provider or "").strip().lower()).strip("-")
+    if not safe_provider:
+        safe_provider = "agent"
+    payload = json.dumps(
+        {
+            "provider": str(agent_provider or "").strip().lower(),
+            "base_image": str(base_image or "").strip(),
+            "runtime_inputs_fingerprint": _agent_cli_runtime_inputs_fingerprint(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"{AGENT_CAPABILITY_DISCOVERY_RUNTIME_IMAGE_PREFIX}-{safe_provider}-{digest}"
+
+
+def _ensure_agent_capability_runtime_image(agent_provider: str) -> str:
+    normalized_provider = _normalize_chat_agent_type(agent_provider)
+    if normalized_provider not in SUPPORTED_CHAT_AGENT_TYPES:
+        raise RuntimeError(f"Unsupported capability discovery provider: {agent_provider}")
+    base_image = _agent_capability_discovery_base_image()
+    runtime_image = _agent_capability_runtime_image_tag(normalized_provider, base_image)
+    try:
+        agent_cli_image._ensure_runtime_image_built_if_missing(
+            base_image=base_image,
+            target_image=runtime_image,
+            agent_provider=normalized_provider,
+        )
+    except click.ClickException as exc:
+        raise RuntimeError(
+            "Capability discovery runtime image build failed "
+            f"(base_image={base_image}, provider={normalized_provider}, target_image={runtime_image}): {exc}"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("docker command not found in PATH") from exc
+    return runtime_image
 
 
 def _read_openai_api_key(path: Path) -> str | None:

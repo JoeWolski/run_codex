@@ -291,6 +291,66 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(codex["models"], ["default", "gpt-6-codex"])
         self.assertEqual(codex["reasoning_modes"], ["default", "low", "high"])
 
+    def test_ensure_agent_capability_runtime_image_uses_default_base_image(self) -> None:
+        with patch.dict(
+            os.environ,
+            {hub_server.AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE_ENV: ""},
+            clear=False,
+        ), patch(
+            "agent_hub.server._agent_cli_runtime_inputs_fingerprint",
+            return_value="runtime-fingerprint-test",
+        ), patch(
+            "agent_hub.server.agent_cli_image._ensure_runtime_image_built_if_missing",
+        ) as ensure_runtime_image:
+            expected_runtime_image = hub_server._agent_capability_runtime_image_tag(
+                hub_server.AGENT_TYPE_GEMINI,
+                hub_server.DEFAULT_AGENT_IMAGE,
+            )
+            runtime_image = hub_server._ensure_agent_capability_runtime_image(hub_server.AGENT_TYPE_GEMINI)
+        self.assertEqual(runtime_image, expected_runtime_image)
+        ensure_runtime_image.assert_called_once_with(
+            base_image=hub_server.DEFAULT_AGENT_IMAGE,
+            target_image=expected_runtime_image,
+            agent_provider=hub_server.AGENT_TYPE_GEMINI,
+        )
+
+    def test_run_agent_capability_probe_executes_inside_runtime_container(self) -> None:
+        runtime_image = "agent-hub-capability-claude-test"
+        with patch(
+            "agent_hub.server._ensure_agent_capability_runtime_image",
+            return_value=runtime_image,
+        ) as ensure_runtime_image, patch(
+            "agent_hub.server.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                ["docker", "run", "--rm", runtime_image, "claude", "--help"],
+                0,
+                "Claude Code help output",
+                "",
+            ),
+        ) as run_mock:
+            return_code, output = hub_server._run_agent_capability_probe(["claude", "--help"], 6.5)
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(output, "Claude Code help output")
+        ensure_runtime_image.assert_called_once_with("claude")
+        run_mock.assert_called_once_with(
+            ["docker", "run", "--rm", runtime_image, "claude", "--help"],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=6.5,
+        )
+
+    def test_run_agent_capability_probe_returns_build_failure_details(self) -> None:
+        with patch(
+            "agent_hub.server._ensure_agent_capability_runtime_image",
+            side_effect=RuntimeError("build failed: docker daemon unavailable"),
+        ):
+            return_code, output = hub_server._run_agent_capability_probe(["gemini", "--help"], 6.0)
+
+        self.assertEqual(return_code, 125)
+        self.assertIn("build failed: docker daemon unavailable", output)
+
     def test_agent_capabilities_discovery_updates_cached_modes(self) -> None:
         def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
             if cmd == ["codex", "--help"]:
