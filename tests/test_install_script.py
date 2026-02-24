@@ -62,8 +62,11 @@ class InstallScriptTests(unittest.TestCase):
         result = self._run_install("--skip-add-path", "none")
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+        managed_repo = self.home / ".local" / "share" / "agent_hub" / "repo"
         agent_cli_path = self.home / ".local" / "bin" / "agent_cli"
         agent_hub_path = self.home / ".local" / "bin" / "agent_hub"
+        self.assertTrue(managed_repo.exists())
+        self.assertTrue((managed_repo / ".git").exists())
         self.assertTrue(agent_cli_path.exists())
         self.assertTrue(agent_hub_path.exists())
         self.assertTrue(agent_cli_path.stat().st_mode & stat.S_IXUSR)
@@ -75,17 +78,23 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn('UPDATE_METHOD=none', hub_content)
         self.assertIn('TOOL_NAME=agent_cli', cli_content)
         self.assertIn('TOOL_NAME=agent_hub', hub_content)
+        self.assertIn(f'SOURCE_REPO_ROOT={managed_repo}', cli_content)
+        self.assertIn(f'SOURCE_REPO_ROOT={managed_repo}', hub_content)
+        self.assertNotIn(f'SOURCE_REPO_ROOT={ROOT}', cli_content)
         self.assertIn('exec "${repo_root}/bin/${TOOL_NAME}" "$@"', cli_content)
 
     def test_installs_launchers_with_head_update_method(self) -> None:
         result = self._run_install("--skip-add-path", "head")
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+        managed_repo = self.home / ".local" / "share" / "agent_hub" / "repo"
         agent_cli_path = self.home / ".local" / "bin" / "agent_cli"
+        self.assertTrue(managed_repo.exists())
         self.assertTrue(agent_cli_path.exists())
 
         cli_content = agent_cli_path.read_text(encoding="utf-8")
         self.assertIn('UPDATE_METHOD=head', cli_content)
+        self.assertIn(f'SOURCE_REPO_ROOT={managed_repo}', cli_content)
         self.assertIn('git -C "${SOURCE_REPO_ROOT}" fetch --quiet --prune origin "${default_branch}"', cli_content)
         self.assertIn(
             'git -C "${SOURCE_REPO_ROOT}" worktree add --quiet --detach "${worktree_path}" "${target_commit}"',

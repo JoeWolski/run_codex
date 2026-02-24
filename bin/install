@@ -184,14 +184,44 @@ append_path_line_to_rc() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
+MANAGED_REPO_ROOT="${XDG_DATA_HOME:-${HOME}/.local/share}/agent_hub/repo"
 
 parse_args "$@"
 
 mkdir -p "${INSTALL_DIR}"
 
-REPO_ROOT_ESCAPED=""
+prepare_managed_repo() {
+  local managed_repo_parent=""
+  managed_repo_parent="$(dirname "${MANAGED_REPO_ROOT}")"
+  mkdir -p "${managed_repo_parent}"
+
+  if [[ -e "${MANAGED_REPO_ROOT}" && ! -d "${MANAGED_REPO_ROOT}" ]]; then
+    echo "Error: managed repository path exists and is not a directory: ${MANAGED_REPO_ROOT}" >&2
+    exit 1
+  fi
+
+  if [[ -d "${MANAGED_REPO_ROOT}" ]]; then
+    rm -rf "${MANAGED_REPO_ROOT}"
+  fi
+
+  git clone --quiet --no-hardlinks "${REPO_ROOT}" "${MANAGED_REPO_ROOT}"
+
+  local source_origin_url=""
+  if source_origin_url="$(git -C "${REPO_ROOT}" remote get-url origin 2>/dev/null)"; then
+    git -C "${MANAGED_REPO_ROOT}" remote set-url origin "${source_origin_url}"
+  fi
+
+  local source_origin_head_ref=""
+  if source_origin_head_ref="$(git -C "${REPO_ROOT}" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)"; then
+    git -C "${MANAGED_REPO_ROOT}" symbolic-ref refs/remotes/origin/HEAD "${source_origin_head_ref}"
+  fi
+}
+
+prepare_managed_repo
+
+MANAGED_REPO_ROOT_ESCAPED=""
 UPDATE_METHOD_ESCAPED=""
-printf -v REPO_ROOT_ESCAPED "%q" "${REPO_ROOT}"
+printf -v MANAGED_REPO_ROOT_ESCAPED "%q" "${MANAGED_REPO_ROOT}"
 printf -v UPDATE_METHOD_ESCAPED "%q" "${UPDATE_METHOD}"
 
 install_launcher() {
@@ -204,7 +234,7 @@ install_launcher() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE_REPO_ROOT=${REPO_ROOT_ESCAPED}
+SOURCE_REPO_ROOT=${MANAGED_REPO_ROOT_ESCAPED}
 UPDATE_METHOD=${UPDATE_METHOD_ESCAPED}
 TOOL_NAME=${tool_name_escaped}
 
@@ -316,4 +346,5 @@ ensure_install_dir_on_path
 echo "Installed launchers:"
 echo "  ${INSTALL_DIR}/agent_cli"
 echo "  ${INSTALL_DIR}/agent_hub"
+echo "Managed repository: ${MANAGED_REPO_ROOT}"
 echo "Update Method: ${UPDATE_METHOD}"

@@ -100,8 +100,13 @@ If you want `agent_cli` and `agent_hub` available directly on your PATH, run:
 
 `<Update Method>` is required and must be one of:
 
-- `none`: run tools from your current local checkout.
-- `head`: before every run, fetch the latest commit on the repository default branch (`origin/HEAD`) and run that updated commit via a cached git worktree.
+- `none`: run tools from the managed clone in `~/.local/share/agent_hub/repo`.
+- `head`: before every run, fetch the latest commit on the repository default branch (`origin/HEAD`) from the managed clone and run that updated commit via a cached git worktree.
+
+Install behavior:
+
+- `./bin/install` creates or refreshes a managed repository clone at `~/.local/share/agent_hub/repo`.
+- Launchers installed into `~/.local/bin` always reference that managed clone, so they keep working even if the checkout used to run `./bin/install` is deleted later.
 
 PATH handling behavior:
 
