@@ -1621,12 +1621,26 @@ Gemini CLI
             encoding="utf-8",
         )
 
-        runtime_config_file = self.state._prepare_chat_runtime_config("chat-mcp-test")
+        runtime_config_file = self.state._prepare_chat_runtime_config(
+            "chat-mcp-test",
+            agent_tools_url="http://host.docker.internal:8765/api/chats/chat-mcp-test/agent-tools",
+            agent_tools_token="mcp-token-test",
+            agent_tools_project_id="project-mcp-test",
+            agent_tools_chat_id="chat-mcp-test",
+        )
 
         runtime_text = runtime_config_file.read_text(encoding="utf-8")
         self.assertNotIn("legacy.server", runtime_text)
         self.assertIn(f'args = ["{hub_server.AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH}"]', runtime_text)
         self.assertNotIn('args = ["-m", "agent_hub.agent_tools_mcp"]', runtime_text)
+        self.assertIn("[mcp_servers.agent_tools.env]", runtime_text)
+        self.assertIn(
+            'AGENT_HUB_AGENT_TOOLS_URL = "http://host.docker.internal:8765/api/chats/chat-mcp-test/agent-tools"',
+            runtime_text,
+        )
+        self.assertIn('AGENT_HUB_AGENT_TOOLS_TOKEN = "mcp-token-test"', runtime_text)
+        self.assertIn('AGENT_HUB_AGENT_TOOLS_PROJECT_ID = "project-mcp-test"', runtime_text)
+        self.assertIn('AGENT_HUB_AGENT_TOOLS_CHAT_ID = "chat-mcp-test"', runtime_text)
         self.assertTrue(self.state.agent_tools_mcp_runtime_script.exists())
         self.assertEqual(
             self.state.agent_tools_mcp_runtime_script.read_text(encoding="utf-8"),
@@ -5874,6 +5888,32 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("RW mount preflight failed", result.output)
             self.assertIn("owner uid does not match runtime uid", result.output)
             self.assertEqual(commands, [])
+
+    def test_build_agent_tools_runtime_config_includes_agent_tools_env_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = tmp_path / "agent.config.toml"
+            host_codex_dir = tmp_path / ".codex"
+            host_codex_dir.mkdir(parents=True, exist_ok=True)
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            runtime_config = image_cli._build_agent_tools_runtime_config(
+                config_path=config,
+                host_codex_dir=host_codex_dir,
+                agent_tools_env={
+                    "AGENT_HUB_AGENT_TOOLS_URL": "http://host.docker.internal:48123",
+                    "AGENT_HUB_AGENT_TOOLS_TOKEN": "test-token",
+                    "AGENT_HUB_AGENT_TOOLS_PROJECT_ID": "project-test",
+                    "AGENT_HUB_AGENT_TOOLS_CHAT_ID": "chat-test",
+                },
+            )
+
+            runtime_text = runtime_config.read_text(encoding="utf-8")
+            self.assertIn("[mcp_servers.agent_tools.env]", runtime_text)
+            self.assertIn('AGENT_HUB_AGENT_TOOLS_URL = "http://host.docker.internal:48123"', runtime_text)
+            self.assertIn('AGENT_HUB_AGENT_TOOLS_TOKEN = "test-token"', runtime_text)
+            self.assertIn('AGENT_HUB_AGENT_TOOLS_PROJECT_ID = "project-test"', runtime_text)
+            self.assertIn('AGENT_HUB_AGENT_TOOLS_CHAT_ID = "chat-test"', runtime_text)
 
     def test_agent_cli_default_run_mounts_runtime_agent_tools_config_and_env(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

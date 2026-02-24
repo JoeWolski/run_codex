@@ -92,6 +92,10 @@ DEFAULT_PORT = 8765
 DEFAULT_CONTAINER_HOME = "/workspace"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
+AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
+AGENT_TOOLS_TOKEN_ENV = "AGENT_HUB_AGENT_TOOLS_TOKEN"
+AGENT_TOOLS_PROJECT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_PROJECT_ID"
+AGENT_TOOLS_CHAT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_CHAT_ID"
 AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
     PurePosixPath(DEFAULT_CONTAINER_HOME)
     / ".codex"
@@ -395,10 +399,10 @@ RESERVED_ENV_VAR_KEYS = {
     "OPENAI_API_KEY",
     "AGENT_HUB_GIT_USER_NAME",
     "AGENT_HUB_GIT_USER_EMAIL",
-    "AGENT_HUB_AGENT_TOOLS_URL",
-    "AGENT_HUB_AGENT_TOOLS_TOKEN",
-    "AGENT_HUB_AGENT_TOOLS_PROJECT_ID",
-    "AGENT_HUB_AGENT_TOOLS_CHAT_ID",
+    AGENT_TOOLS_URL_ENV,
+    AGENT_TOOLS_TOKEN_ENV,
+    AGENT_TOOLS_PROJECT_ID_ENV,
+    AGENT_TOOLS_CHAT_ID_ENV,
 }
 AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
 HUB_LOG_LEVEL_CHOICES = ("critical", "error", "warning", "info", "debug")
@@ -6102,7 +6106,15 @@ class HubState:
         container_workspace = str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name)
         container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
         session_id, session_token = self._create_agent_tools_session(repo_url=repo_url)
-        runtime_config_file = self._prepare_chat_runtime_config(f"auto-config-{session_id}")
+        agent_tools_url = f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}"
+        agent_tools_chat_id = f"auto-config:{session_id}"
+        runtime_config_file = self._prepare_chat_runtime_config(
+            f"auto-config-{session_id}",
+            agent_tools_url=agent_tools_url,
+            agent_tools_token=session_token,
+            agent_tools_project_id="",
+            agent_tools_chat_id=agent_tools_chat_id,
+        )
         cmd = [
             "uv",
             "run",
@@ -6132,10 +6144,10 @@ class HubState:
         )
         for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url):
             cmd.extend(["--env-var", git_identity_env])
-        cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_URL={self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}"])
-        cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_TOKEN={session_token}"])
-        cmd.extend(["--env-var", "AGENT_HUB_AGENT_TOOLS_PROJECT_ID="])
-        cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_CHAT_ID=auto-config:{session_id}"])
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}"])
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={session_token}"])
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}="])
+        cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}"])
         cmd.extend(
             [
                 "--",
@@ -7134,11 +7146,32 @@ class HubState:
         stripped = re.sub(pattern, "", config_text)
         return stripped.rstrip() + "\n"
 
-    def _prepare_chat_runtime_config(self, chat_id: str) -> Path:
+    def _prepare_chat_runtime_config(
+        self,
+        chat_id: str,
+        *,
+        agent_tools_url: str,
+        agent_tools_token: str,
+        agent_tools_project_id: str,
+        agent_tools_chat_id: str,
+    ) -> Path:
         try:
             base_text = self.config_file.read_text(encoding="utf-8", errors="ignore")
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Failed to read config file: {self.config_file}") from exc
+
+        normalized_agent_tools_url = str(agent_tools_url or "").strip()
+        normalized_agent_tools_token = str(agent_tools_token or "").strip()
+        if not normalized_agent_tools_url:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Missing required {AGENT_TOOLS_URL_ENV} while preparing runtime config for {chat_id}.",
+            )
+        if not normalized_agent_tools_token:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Missing required {AGENT_TOOLS_TOKEN_ENV} while preparing runtime config for {chat_id}.",
+            )
 
         self._ensure_agent_tools_mcp_runtime_script()
 
@@ -7149,6 +7182,11 @@ class HubState:
             f"args = [{json.dumps(AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH)}]\n"
             "startup_timeout_sec = 20\n"
             "tool_timeout_sec = 120\n"
+            "\n[mcp_servers.agent_tools.env]\n"
+            f"{AGENT_TOOLS_URL_ENV} = {json.dumps(normalized_agent_tools_url)}\n"
+            f"{AGENT_TOOLS_TOKEN_ENV} = {json.dumps(normalized_agent_tools_token)}\n"
+            f"{AGENT_TOOLS_PROJECT_ID_ENV} = {json.dumps(str(agent_tools_project_id or '').strip())}\n"
+            f"{AGENT_TOOLS_CHAT_ID_ENV} = {json.dumps(str(agent_tools_chat_id or '').strip())}\n"
         )
 
         runtime_config_path = self._chat_runtime_config_path(chat_id)
@@ -9498,7 +9536,15 @@ class HubState:
                 self._chat_input_ansi_carry[chat_id] = ""
             artifact_publish_token = _new_artifact_publish_token()
             agent_tools_token = _new_agent_tools_token()
-            runtime_config_file = self._prepare_chat_runtime_config(chat_id)
+            agent_tools_url = self._chat_agent_tools_url(chat_id)
+            agent_tools_project_id = str(project.get("id") or "")
+            runtime_config_file = self._prepare_chat_runtime_config(
+                chat_id,
+                agent_tools_url=agent_tools_url,
+                agent_tools_token=agent_tools_token,
+                agent_tools_project_id=agent_tools_project_id,
+                agent_tools_chat_id=chat_id,
+            )
             agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
             agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
             chat["agent_type"] = agent_type
@@ -9545,10 +9591,10 @@ class HubState:
                 cmd.extend(["--rw-mount", mount])
             cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACTS_URL={self._chat_artifact_publish_url(chat_id)}"])
             cmd.extend(["--env-var", f"AGENT_HUB_ARTIFACT_TOKEN={artifact_publish_token}"])
-            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_URL={self._chat_agent_tools_url(chat_id)}"])
-            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_TOKEN={agent_tools_token}"])
-            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_PROJECT_ID={project.get('id')}"])
-            cmd.extend(["--env-var", f"AGENT_HUB_AGENT_TOOLS_CHAT_ID={chat_id}"])
+            cmd.extend(["--env-var", f"{AGENT_TOOLS_URL_ENV}={agent_tools_url}"])
+            cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}"])
+            cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}"])
+            cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={chat_id}"])
             for env_entry in chat.get("env_vars") or []:
                 if _is_reserved_env_entry(str(env_entry)):
                     continue
