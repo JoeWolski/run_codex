@@ -13,7 +13,8 @@ import {
 } from "./chatLayoutEngines";
 import {
   layoutJsonEquals,
-  reconcileOuterFlexLayoutJson
+  reconcileOuterFlexLayoutJson,
+  reconcileProjectChatsFlexLayoutJson
 } from "./flexLayoutState";
 import {
   isAutoCreateProjectConfigMode,
@@ -38,8 +39,8 @@ import {
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY = "agent_hub_project_config_mode";
 const CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY = "agent_hub_chat_flexlayout_outer_layout_v1";
+const CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY = "agent_hub_chat_flexlayout_project_layout_v1";
 const CHAT_TERMINAL_COLLAPSE_STORAGE_KEY = "agent_hub_chat_terminal_collapse_v1";
-const CHAT_PROJECT_TERMINAL_TAB_STORAGE_KEY = "agent_hub_chat_project_terminal_tab_v1";
 const DEFAULT_BASE_IMAGE_TAG = "ubuntu:24.04";
 const DEFAULT_AGENT_TYPE = "codex";
 const DEFAULT_HUB_SETTINGS = {
@@ -318,6 +319,24 @@ function writeLocalStorageJson(storageKey, value) {
   } catch {
     // Ignore storage write failures and continue with in-memory state.
   }
+}
+
+function layoutJsonMapEquals(left, right) {
+  const leftEntries = Object.entries(left || {});
+  const rightEntries = Object.entries(right || {});
+  if (leftEntries.length !== rightEntries.length) {
+    return false;
+  }
+  for (const [key, leftLayoutJson] of leftEntries) {
+    if (!Object.prototype.hasOwnProperty.call(right || {}, key)) {
+      return false;
+    }
+    const rightLayoutJson = right[key];
+    if (!layoutJsonEquals(leftLayoutJson || null, rightLayoutJson || null)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function applyThemePreference(preference) {
@@ -887,6 +906,7 @@ function ChatTerminal({
   titleStateClassName = "",
   statusOverride = "",
   toolbarActions = null,
+  showToolbar = true,
   overlay = null,
   collapsed = false,
   tabs = [],
@@ -899,6 +919,7 @@ function ChatTerminal({
   const statusText = String(status || "unknown").toLowerCase();
   const displayStatus = String(statusOverride || statusText || "unknown").toLowerCase();
   const hasTabs = Array.isArray(tabs) && tabs.length > 0;
+  const renderToolbar = Boolean(showToolbar);
 
   useEffect(() => {
     if (!running) {
@@ -1084,63 +1105,76 @@ function ChatTerminal({
     };
   }, [chatId, running]);
 
-  const shellClasses = ["terminal-shell", "chat-terminal-shell", collapsed ? "terminal-shell-collapsed" : ""]
+  const shellClasses = [
+    "terminal-shell",
+    "chat-terminal-shell",
+    renderToolbar ? "" : "terminal-shell-no-toolbar",
+    collapsed ? "terminal-shell-collapsed" : ""
+  ]
     .filter(Boolean)
     .join(" ");
-  const viewClasses = ["terminal-view", collapsed ? "terminal-view-collapsed" : ""].filter(Boolean).join(" ");
+  const viewClasses = [
+    "terminal-view",
+    renderToolbar ? "" : "terminal-view-no-toolbar",
+    collapsed ? "terminal-view-collapsed" : ""
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div className={shellClasses} ref={shellRef}>
-      <div className="terminal-toolbar">
-        <div className="terminal-toolbar-main">
-          <span
-            className={`terminal-health-dot ${displayStatus}`}
-            role="img"
-            aria-label={`Terminal health: ${displayStatus}`}
-            title={displayStatus}
-          />
-          {hasTabs ? (
-            <div className="terminal-toolbar-tabs" role="tablist" aria-label="Chat tabs">
-              {tabs.map((tab) => {
-                const tabId = String(tab?.id || "");
-                const tabLabel = String(tab?.label || tabId || "Chat");
-                const isSelected = tabId && tabId === String(activeTabId || "");
-                return (
-                  <button
-                    key={`terminal-tab-${tabId || tabLabel}`}
-                    type="button"
-                    role="tab"
-                    className={`terminal-toolbar-tab ${isSelected ? "selected" : ""}`.trim()}
-                    aria-selected={isSelected}
-                    aria-label={tabLabel}
-                    onClick={() => {
-                      if (typeof onTabSelect === "function" && tabId) {
-                        onTabSelect(tabId);
-                      }
-                    }}
-                  >
-                    {tabLabel}
-                  </button>
-                );
-              })}
+      {renderToolbar ? (
+        <div className="terminal-toolbar">
+          <div className="terminal-toolbar-main">
+            <span
+              className={`terminal-health-dot ${displayStatus}`}
+              role="img"
+              aria-label={`Terminal health: ${displayStatus}`}
+              title={displayStatus}
+            />
+            {hasTabs ? (
+              <div className="terminal-toolbar-tabs" role="tablist" aria-label="Chat tabs">
+                {tabs.map((tab) => {
+                  const tabId = String(tab?.id || "");
+                  const tabLabel = String(tab?.label || tabId || "Chat");
+                  const isSelected = tabId && tabId === String(activeTabId || "");
+                  return (
+                    <button
+                      key={`terminal-tab-${tabId || tabLabel}`}
+                      type="button"
+                      role="tab"
+                      className={`terminal-toolbar-tab ${isSelected ? "selected" : ""}`.trim()}
+                      aria-selected={isSelected}
+                      aria-label={tabLabel}
+                      onClick={() => {
+                        if (typeof onTabSelect === "function" && tabId) {
+                          onTabSelect(tabId);
+                        }
+                      }}
+                    >
+                      {tabLabel}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : title ? (
+              <span className="terminal-title" title={title}>
+                {title}
+              </span>
+            ) : null}
+            {titleStateLabel ? (
+              <span className={`chat-title-state ${titleStateClassName}`.trim()}>
+                {titleStateLabel}
+              </span>
+            ) : null}
+          </div>
+          {toolbarActions ? (
+            <div className="terminal-toolbar-actions">
+              {toolbarActions}
             </div>
-          ) : title ? (
-            <span className="terminal-title" title={title}>
-              {title}
-            </span>
-          ) : null}
-          {titleStateLabel ? (
-            <span className={`chat-title-state ${titleStateClassName}`.trim()}>
-              {titleStateLabel}
-            </span>
           ) : null}
         </div>
-        {toolbarActions ? (
-          <div className="terminal-toolbar-actions">
-            {toolbarActions}
-          </div>
-        ) : null}
-      </div>
+      ) : null}
       <div className={viewClasses} ref={hostRef} />
       {!collapsed && overlay ? <div className="terminal-overlay">{overlay}</div> : null}
     </div>
@@ -1635,8 +1669,8 @@ function HubApp() {
     const loaded = readLocalStorageJson(CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY, null);
     return loaded && typeof loaded === "object" ? loaded : null;
   });
-  const [activeProjectTerminalTabByProjectId, setActiveProjectTerminalTabByProjectId] = useState(() => {
-    const loaded = readLocalStorageJson(CHAT_PROJECT_TERMINAL_TAB_STORAGE_KEY, {});
+  const [chatFlexProjectLayoutsByProjectId, setChatFlexProjectLayoutsByProjectId] = useState(() => {
+    const loaded = readLocalStorageJson(CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY, {});
     if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
       return {};
     }
@@ -3157,6 +3191,25 @@ function HubApp() {
     () => reconcileOuterFlexLayoutJson(chatFlexOuterLayoutJson, orderedProjects, chatsByProject.orphanChats.length > 0),
     [chatFlexOuterLayoutJson, orderedProjects, chatsByProject.orphanChats.length]
   );
+  const chatFlexProjectLayoutsReconciledByProjectId = useMemo(() => {
+    const nextLayoutsByProjectId = {};
+    for (const project of orderedProjects) {
+      const projectId = String(project.id || "");
+      if (!projectId) {
+        continue;
+      }
+      const projectChats = chatsByProject.byProject.get(projectId) || [];
+      const reconciled = reconcileProjectChatsFlexLayoutJson(
+        chatFlexProjectLayoutsByProjectId[projectId],
+        projectChats,
+        projectId
+      );
+      if (reconciled) {
+        nextLayoutsByProjectId[projectId] = reconciled;
+      }
+    }
+    return nextLayoutsByProjectId;
+  }, [chatFlexProjectLayoutsByProjectId, orderedProjects, chatsByProject]);
   const chatFlexOuterModel = useMemo(() => {
     if (
       !chatFlexOuterLayoutReconciledJson ||
@@ -3352,29 +3405,19 @@ function HubApp() {
       return;
     }
     const keepProjectIds = new Set(orderedProjects.map((project) => String(project.id || "")));
-    setActiveProjectTerminalTabByProjectId((prev) => {
+    setChatFlexProjectLayoutsByProjectId((prev) => {
       let changed = false;
       const next = {};
-      for (const [projectId, activeChatIdValue] of Object.entries(prev || {})) {
+      for (const [projectId, layoutJson] of Object.entries(prev || {})) {
         if (!keepProjectIds.has(projectId)) {
           changed = true;
           continue;
         }
-        const projectChatIds = new Set(
-          (chatsByProject.byProject.get(projectId) || [])
-            .map((chat) => String(chat.id || ""))
-            .filter(Boolean)
-        );
-        const activeChatId = String(activeChatIdValue || "");
-        if (activeChatId && !projectChatIds.has(activeChatId)) {
-          changed = true;
-          continue;
-        }
-        next[projectId] = activeChatId;
+        next[projectId] = layoutJson;
       }
       return changed ? next : prev;
     });
-  }, [hubStateHydrated, orderedProjects, chatsByProject]);
+  }, [hubStateHydrated, orderedProjects]);
 
   useEffect(() => {
     if (!hubStateHydrated) {
@@ -3406,12 +3449,22 @@ function HubApp() {
   }, [chatFlexOuterLayoutJson, chatFlexOuterLayoutReconciledJson, hubStateHydrated]);
 
   useEffect(() => {
+    if (!hubStateHydrated) {
+      return;
+    }
+    if (layoutJsonMapEquals(chatFlexProjectLayoutsByProjectId, chatFlexProjectLayoutsReconciledByProjectId)) {
+      return;
+    }
+    setChatFlexProjectLayoutsByProjectId(chatFlexProjectLayoutsReconciledByProjectId || {});
+  }, [chatFlexProjectLayoutsByProjectId, chatFlexProjectLayoutsReconciledByProjectId, hubStateHydrated]);
+
+  useEffect(() => {
     writeLocalStorageJson(CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY, chatFlexOuterLayoutJson || null);
   }, [chatFlexOuterLayoutJson]);
 
   useEffect(() => {
-    writeLocalStorageJson(CHAT_PROJECT_TERMINAL_TAB_STORAGE_KEY, activeProjectTerminalTabByProjectId || {});
-  }, [activeProjectTerminalTabByProjectId]);
+    writeLocalStorageJson(CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY, chatFlexProjectLayoutsByProjectId || {});
+  }, [chatFlexProjectLayoutsByProjectId]);
 
   useEffect(() => {
     writeLocalStorageJson(CHAT_TERMINAL_COLLAPSE_STORAGE_KEY, collapsedTerminalsByChat || {});
@@ -3528,13 +3581,15 @@ function HubApp() {
     setActiveTab("settings");
   }
 
-  function renderChatCard(chat, options = {}) {
+  function renderChatTerminalControlGroup(chat) {
     const resolvedChatId = resolveServerChatId(chat);
     const chatHasServer = hasServerChat(chat);
-    const normalizedStatus = String(chat.status || "").toLowerCase();
-    const isRunning = Boolean(chat.is_running);
-    const pendingStart = Boolean(pendingChatStarts[resolvedChatId] || chat.is_pending_start);
-    const isStarting = isChatStarting(normalizedStatus, isRunning, pendingStart);
+    const titleText = chat.display_name || chat.name;
+    const terminalCollapsed = Boolean(collapsedTerminalsByChat[chat.id]);
+    const detailsOpen = openChatDetails[chat.id] ?? false;
+    const isFullscreenChat = fullscreenChatId === chat.id;
+    const isCodexChat = normalizeAgentType(chat.agent_type, agentCapabilities) === "codex";
+    const showOpenAiHelperButton = isCodexChat && !openAiAccountConnected;
     const isContainerOutdated = Boolean(chat.container_outdated);
     const containerOutdatedReason = String(chat.container_outdated_reason || "");
     const isContainerRefreshInFlight = Boolean(pendingContainerRefreshes[resolvedChatId]);
@@ -3542,6 +3597,116 @@ function HubApp() {
     const containerRefreshTooltip = isContainerRefreshInFlight
       ? "Refreshing container with latest snapshot..."
       : containerOutdatedReason || "Running on an out-of-date container. Refresh to restart on latest snapshot.";
+
+    return (
+      <>
+        {showOpenAiHelperButton ? (
+          <button
+            type="button"
+            className="chat-header-helper-button"
+            title="Open OpenAI account login helper"
+            aria-label={`Open OpenAI account login helper for ${chat.display_name || chat.name}`}
+            onClick={openOpenAiLoginHelper}
+          >
+            <InfoIcon />
+            <span>Connect account</span>
+          </button>
+        ) : null}
+        {showContainerRefreshButton ? (
+          <button
+            type="button"
+            className={`icon-button chat-header-icon chat-header-refresh${isContainerRefreshInFlight ? " is-refreshing" : ""}`}
+            title={containerRefreshTooltip}
+            aria-label={
+              isContainerRefreshInFlight
+                ? `Refreshing container for ${chat.display_name || chat.name}`
+                : `Refresh out-of-date container for ${chat.display_name || chat.name}`
+            }
+            disabled={isContainerRefreshInFlight}
+            onClick={() => handleRefreshChatContainer(resolvedChatId)}
+          >
+            <RefreshWarningIcon />
+          </button>
+        ) : null}
+        <button
+          type="button"
+          className="icon-button chat-header-icon chat-header-collapse"
+          title={terminalCollapsed ? "Expand terminal" : "Collapse terminal"}
+          aria-label={terminalCollapsed ? `Expand terminal for ${titleText}` : `Collapse terminal for ${titleText}`}
+          aria-pressed={terminalCollapsed}
+          onClick={() => {
+            setCollapsedTerminalsByChat((prev) => ({
+              ...(prev || {}),
+              [chat.id]: !(prev?.[chat.id] ?? false)
+            }));
+          }}
+        >
+          <span aria-hidden="true">{terminalCollapsed ? "+" : "−"}</span>
+        </button>
+        <button
+          type="button"
+          className="icon-button chat-header-icon chat-header-popout"
+          title={isFullscreenChat ? "Minimize" : "Pop out"}
+          aria-label={isFullscreenChat ? `Minimize ${chat.display_name || chat.name}` : `Pop out ${chat.display_name || chat.name}`}
+          onClick={() => {
+            if (isFullscreenChat) {
+              setFullscreenChatId("");
+              return;
+            }
+            setOpenChats((prev) => ({ ...prev, [chat.id]: true }));
+            setFullscreenChatId(chat.id);
+          }}
+        >
+          {isFullscreenChat ? <MinimizeIcon /> : <ExpandIcon />}
+        </button>
+        <button
+          type="button"
+          className="icon-button chat-header-icon"
+          title={detailsOpen ? "Hide details" : "Show details"}
+          aria-label={detailsOpen ? `Hide details for ${chat.display_name || chat.name}` : `Show details for ${chat.display_name || chat.name}`}
+          onClick={() => {
+            setOpenChatDetails((prev) => ({ ...prev, [chat.id]: !(prev[chat.id] ?? false) }));
+          }}
+        >
+          <EllipsisIcon />
+        </button>
+        <button
+          type="button"
+          className="icon-button chat-header-icon chat-header-delete"
+          title={`Delete ${titleText}`}
+          aria-label={`Delete ${titleText}`}
+          onClick={() => {
+            if (!chatHasServer) {
+              setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
+              setOpenChats((prev) => {
+                const next = { ...prev };
+                delete next[chat.id];
+                return next;
+              });
+              setOpenChatDetails((prev) => {
+                const next = { ...prev };
+                delete next[chat.id];
+                return next;
+              });
+              setFullscreenChatId((current) => (current === chat.id ? "" : current));
+              return;
+            }
+            handleDeleteChat(resolvedChatId, chat.id);
+          }}
+        >
+          <CloseIcon />
+        </button>
+      </>
+    );
+  }
+
+  function renderChatCard(chat, options = {}) {
+    const resolvedChatId = resolveServerChatId(chat);
+    const chatHasServer = hasServerChat(chat);
+    const normalizedStatus = String(chat.status || "").toLowerCase();
+    const isRunning = Boolean(chat.is_running);
+    const pendingStart = Boolean(pendingChatStarts[resolvedChatId] || chat.is_pending_start);
+    const isStarting = isChatStarting(normalizedStatus, isRunning, pendingStart);
     const isFailed = normalizedStatus === "failed";
     const statusClassName = isRunning ? "running" : isStarting ? "starting" : isFailed ? "failed" : "stopped";
     const statusLabel = isRunning
@@ -3608,8 +3773,6 @@ function HubApp() {
     const detailsOpen = openChatDetails[chat.id] ?? false;
     const thumbnailsVisible = showArtifactThumbnailsByChat[chat.id] ?? true;
     const isFullscreenChat = fullscreenChatId === chat.id;
-    const isCodexChat = normalizeAgentType(chat.agent_type, agentCapabilities) === "codex";
-    const showOpenAiHelperButton = isCodexChat && !openAiAccountConnected;
     const containerClassName = ["card", isFullscreenChat ? "chat-card-popped" : ""].filter(Boolean).join(" ");
     const titleText = chat.display_name || chat.name;
     const titleStateLabel = titleStatus === "error" ? "Title error" : "";
@@ -3766,107 +3929,8 @@ function HubApp() {
     }));
     const nonPreviewableCurrentArtifacts = currentArtifactItems.filter(({ artifactInfo }) => !artifactInfo.canPreview);
     const previewableCurrentArtifacts = currentArtifactItems.filter(({ artifactInfo }) => artifactInfo.canPreview);
-
-    const terminalToolbarActions = (
-      <>
-        {showOpenAiHelperButton ? (
-          <button
-            type="button"
-            className="chat-header-helper-button"
-            title="Open OpenAI account login helper"
-            aria-label={`Open OpenAI account login helper for ${chat.display_name || chat.name}`}
-            onClick={openOpenAiLoginHelper}
-          >
-            <InfoIcon />
-            <span>Connect account</span>
-          </button>
-        ) : null}
-        {showContainerRefreshButton ? (
-          <button
-            type="button"
-            className={`icon-button chat-header-icon chat-header-refresh${isContainerRefreshInFlight ? " is-refreshing" : ""}`}
-            title={containerRefreshTooltip}
-            aria-label={
-              isContainerRefreshInFlight
-                ? `Refreshing container for ${chat.display_name || chat.name}`
-                : `Refresh out-of-date container for ${chat.display_name || chat.name}`
-            }
-            disabled={isContainerRefreshInFlight}
-            onClick={() => handleRefreshChatContainer(resolvedChatId)}
-          >
-            <RefreshWarningIcon />
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="icon-button chat-header-icon chat-header-collapse"
-          title={terminalCollapsed ? "Expand terminal" : "Collapse terminal"}
-          aria-label={terminalCollapsed ? `Expand terminal for ${titleText}` : `Collapse terminal for ${titleText}`}
-          aria-pressed={terminalCollapsed}
-          onClick={() => {
-            setCollapsedTerminalsByChat((prev) => ({
-              ...(prev || {}),
-              [chat.id]: !(prev?.[chat.id] ?? false)
-            }));
-          }}
-        >
-          <span aria-hidden="true">{terminalCollapsed ? "+" : "−"}</span>
-        </button>
-        <button
-          type="button"
-          className="icon-button chat-header-icon chat-header-popout"
-          title={isFullscreenChat ? "Minimize" : "Pop out"}
-          aria-label={isFullscreenChat ? `Minimize ${chat.display_name || chat.name}` : `Pop out ${chat.display_name || chat.name}`}
-          onClick={() => {
-            if (isFullscreenChat) {
-              setFullscreenChatId("");
-              return;
-            }
-            setOpenChats((prev) => ({ ...prev, [chat.id]: true }));
-            setFullscreenChatId(chat.id);
-          }}
-        >
-          {isFullscreenChat ? <MinimizeIcon /> : <ExpandIcon />}
-        </button>
-        <button
-          type="button"
-          className="icon-button chat-header-icon"
-          title={detailsOpen ? "Hide details" : "Show details"}
-          aria-label={detailsOpen ? `Hide details for ${chat.display_name || chat.name}` : `Show details for ${chat.display_name || chat.name}`}
-          onClick={() => {
-            setOpenChatDetails((prev) => ({ ...prev, [chat.id]: !(prev[chat.id] ?? false) }));
-          }}
-        >
-          <EllipsisIcon />
-        </button>
-        <button
-          type="button"
-          className="icon-button chat-header-icon chat-header-delete"
-          title={`Delete ${titleText}`}
-          aria-label={`Delete ${titleText}`}
-          onClick={() => {
-            if (!chatHasServer) {
-              setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
-              setOpenChats((prev) => {
-                const next = { ...prev };
-                delete next[chat.id];
-                return next;
-              });
-              setOpenChatDetails((prev) => {
-                const next = { ...prev };
-                delete next[chat.id];
-                return next;
-              });
-              setFullscreenChatId((current) => (current === chat.id ? "" : current));
-              return;
-            }
-            handleDeleteChat(resolvedChatId, chat.id);
-          }}
-        >
-          <CloseIcon />
-        </button>
-      </>
-    );
+    const moveTerminalControlsToTabRow = Boolean(options?.moveTerminalControlsToTabRow) && !isFullscreenChat;
+    const terminalToolbarActions = moveTerminalControlsToTabRow ? null : renderChatTerminalControlGroup(chat);
 
     return (
       <article className={containerClassName} key={chat.id}>
@@ -3930,6 +3994,7 @@ function HubApp() {
               titleStateLabel={titleStateLabel}
               titleStateClassName={titleStatus}
               toolbarActions={terminalToolbarActions}
+              showToolbar={!moveTerminalControlsToTabRow}
               collapsed={terminalCollapsed}
               tabs={terminalTabs}
               activeTabId={activeTerminalTabId}
@@ -3945,6 +4010,7 @@ function HubApp() {
               titleStateLabel={titleStateLabel}
               titleStateClassName={titleStatus}
               toolbarActions={terminalToolbarActions}
+              showToolbar={!moveTerminalControlsToTabRow}
               overlay={isStarting ? <span className="inline-spinner" aria-hidden="true" /> : null}
               collapsed={terminalCollapsed}
               tabs={terminalTabs}
@@ -4290,31 +4356,75 @@ function HubApp() {
     if (projectChats.length === 0) {
       return <div className="empty">No chats yet for this project.</div>;
     }
-    const configuredActiveChatId = String(activeProjectTerminalTabByProjectId[project.id] || "");
-    const selectedChat =
-      projectChats.find((chat) => String(chat.id || "") === configuredActiveChatId) || projectChats[0];
-    const selectedChatId = String(selectedChat?.id || "");
-    const terminalTabs = projectChats.map((chat) => ({
-      id: String(chat.id || ""),
-      label: String(chat.display_name || chat.name || "Chat")
-    }));
-    if (!selectedChat) {
+    const projectChatLayoutJson = chatFlexProjectLayoutsReconciledByProjectId[project.id] || null;
+    if (!projectChatLayoutJson || !projectChatLayoutJson.layout || typeof projectChatLayoutJson.layout !== "object") {
       return <div className="empty">No chats yet for this project.</div>;
     }
+    let projectChatModel;
+    try {
+      projectChatModel = Model.fromJson(projectChatLayoutJson);
+    } catch (err) {
+      console.error(`Failed to parse project chat flex layout model for ${project.id}.`, err);
+      return <div className="empty">Unable to load saved chat layout for this project.</div>;
+    }
+    const chatsById = new Map(projectChats.map((chat) => [String(chat.id || ""), chat]));
+    const renderProjectChatPaneTab = (tabNode) => {
+      const component = String(tabNode.getComponent() || "");
+      if (component !== "project-chat-pane") {
+        return <div className="empty">Unsupported project chat tab.</div>;
+      }
+      const chatId = String(tabNode.getConfig()?.chat_id || "");
+      const chat = chatsById.get(chatId);
+      if (!chat) {
+        return <div className="empty">Chat no longer exists.</div>;
+      }
+      return <div className="chat-layout-project-chat-pane">{renderChatCard(chat, { moveTerminalControlsToTabRow: true })}</div>;
+    };
+    const renderProjectChatTabSetControls = (tabSetNode, renderValues) => {
+      const selectedNode = tabSetNode?.getSelectedNode?.();
+      if (!selectedNode) {
+        return;
+      }
+      const component = String(selectedNode.getComponent() || "");
+      if (component !== "project-chat-pane") {
+        return;
+      }
+      const selectedChatId = String(selectedNode.getConfig()?.chat_id || "");
+      const selectedChat = chatsById.get(selectedChatId);
+      if (!selectedChat) {
+        return;
+      }
+      renderValues.stickyButtons.push(
+        <div
+          key={`project-chat-controls-${tabSetNode.getId()}-${selectedChatId}`}
+          className="terminal-toolbar-actions chat-layout-project-terminal-controls"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          {renderChatTerminalControlGroup(selectedChat)}
+        </div>
+      );
+    };
     return (
       <div className={`chat-layout-project-shell ${chatFlexLayoutThemeClass}`.trim()}>
-        <div className="chat-layout-project-chat-pane">
-          {renderChatCard(selectedChat, {
-            terminalTabs,
-            activeTerminalTabId: selectedChatId,
-            onSelectTerminalTab: (nextChatId) => {
-              setActiveProjectTerminalTabByProjectId((prev) => ({
+        <Layout
+          model={projectChatModel}
+          factory={renderProjectChatPaneTab}
+          onRenderTabSet={renderProjectChatTabSetControls}
+          onModelChange={(model) => {
+            const nextProjectLayoutJson = model.toJson();
+            setChatFlexProjectLayoutsByProjectId((prev) => {
+              const currentLayoutJson = prev?.[project.id];
+              if (layoutJsonEquals(currentLayoutJson || null, nextProjectLayoutJson || null)) {
+                return prev;
+              }
+              return {
                 ...(prev || {}),
-                [project.id]: String(nextChatId || "")
-              }));
-            }
-          })}
-        </div>
+                [project.id]: nextProjectLayoutJson
+              };
+            });
+          }}
+        />
       </div>
     );
   }
