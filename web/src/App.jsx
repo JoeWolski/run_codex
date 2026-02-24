@@ -3581,7 +3581,7 @@ function HubApp() {
     setActiveTab("settings");
   }
 
-  function renderChatTerminalControlGroup(chat) {
+  function renderChatTerminalControlGroup(chat, { includeDelete = true } = {}) {
     const resolvedChatId = resolveServerChatId(chat);
     const chatHasServer = hasServerChat(chat);
     const titleText = chat.display_name || chat.name;
@@ -3670,32 +3670,34 @@ function HubApp() {
         >
           <EllipsisIcon />
         </button>
-        <button
-          type="button"
-          className="icon-button chat-header-icon chat-header-delete"
-          title={`Delete ${titleText}`}
-          aria-label={`Delete ${titleText}`}
-          onClick={() => {
-            if (!chatHasServer) {
-              setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
-              setOpenChats((prev) => {
-                const next = { ...prev };
-                delete next[chat.id];
-                return next;
-              });
-              setOpenChatDetails((prev) => {
-                const next = { ...prev };
-                delete next[chat.id];
-                return next;
-              });
-              setFullscreenChatId((current) => (current === chat.id ? "" : current));
-              return;
-            }
-            handleDeleteChat(resolvedChatId, chat.id);
-          }}
-        >
-          <CloseIcon />
-        </button>
+        {includeDelete ? (
+          <button
+            type="button"
+            className="icon-button chat-header-icon chat-header-delete"
+            title={`Delete ${titleText}`}
+            aria-label={`Delete ${titleText}`}
+            onClick={() => {
+              if (!chatHasServer) {
+                setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
+                setOpenChats((prev) => {
+                  const next = { ...prev };
+                  delete next[chat.id];
+                  return next;
+                });
+                setOpenChatDetails((prev) => {
+                  const next = { ...prev };
+                  delete next[chat.id];
+                  return next;
+                });
+                setFullscreenChatId((current) => (current === chat.id ? "" : current));
+                return;
+              }
+              handleDeleteChat(resolvedChatId, chat.id);
+            }}
+          >
+            <CloseIcon />
+          </button>
+        ) : null}
       </>
     );
   }
@@ -4401,8 +4403,82 @@ function HubApp() {
           onPointerDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
         >
-          {renderChatTerminalControlGroup(selectedChat)}
+          {renderChatTerminalControlGroup(selectedChat, { includeDelete: false })}
         </div>
+      );
+    };
+    const renderProjectChatTab = (tabNode, renderValues) => {
+      const component = String(tabNode.getComponent() || "");
+      if (component !== "project-chat-pane") {
+        return;
+      }
+      const chatId = String(tabNode.getConfig()?.chat_id || "");
+      const chat = chatsById.get(chatId);
+      if (!chat) {
+        return;
+      }
+      const resolvedChatId = resolveServerChatId(chat);
+      const chatHasServer = hasServerChat(chat);
+      const normalizedStatus = String(chat.status || "").toLowerCase();
+      const isRunning = Boolean(chat.is_running);
+      const pendingStart = Boolean(pendingChatStarts[resolvedChatId] || chat.is_pending_start);
+      const isStarting = isChatStarting(normalizedStatus, isRunning, pendingStart);
+      const isFailed = normalizedStatus === "failed";
+      const statusClassName = isRunning ? "running" : isStarting ? "starting" : isFailed ? "failed" : "stopped";
+      const isContainerOutdated = Boolean(chat.container_outdated);
+      const isContainerRefreshInFlight = Boolean(pendingContainerRefreshes[resolvedChatId]);
+      const showContainerRefreshButton = chatHasServer && isContainerOutdated;
+      const containerOutdatedReason = String(chat.container_outdated_reason || "");
+      const containerRefreshTooltip = isContainerRefreshInFlight
+        ? "Refreshing container with latest snapshot..."
+        : containerOutdatedReason || "Running on an out-of-date container. Refresh to restart on latest snapshot.";
+      const chatTitle = chat.display_name || chat.name;
+      if (showContainerRefreshButton) {
+        renderValues.leading = (
+          <button
+            type="button"
+            className={`icon-button chat-flex-tab-status-btn chat-header-refresh${isContainerRefreshInFlight ? " is-refreshing" : ""}`}
+            title={containerRefreshTooltip}
+            aria-label={isContainerRefreshInFlight ? `Refreshing container for ${chatTitle}` : `Refresh out-of-date container for ${chatTitle}`}
+            disabled={isContainerRefreshInFlight}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => { e.stopPropagation(); handleRefreshChatContainer(resolvedChatId); }}
+          >
+            <RefreshWarningIcon />
+          </button>
+        );
+      } else {
+        renderValues.leading = (
+          <span
+            className={`terminal-health-dot chat-flex-tab-status-dot ${statusClassName}`}
+            role="img"
+            aria-label={`Status: ${statusClassName}`}
+            title={statusClassName}
+          />
+        );
+      }
+      renderValues.buttons.push(
+        <button
+          key={`flex-tab-close-${chatId}`}
+          type="button"
+          className="icon-button chat-flex-tab-close"
+          title={`Delete ${chatTitle}`}
+          aria-label={`Delete ${chatTitle}`}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (!chatHasServer) {
+              setPendingSessions((prev) => prev.filter((session) => session.ui_id !== chat.id));
+              setOpenChats((prev) => { const next = { ...prev }; delete next[chat.id]; return next; });
+              setOpenChatDetails((prev) => { const next = { ...prev }; delete next[chat.id]; return next; });
+              setFullscreenChatId((current) => (current === chat.id ? "" : current));
+              return;
+            }
+            handleDeleteChat(resolvedChatId, chat.id);
+          }}
+        >
+          <CloseIcon />
+        </button>
       );
     };
     return (
@@ -4411,6 +4487,7 @@ function HubApp() {
           model={projectChatModel}
           factory={renderProjectChatPaneTab}
           onRenderTabSet={renderProjectChatTabSetControls}
+          onRenderTab={renderProjectChatTab}
           onModelChange={(model) => {
             const nextProjectLayoutJson = model.toJson();
             setChatFlexProjectLayoutsByProjectId((prev) => {
