@@ -95,6 +95,12 @@ class InstallScriptTests(unittest.TestCase):
         cli_content = agent_cli_path.read_text(encoding="utf-8")
         self.assertIn('UPDATE_METHOD=head', cli_content)
         self.assertIn(f'SOURCE_REPO_ROOT={managed_repo}', cli_content)
+        self.assertIn('worktree_is_clean() {', cli_content)
+        self.assertIn('git -C "${worktree_path}" rev-parse --verify HEAD^{commit} 2>/dev/null', cli_content)
+        self.assertIn('git -C "${worktree_path}" diff --no-ext-diff --quiet --exit-code', cli_content)
+        self.assertIn('git -C "${worktree_path}" diff --no-ext-diff --cached --quiet --exit-code', cli_content)
+        self.assertIn('git -C "${worktree_path}" ls-files --others --exclude-standard', cli_content)
+        self.assertIn('if ! worktree_is_clean "${worktree_path}" "${target_commit}"; then', cli_content)
         self.assertIn('git -C "${SOURCE_REPO_ROOT}" fetch --quiet --prune origin "${default_branch}"', cli_content)
         self.assertIn(
             'git -C "${SOURCE_REPO_ROOT}" worktree add --quiet --detach "${worktree_path}" "${target_commit}"',

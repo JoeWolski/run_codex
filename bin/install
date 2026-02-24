@@ -253,6 +253,38 @@ resolve_default_branch() {
   printf '%s\n' "\${ref#origin/}"
 }
 
+worktree_is_clean() {
+  local worktree_path="\$1"
+  local expected_commit="\$2"
+
+  if [[ ! -d "\${worktree_path}" ]]; then
+    return 1
+  fi
+  if [[ ! -x "\${worktree_path}/bin/\${TOOL_NAME}" ]]; then
+    return 1
+  fi
+
+  local worktree_commit=""
+  if ! worktree_commit="\$(git -C "\${worktree_path}" rev-parse --verify HEAD^{commit} 2>/dev/null)"; then
+    return 1
+  fi
+  if [[ "\${worktree_commit}" != "\${expected_commit}" ]]; then
+    return 1
+  fi
+
+  if ! git -C "\${worktree_path}" diff --no-ext-diff --quiet --exit-code; then
+    return 1
+  fi
+  if ! git -C "\${worktree_path}" diff --no-ext-diff --cached --quiet --exit-code; then
+    return 1
+  fi
+  if [[ -n "\$(git -C "\${worktree_path}" ls-files --others --exclude-standard)" ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
 resolve_repo_root() {
   if [[ "\${UPDATE_METHOD}" == "none" ]]; then
     printf '%s\n' "\${SOURCE_REPO_ROOT}"
@@ -271,7 +303,7 @@ resolve_repo_root() {
   mkdir -p "\${worktree_root}"
   local worktree_path="\${worktree_root}/\${target_commit}"
 
-  if [[ ! -x "\${worktree_path}/bin/\${TOOL_NAME}" ]]; then
+  if ! worktree_is_clean "\${worktree_path}" "\${target_commit}"; then
     if [[ -d "\${worktree_path}" ]]; then
       git -C "\${SOURCE_REPO_ROOT}" worktree remove --force "\${worktree_path}"
     fi
