@@ -69,6 +69,10 @@ const DEFAULT_HUB_SETTINGS = {
   defaultAgentType: DEFAULT_AGENT_TYPE,
   chatLayoutEngine: DEFAULT_CHAT_LAYOUT_ENGINE
 };
+const BRAND_LOGO_ASSET_BY_THEME = Object.freeze({
+  light: "/branding/agent-hub-mark-light.svg",
+  dark: "/branding/agent-hub-mark-dark.svg"
+});
 const DEFAULT_AGENT_CAPABILITIES = {
   version: 1,
   updatedAt: "",
@@ -284,6 +288,29 @@ function applyThemePreference(preference) {
     return;
   }
   root.setAttribute("data-theme", normalized);
+}
+
+function logoAssetForTheme(theme) {
+  const normalized = String(theme || "").toLowerCase();
+  return normalized === "dark" ? BRAND_LOGO_ASSET_BY_THEME.dark : BRAND_LOGO_ASSET_BY_THEME.light;
+}
+
+function applyFaviconForTheme(theme) {
+  if (typeof document === "undefined") {
+    return;
+  }
+  const faviconHref = logoAssetForTheme(theme);
+  let faviconLink = document.querySelector('link[data-agent-hub-favicon="app"]');
+  if (!faviconLink) {
+    faviconLink = document.createElement("link");
+    faviconLink.setAttribute("rel", "icon");
+    faviconLink.setAttribute("type", "image/svg+xml");
+    faviconLink.setAttribute("data-agent-hub-favicon", "app");
+    document.head.appendChild(faviconLink);
+  }
+  if (faviconLink.getAttribute("href") !== faviconHref) {
+    faviconLink.setAttribute("href", faviconHref);
+  }
 }
 
 function emptyVolume() {
@@ -3395,6 +3422,10 @@ function HubApp() {
   }, [themePreference]);
 
   useEffect(() => {
+    applyFaviconForTheme(effectiveTheme);
+  }, [effectiveTheme]);
+
+  useEffect(() => {
     if (!hubStateHydrated) {
       return;
     }
@@ -4529,7 +4560,10 @@ function HubApp() {
       <header className="app-header">
         <div className="header-row">
           <div className="brand-block">
-            <h1>Agent Hub</h1>
+            <h1 className="brand-title">
+              <img className="brand-logo" src={logoAssetForTheme(effectiveTheme)} alt="" aria-hidden="true" />
+              <span>Agent Hub</span>
+            </h1>
           </div>
           <nav className="tab-row" aria-label="Primary sections">
             <button
@@ -5525,7 +5559,9 @@ function HubApp() {
 
 export default function App() {
   useEffect(() => {
-    applyThemePreference(loadThemePreference());
+    const preference = loadThemePreference();
+    applyThemePreference(preference);
+    applyFaviconForTheme(resolveEffectiveTheme(preference, detectSystemPrefersDark()));
   }, []);
 
   if (window.location.pathname === "/openai-auth/callback") {

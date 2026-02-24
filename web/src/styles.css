@@ -406,12 +406,22 @@ code {
   min-width: 0;
 }
 
-.brand-block h1 {
+.brand-title {
   margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
   font-size: clamp(1.5rem, 1.36rem + 0.72vw, 1.9rem);
   line-height: 1.2;
   font-weight: 600;
   letter-spacing: -0.02em;
+}
+
+.brand-logo {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  display: block;
 }
 
 .brand-block p {
