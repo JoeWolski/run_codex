@@ -1155,6 +1155,63 @@ Gemini CLI
         self.assertEqual(fallback_payload["personal_access_token"], TEST_GITHUB_PERSONAL_ACCESS_TOKEN)
         self.assertNotEqual(str(first_token_id), str(second_token_id))
 
+    def test_connect_github_personal_access_token_keeps_multiple_tokens_for_same_account(self) -> None:
+        first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        first_verification["token_scopes"] = "repo"
+        second_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        second_verification["token_scopes"] = "repo,workflow"
+
+        with patch.object(
+            hub_server.HubState,
+            "_verify_github_personal_access_token",
+            side_effect=[first_verification, second_verification],
+        ):
+            self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+                host="github.com",
+            )
+            connected = self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND,
+                host="github.com",
+            )
+
+        self.assertEqual(connected["token_count"], 2)
+        self.assertEqual(len(connected["tokens"]), 2)
+        token_hints = {str(token.get("token_hint") or "") for token in connected["tokens"]}
+        self.assertEqual(
+            token_hints,
+            {
+                hub_server._mask_secret(TEST_GITHUB_PERSONAL_ACCESS_TOKEN),
+                hub_server._mask_secret(TEST_GITHUB_PERSONAL_ACCESS_TOKEN_SECOND),
+            },
+        )
+        stored_payload = json.loads(self.state.github_tokens_file.read_text(encoding="utf-8"))
+        self.assertEqual(len(stored_payload["tokens"]), 2)
+
+    def test_connect_github_personal_access_token_reconnect_same_token_replaces_existing_record(self) -> None:
+        first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        first_verification["token_scopes"] = "repo"
+        second_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
+        second_verification["token_scopes"] = "repo,workflow"
+
+        with patch.object(
+            hub_server.HubState,
+            "_verify_github_personal_access_token",
+            side_effect=[first_verification, second_verification],
+        ):
+            self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+                host="github.com",
+            )
+            reconnected = self.state.connect_github_personal_access_token(
+                TEST_GITHUB_PERSONAL_ACCESS_TOKEN,
+                host="github.com",
+            )
+
+        self.assertEqual(reconnected["token_count"], 1)
+        self.assertEqual(len(reconnected["tokens"]), 1)
+        self.assertEqual(reconnected["tokens"][0]["token_scopes"], "repo,workflow")
+
     def test_disconnect_github_personal_access_token_removes_only_selected_token(self) -> None:
         first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
         first_verification["account_login"] = "fallback-user"
@@ -1545,6 +1602,33 @@ Gemini CLI
     def test_parse_env_vars_rejects_openai_api_key(self) -> None:
         with self.assertRaises(HTTPException):
             hub_server._parse_env_vars(["OPENAI_API_KEY=sk-test-abcdef"])
+
+    def test_prepare_chat_runtime_config_materializes_agent_tools_mcp_script(self) -> None:
+        self.config_file.write_text(
+            (
+                "model = 'test'\n"
+                "\n"
+                "[mcp_servers.agent_tools]\n"
+                "command = 'python3'\n"
+                "args = ['-m', 'legacy.server']\n"
+                "startup_timeout_sec = 3\n"
+                "tool_timeout_sec = 30\n"
+            ),
+            encoding="utf-8",
+        )
+
+        runtime_config_file = self.state._prepare_chat_runtime_config("chat-mcp-test")
+
+        runtime_text = runtime_config_file.read_text(encoding="utf-8")
+        self.assertNotIn("legacy.server", runtime_text)
+        self.assertIn(f'args = ["{hub_server.AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH}"]', runtime_text)
+        self.assertNotIn('args = ["-m", "agent_hub.agent_tools_mcp"]', runtime_text)
+        self.assertTrue(self.state.agent_tools_mcp_runtime_script.exists())
+        self.assertEqual(
+            self.state.agent_tools_mcp_runtime_script.read_text(encoding="utf-8"),
+            hub_server._agent_tools_mcp_source_path().read_text(encoding="utf-8"),
+        )
+        self.assertEqual(self.state.agent_tools_mcp_runtime_script.stat().st_mode & 0o777, 0o600)
 
     def test_start_chat_filters_reserved_openai_env_vars(self) -> None:
         project = self.state.add_project(

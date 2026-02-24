@@ -90,6 +90,14 @@ GITLAB_PERSONAL_ACCESS_TOKEN_REQUIRED_SCOPES = frozenset({"read_repository", "wr
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_CONTAINER_HOME = "/workspace"
+AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
+AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
+AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
+    PurePosixPath(DEFAULT_CONTAINER_HOME)
+    / ".codex"
+    / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME
+    / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
+)
 TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777,exec"
 ARTIFACT_PUBLISH_BASE_URL_ENV = "AGENT_HUB_ARTIFACT_BASE_URL"
 DEFAULT_ARTIFACT_PUBLISH_HOST = "host.docker.internal"
@@ -2135,6 +2143,10 @@ def _write_private_env_file(path: Path, content: str) -> None:
                 pass
 
 
+def _agent_tools_mcp_source_path() -> Path:
+    return Path(__file__).resolve().with_name(AGENT_TOOLS_MCP_RUNTIME_FILE_NAME)
+
+
 def _empty_list(v: Any) -> list[str]:
     if v is None:
         return []
@@ -3258,6 +3270,9 @@ class HubState:
         self.local_umask = "0022"
         self.host_agent_home = (Path.home() / ".agent-home" / self.local_user).resolve()
         self.host_codex_dir = self.host_agent_home / ".codex"
+        self.agent_tools_mcp_runtime_script = (
+            self.host_codex_dir / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
+        )
         self.openai_codex_auth_file = self.host_codex_dir / OPENAI_CODEX_AUTH_FILE_NAME
 
         self.data_dir = data_dir
@@ -6552,10 +6567,12 @@ class HubState:
             except HTTPException:
                 existing_scheme = GIT_CREDENTIAL_DEFAULT_SCHEME
             existing_login = str(existing_record.get("account_login") or "").strip().lower()
+            existing_token = str(existing_record.get("personal_access_token") or "").strip()
             if (
                 existing_host == normalized_host
                 and existing_scheme == normalized_scheme
                 and existing_login == account_login.lower()
+                and existing_token == normalized_token
             ):
                 continue
             filtered_existing.append(existing_record)
@@ -7021,11 +7038,13 @@ class HubState:
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Failed to read config file: {self.config_file}") from exc
 
+        self._ensure_agent_tools_mcp_runtime_script()
+
         merged_text = self._strip_mcp_server_table(base_text, "agent_tools")
         merged_text += (
             "\n[mcp_servers.agent_tools]\n"
             'command = "python3"\n'
-            'args = ["-m", "agent_hub.agent_tools_mcp"]\n'
+            f"args = [{json.dumps(AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH)}]\n"
             "startup_timeout_sec = 20\n"
             "tool_timeout_sec = 120\n"
         )
@@ -7033,6 +7052,32 @@ class HubState:
         runtime_config_path = self._chat_runtime_config_path(chat_id)
         _write_private_env_file(runtime_config_path, merged_text)
         return runtime_config_path
+
+    def _ensure_agent_tools_mcp_runtime_script(self) -> None:
+        source_path = _agent_tools_mcp_source_path()
+        try:
+            script_text = source_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to read agent_tools MCP source script: {source_path}",
+            ) from exc
+
+        if self.agent_tools_mcp_runtime_script.exists():
+            try:
+                existing_text = self.agent_tools_mcp_runtime_script.read_text(encoding="utf-8")
+            except OSError:
+                existing_text = ""
+            if existing_text == script_text:
+                return
+
+        try:
+            _write_private_env_file(self.agent_tools_mcp_runtime_script, script_text)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to materialize agent_tools MCP runtime script: {self.agent_tools_mcp_runtime_script}",
+            ) from exc
 
     def _chat_agent_tools_url(self, chat_id: str) -> str:
         return f"{self.artifact_publish_base_url}/api/chats/{chat_id}/agent-tools"
