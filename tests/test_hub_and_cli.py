@@ -4562,6 +4562,31 @@ Gemini CLI
                 )
         self.assertEqual(ctx.exception.status_code, 409)
 
+    def test_attach_agent_tools_session_project_credentials_supports_repo_only_session(self) -> None:
+        self._connect_github_pat()
+        session_id, _token = self.state._create_agent_tools_session(repo_url="https://github.com/org/repo.git")
+        session_payload = self.state.agent_tools_session_credentials_list_payload(session_id)
+        available = session_payload.get("available_credentials") or []
+        self.assertGreaterEqual(len(available), 1)
+        credential_id = str(available[0].get("credential_id") or "")
+        self.assertTrue(credential_id)
+
+        attached = self.state.attach_agent_tools_session_project_credentials(
+            session_id=session_id,
+            mode="single",
+            credential_ids=[credential_id],
+        )
+        self.assertEqual(attached.get("project_id"), "")
+        binding = attached.get("binding")
+        self.assertIsInstance(binding, dict)
+        assert isinstance(binding, dict)
+        self.assertEqual(binding.get("mode"), "single")
+        self.assertEqual(binding.get("credential_ids"), [credential_id])
+        self.assertEqual(attached.get("effective_credential_ids"), [credential_id])
+
+        updated_payload = self.state.agent_tools_session_credentials_list_payload(session_id)
+        self.assertEqual(updated_payload.get("effective_credential_ids"), [credential_id])
+
     def test_auto_configure_project_retries_clone_without_auth_env(self) -> None:
         attempted_clone_envs: list[dict[str, str] | None] = []
 
@@ -5721,6 +5746,72 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("RW mount preflight failed", result.output)
             self.assertIn("owner uid does not match runtime uid", result.output)
             self.assertEqual(commands, [])
+
+    def test_agent_cli_default_run_mounts_runtime_agent_tools_config_and_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            runtime_config = tmp_path / "runtime-agent-tools.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            runtime_config.write_text("model = 'test'\n", encoding="utf-8")
+
+            class FakeBridge:
+                def __init__(self, runtime_path: Path):
+                    self.runtime_config_path = runtime_path
+                    self.env_vars = [
+                        "AGENT_HUB_AGENT_TOOLS_URL=http://host.docker.internal:48123",
+                        "AGENT_HUB_AGENT_TOOLS_TOKEN=test-token",
+                        "AGENT_HUB_AGENT_TOOLS_PROJECT_ID=",
+                        "AGENT_HUB_AGENT_TOOLS_CHAT_ID=agent_cli:test-session",
+                    ]
+                    self.closed = False
+
+                def close(self) -> None:
+                    self.closed = True
+
+            fake_bridge = FakeBridge(runtime_config)
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._start_agent_tools_runtime_bridge",
+                return_value=fake_bridge,
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertIn(
+                f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.codex/config.toml:ro",
+                run_cmd,
+            )
+            self.assertIn("AGENT_HUB_AGENT_TOOLS_URL=http://host.docker.internal:48123", run_cmd)
+            self.assertIn("AGENT_HUB_AGENT_TOOLS_TOKEN=test-token", run_cmd)
+            self.assertIn("AGENT_HUB_AGENT_TOOLS_PROJECT_ID=", run_cmd)
+            self.assertIn("AGENT_HUB_AGENT_TOOLS_CHAT_ID=agent_cli:test-session", run_cmd)
+            self.assertTrue(fake_bridge.closed)
 
     def test_no_alt_screen_flag_passes_through_to_codex_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

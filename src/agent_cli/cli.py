@@ -14,8 +14,12 @@ import sys
 import tempfile
 import tomllib
 import urllib.parse
+import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
+from threading import Thread
 from typing import Iterable, Iterator, Tuple
 
 import click
@@ -48,6 +52,20 @@ GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 AGENT_HUB_SECRETS_DIR_NAME = "secrets"
 AGENT_HUB_GIT_CREDENTIALS_DIR_NAME = "git_credentials"
+AGENT_HUB_DATA_DIR_ENV = "AGENT_HUB_DATA_DIR"
+AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
+AGENT_TOOLS_TOKEN_ENV = "AGENT_HUB_AGENT_TOOLS_TOKEN"
+AGENT_TOOLS_PROJECT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_PROJECT_ID"
+AGENT_TOOLS_CHAT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_CHAT_ID"
+AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
+AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
+AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
+AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
+    PurePosixPath(DEFAULT_CONTAINER_HOME)
+    / ".codex"
+    / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME
+    / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
+)
 GIT_CREDENTIAL_DEFAULT_SCHEME = "https"
 GIT_CREDENTIAL_ALLOWED_SCHEMES = {"http", "https"}
 RUNTIME_IMAGE_BUILD_LOCK_DIR = Path(tempfile.gettempdir()) / "agent-cli-image-build-locks"
@@ -384,6 +402,358 @@ def _discover_agent_hub_git_credentials() -> tuple[Path | None, str, str]:
         except (OSError, UnicodeError):
             continue
     return None, "", ""
+
+
+def _resolved_agent_hub_data_dir() -> Path:
+    candidate = str(os.environ.get(AGENT_HUB_DATA_DIR_ENV) or "").strip()
+    if candidate:
+        return Path(candidate).expanduser().resolve()
+    return _default_agent_hub_data_dir()
+
+
+def _write_private_text_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _strip_mcp_server_table(config_text: str, server_name: str) -> str:
+    if not config_text:
+        return ""
+    escaped_name = re.escape(server_name)
+    pattern = re.compile(r"(?ms)^\[mcp_servers\." + escaped_name + r"\]\n.*?(?=^\[|\Z)")
+    stripped = re.sub(pattern, "", config_text)
+    return stripped.rstrip() + "\n"
+
+
+def _env_var_keys(entries: Iterable[str]) -> set[str]:
+    keys: set[str] = set()
+    for entry in entries:
+        key, _sep, _value = str(entry).partition("=")
+        normalized = key.strip()
+        if normalized:
+            keys.add(normalized)
+    return keys
+
+
+def _git_origin_repo_url(project_path: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(project_path), "remote", "get-url", "origin"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return str(result.stdout or "").strip()
+
+
+@dataclass
+class _AgentToolsRuntimeBridge:
+    runtime_config_path: Path
+    env_vars: list[str]
+    state: object | None
+    session_id: str
+    server: ThreadingHTTPServer | None
+    thread: Thread | None
+
+    def close(self) -> None:
+        if self.server is not None:
+            try:
+                self.server.shutdown()
+            except Exception:
+                pass
+            try:
+                self.server.server_close()
+            except Exception:
+                pass
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+        sessions_lock = getattr(self.state, "_agent_tools_sessions_lock", None) if self.state is not None else None
+        sessions = getattr(self.state, "_agent_tools_sessions", None) if self.state is not None else None
+        if self.session_id and sessions_lock is not None and isinstance(sessions, dict):
+            try:
+                with sessions_lock:
+                    sessions.pop(self.session_id, None)
+            except Exception:
+                pass
+        try:
+            self.runtime_config_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _resolve_existing_project_context(state: object, repo_url: str) -> tuple[str, dict[str, object]]:
+    from agent_hub import server as hub_server
+
+    target_repo = str(repo_url or "").strip()
+    if not target_repo:
+        return "", hub_server._normalize_project_credential_binding(None)
+
+    target_host = hub_server._git_repo_host(target_repo)
+    target_owner = hub_server._git_repo_owner(target_repo)
+    target_name = hub_server._extract_repo_name(target_repo).lower().strip()
+    if not target_host or not target_name:
+        return "", hub_server._normalize_project_credential_binding(None)
+
+    state_payload = state.load()
+    projects = state_payload.get("projects")
+    if not isinstance(projects, dict):
+        return "", hub_server._normalize_project_credential_binding(None)
+
+    for project_id, project in projects.items():
+        if not isinstance(project, dict):
+            continue
+        project_repo = str(project.get("repo_url") or "").strip()
+        if not project_repo:
+            continue
+        host = hub_server._git_repo_host(project_repo)
+        owner = hub_server._git_repo_owner(project_repo)
+        name = hub_server._extract_repo_name(project_repo).lower().strip()
+        if host == target_host and owner == target_owner and name == target_name:
+            binding = hub_server._normalize_project_credential_binding(project.get("credential_binding"))
+            return str(project_id), binding
+
+    return "", hub_server._normalize_project_credential_binding(None)
+
+
+def _build_agent_tools_runtime_config(*, config_path: Path, host_codex_dir: Path) -> Path:
+    from agent_hub import server as hub_server
+
+    source_script = hub_server._agent_tools_mcp_source_path()
+    try:
+        script_text = source_script.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise click.ClickException(f"Failed to read agent_tools MCP script {source_script}: {exc}") from exc
+
+    runtime_script = host_codex_dir / AGENT_TOOLS_MCP_RUNTIME_DIR_NAME / AGENT_TOOLS_MCP_RUNTIME_FILE_NAME
+    if runtime_script.exists():
+        try:
+            existing_script = runtime_script.read_text(encoding="utf-8")
+        except OSError:
+            existing_script = ""
+    else:
+        existing_script = ""
+    if existing_script != script_text:
+        try:
+            _write_private_text_file(runtime_script, script_text)
+        except OSError as exc:
+            raise click.ClickException(f"Failed to materialize agent_tools MCP script {runtime_script}: {exc}") from exc
+
+    try:
+        base_config = config_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        raise click.ClickException(f"Failed to read config file {config_path}: {exc}") from exc
+
+    merged_config = _strip_mcp_server_table(base_config, "agent_tools")
+    merged_config += (
+        "\n[mcp_servers.agent_tools]\n"
+        'command = "python3"\n'
+        f"args = [{json.dumps(AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH)}]\n"
+        "startup_timeout_sec = 20\n"
+        "tool_timeout_sec = 120\n"
+    )
+
+    runtime_config_path = host_codex_dir / f"agent-tools-runtime-{uuid.uuid4().hex}.toml"
+    try:
+        _write_private_text_file(runtime_config_path, merged_config)
+    except OSError as exc:
+        raise click.ClickException(f"Failed to write runtime config {runtime_config_path}: {exc}") from exc
+    return runtime_config_path
+
+
+def _start_agent_tools_runtime_bridge(
+    *,
+    project_path: Path,
+    host_codex_dir: Path,
+    config_path: Path,
+    system_prompt_path: Path,
+    parsed_env_vars: list[str],
+) -> _AgentToolsRuntimeBridge | None:
+    if AGENT_TOOLS_URL_ENV in _env_var_keys(parsed_env_vars) or AGENT_TOOLS_TOKEN_ENV in _env_var_keys(parsed_env_vars):
+        keys = _env_var_keys(parsed_env_vars)
+        if AGENT_TOOLS_URL_ENV not in keys or AGENT_TOOLS_TOKEN_ENV not in keys:
+            raise click.ClickException(
+                f"{AGENT_TOOLS_URL_ENV} and {AGENT_TOOLS_TOKEN_ENV} must be provided together when using --env-var."
+            )
+        runtime_config_path = _build_agent_tools_runtime_config(config_path=config_path, host_codex_dir=host_codex_dir)
+        return _AgentToolsRuntimeBridge(
+            runtime_config_path=runtime_config_path,
+            env_vars=[],
+            state=None,
+            session_id="",
+            server=None,
+            thread=None,
+        )
+
+    from agent_hub import server as hub_server
+
+    class _CliHubState(hub_server.HubState):
+        def _reconcile_project_build_state(self) -> None:  # type: ignore[override]
+            return
+
+    data_dir = _resolved_agent_hub_data_dir()
+    hub_state = _CliHubState(
+        data_dir=data_dir,
+        config_file=config_path,
+        system_prompt_file=system_prompt_path,
+        artifact_publish_base_url="http://127.0.0.1",
+    )
+    repo_url = _git_origin_repo_url(project_path)
+    project_id = ""
+    session_id = ""
+    runtime_config_path: Path | None = None
+    server: ThreadingHTTPServer | None = None
+    thread: Thread | None = None
+    try:
+        project_id, credential_binding = _resolve_existing_project_context(hub_state, repo_url)
+        session_id, session_token = hub_state._create_agent_tools_session(
+            project_id=project_id,
+            repo_url=repo_url,
+            credential_binding=credential_binding,
+        )
+        runtime_config_path = _build_agent_tools_runtime_config(config_path=config_path, host_codex_dir=host_codex_dir)
+
+        class _BridgeHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+                del format, args
+                return
+
+            def _send_json(self, status_code: int, payload: dict[str, object]) -> None:
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def _read_payload(self) -> dict[str, object]:
+                try:
+                    content_length = int(str(self.headers.get("Content-Length") or "0"))
+                except ValueError:
+                    content_length = 0
+                if content_length <= 0:
+                    return {}
+                body = self.rfile.read(content_length).decode("utf-8", errors="ignore")
+                if not body.strip():
+                    return {}
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    raise click.ClickException(f"Invalid JSON payload: {exc}") from exc
+                if not isinstance(parsed, dict):
+                    raise click.ClickException("Invalid JSON payload.")
+                return parsed
+
+            def _request_token(self) -> str:
+                auth_header = str(self.headers.get("Authorization") or "")
+                if auth_header.lower().startswith("bearer "):
+                    return auth_header[7:].strip()
+                return str(self.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+
+            def _authorize(self) -> None:
+                hub_state.require_agent_tools_session_token(session_id, self._request_token())
+
+            @staticmethod
+            def _http_detail(exc: Exception) -> tuple[int, str]:
+                status_code = int(getattr(exc, "status_code", 500))
+                detail = str(getattr(exc, "detail", str(exc)))
+                return status_code, detail
+
+            def do_GET(self) -> None:  # noqa: N802
+                path = urllib.parse.urlsplit(self.path).path
+                if path != "/credentials":
+                    self._send_json(404, {"detail": "Not found."})
+                    return
+                try:
+                    self._authorize()
+                    payload = hub_state.agent_tools_session_credentials_list_payload(session_id)
+                except Exception as exc:
+                    status_code, detail = self._http_detail(exc)
+                    self._send_json(status_code, {"detail": detail})
+                    return
+                self._send_json(200, payload)
+
+            def do_POST(self) -> None:  # noqa: N802
+                path = urllib.parse.urlsplit(self.path).path
+                if path not in {"/credentials/resolve", "/project-binding"}:
+                    self._send_json(404, {"detail": "Not found."})
+                    return
+                try:
+                    self._authorize()
+                    payload = self._read_payload()
+                    mode = payload.get("mode")
+                    credential_ids = payload.get("credential_ids")
+                    if path == "/credentials/resolve":
+                        response = hub_state.resolve_agent_tools_session_credentials(
+                            session_id=session_id,
+                            mode=mode,
+                            credential_ids=credential_ids,
+                        )
+                    else:
+                        response = hub_state.attach_agent_tools_session_project_credentials(
+                            session_id=session_id,
+                            mode=mode,
+                            credential_ids=credential_ids,
+                        )
+                except Exception as exc:
+                    status_code, detail = self._http_detail(exc)
+                    self._send_json(status_code, {"detail": detail})
+                    return
+                self._send_json(200, response)
+
+        server = ThreadingHTTPServer(("0.0.0.0", 0), _BridgeHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        bridge_port = int(server.server_address[1])
+        env_vars = [
+            f"{AGENT_TOOLS_URL_ENV}=http://host.docker.internal:{bridge_port}",
+            f"{AGENT_TOOLS_TOKEN_ENV}={session_token}",
+            f"{AGENT_TOOLS_PROJECT_ID_ENV}={project_id}",
+            f"{AGENT_TOOLS_CHAT_ID_ENV}=agent_cli:{session_id}",
+        ]
+        assert runtime_config_path is not None
+        return _AgentToolsRuntimeBridge(
+            runtime_config_path=runtime_config_path,
+            env_vars=env_vars,
+            state=hub_state,
+            session_id=session_id,
+            server=server,
+            thread=thread,
+        )
+    except Exception:
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        if session_id:
+            sessions_lock = getattr(hub_state, "_agent_tools_sessions_lock", None)
+            sessions = getattr(hub_state, "_agent_tools_sessions", None)
+            if sessions_lock is not None and isinstance(sessions, dict):
+                try:
+                    with sessions_lock:
+                        sessions.pop(session_id, None)
+                except Exception:
+                    pass
+        if runtime_config_path is not None:
+            try:
+                runtime_config_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 
 def _default_group_name() -> str:
@@ -1286,6 +1656,8 @@ def main(
             ),
         ]
 
+    config_mount_target = f"{container_home_path}/.codex/config.toml:ro"
+    config_mount_entry = f"{config_path}:{config_mount_target}"
     run_args = [
         "--init",
         "--user",
@@ -1309,7 +1681,7 @@ def main(
         "--volume",
         f"{host_gemini_dir}:{container_home_path}/.gemini",
         "--volume",
-        f"{config_path}:{container_home_path}/.codex/config.toml:ro",
+        config_mount_entry,
         "--env",
         f"LOCAL_UMASK={local_umask}",
         "--env",
@@ -1447,20 +1819,41 @@ def main(
     if prepare_snapshot_only:
         return
 
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "-i",
-        "-t",
-        "--tmpfs",
-        TMP_DIR_TMPFS_SPEC,
-        *run_args,
-        runtime_image,
-        *command,
-    ]
+    runtime_bridge: _AgentToolsRuntimeBridge | None = None
+    runtime_run_args = list(run_args)
+    try:
+        if selected_agent_command == DEFAULT_AGENT_COMMAND:
+            runtime_bridge = _start_agent_tools_runtime_bridge(
+                project_path=project_path,
+                host_codex_dir=host_codex_dir,
+                config_path=config_path,
+                system_prompt_path=system_prompt_path,
+                parsed_env_vars=parsed_env_vars,
+            )
+            if runtime_bridge is not None:
+                runtime_run_args = list(run_args)
+                mount_index = runtime_run_args.index(config_mount_entry)
+                runtime_run_args[mount_index] = f"{runtime_bridge.runtime_config_path}:{config_mount_target}"
+                for runtime_env in runtime_bridge.env_vars:
+                    runtime_run_args.extend(["--env", runtime_env])
 
-    _run(cmd)
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "-t",
+            "--tmpfs",
+            TMP_DIR_TMPFS_SPEC,
+            *runtime_run_args,
+            runtime_image,
+            *command,
+        ]
+
+        _run(cmd)
+    finally:
+        if runtime_bridge is not None:
+            runtime_bridge.close()
 
 
 if __name__ == "__main__":

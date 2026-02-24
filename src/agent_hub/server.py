@@ -7465,7 +7465,50 @@ class HubState:
         session = self._agent_tools_session(session_id)
         project_id = str(session.get("project_id") or "").strip()
         if not project_id:
-            raise HTTPException(status_code=409, detail="This agent_tools session is not attached to a persisted project.")
+            project = self._agent_tools_project_context_from_session(session)
+            requested_ids = credential_ids if isinstance(credential_ids, list) else []
+            binding = _normalize_project_credential_binding(
+                {
+                    "mode": mode,
+                    "credential_ids": requested_ids,
+                    "source": f"agent_tools_session:{session_id}",
+                    "updated_at": _iso_now(),
+                }
+            )
+            available_credentials = self._project_available_credentials(project)
+            available_ids = {
+                str(entry.get("credential_id") or "").strip()
+                for entry in available_credentials
+                if str(entry.get("credential_id") or "").strip()
+            }
+            if binding["mode"] in {PROJECT_CREDENTIAL_BINDING_MODE_SET, PROJECT_CREDENTIAL_BINDING_MODE_SINGLE}:
+                filtered_ids = [credential_id for credential_id in binding["credential_ids"] if credential_id in available_ids]
+                if not filtered_ids:
+                    raise HTTPException(status_code=400, detail="No valid credentials were provided for this repository.")
+                binding["credential_ids"] = (
+                    filtered_ids[:1] if binding["mode"] == PROJECT_CREDENTIAL_BINDING_MODE_SINGLE else filtered_ids
+                )
+            else:
+                binding["credential_ids"] = []
+
+            project["credential_binding"] = binding
+            effective_ids = self._resolve_agent_tools_credential_ids(
+                project,
+                binding["mode"],
+                binding["credential_ids"],
+            )
+            with self._agent_tools_sessions_lock:
+                active_session = self._agent_tools_sessions.get(session_id)
+                if active_session is not None:
+                    active_session["credential_binding"] = binding
+                    self._agent_tools_sessions[session_id] = active_session
+
+            return {
+                "project_id": "",
+                "binding": binding,
+                "available_credentials": available_credentials,
+                "effective_credential_ids": effective_ids,
+            }
         return self.attach_project_credentials(
             project_id=project_id,
             mode=mode,
