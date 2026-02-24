@@ -914,6 +914,79 @@ Gemini CLI
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("personal_access_token", str(ctx.exception.detail))
 
+    def test_connect_github_personal_access_token_supports_gitlab_host_with_port(self) -> None:
+        token = TEST_GITHUB_PERSONAL_ACCESS_TOKEN
+        request_paths: list[str] = []
+        private_token_headers: list[str] = []
+
+        class GitlabPatVerificationHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                request_paths.append(self.path)
+                private_token_headers.append(str(self.headers.get("PRIVATE-TOKEN") or ""))
+                if self.path == "/api/v3/user":
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{\"message\":\"Not Found\"}')
+                    return
+                if self.path == "/api/v4/user":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("X-Gitlab-Scopes", "api,read_repository,write_repository")
+                    self.end_headers()
+                    self.wfile.write(
+                        b'{\"id\":44,\"username\":\"gitlab-user\",\"name\":\"GitLab User\",\"email\":\"gitlab-user@example.com\"}'
+                    )
+                    return
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{\"message\":\"Not Found\"}')
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                del format, args
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), GitlabPatVerificationHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            port = int(server.server_address[1])
+            host_input = f"http://127.0.0.1:{port}"
+            saved = self.state.connect_github_personal_access_token(
+                token,
+                host=host_input,
+                owner_scopes=["acme-org"],
+            )
+            expected_host = f"127.0.0.1:{port}"
+            self.assertTrue(saved["connected"])
+            self.assertEqual(saved["personal_access_token_host"], expected_host)
+            self.assertEqual(saved["personal_access_token_scheme"], "http")
+            self.assertEqual(saved["personal_access_token_provider"], "gitlab")
+            self.assertEqual(saved["personal_access_token_user_login"], "gitlab-user")
+            self.assertEqual(saved["personal_access_token_user_email"], "gitlab-user@example.com")
+            self.assertEqual(saved["personal_access_token_owner_scopes"], ["acme-org"])
+            credentials_line = self.state.github_git_credentials_file.read_text(encoding="utf-8").strip()
+            self.assertEqual(credentials_line, f"http://gitlab-user:{token}@{expected_host}")
+
+            context = self.state._github_repo_auth_context(f"http://{expected_host}/acme-org/repo.git")
+            self.assertIsNotNone(context)
+            assert context is not None
+            mode, context_host, payload = context
+            self.assertEqual(mode, hub_server.GITHUB_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN)
+            self.assertEqual(context_host, expected_host)
+            self.assertEqual(payload["scheme"], "http")
+            self.assertEqual(payload["provider"], "gitlab")
+
+            self.assertIn("/api/v3/user", request_paths)
+            self.assertIn("/api/v4/user", request_paths)
+            self.assertIn(token, private_token_headers)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1.0)
+
     def test_connect_github_app_clears_personal_access_token_state(self) -> None:
         self._connect_github_pat()
         with patch.object(
@@ -6327,6 +6400,66 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("GIT_CONFIG_KEY_2=url.https://github.com/.insteadOf", env_values)
             self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@github.com/", env_values)
 
+    def test_cli_mounts_git_credentials_with_host_port_and_http_scheme(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+            credential_file = tmp_path / "gitlab_credentials"
+            credential_file.write_text(
+                "http://gitlab-user:glpat_local_test_token@gitlab.local:8929\n",
+                encoding="utf-8",
+            )
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--git-credential-file",
+                        str(credential_file),
+                        "--git-credential-host",
+                        "gitlab.local:8929",
+                        "--git-credential-scheme",
+                        "http",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=gitlab.local:8929", env_values)
+            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_SCHEME=http", env_values)
+            self.assertIn("GIT_CONFIG_KEY_1=url.http://gitlab.local:8929/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_1=git@gitlab.local:", env_values)
+            self.assertIn("GIT_CONFIG_KEY_2=url.http://gitlab.local:8929/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@gitlab.local/", env_values)
+
     def test_cli_auto_discovers_agent_hub_github_credentials_when_flags_not_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -6455,6 +6588,68 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("GIT_CONFIG_VALUE_1=git@github.enterprise.local:", env_values)
             self.assertIn("GIT_CONFIG_KEY_2=url.https://github.enterprise.local/.insteadOf", env_values)
             self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@github.enterprise.local/", env_values)
+
+    def test_cli_auto_discovery_parses_host_port_and_scheme(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            stored_credentials = (
+                tmp_path
+                / ".local"
+                / "share"
+                / "agent-hub"
+                / image_cli.AGENT_HUB_SECRETS_DIR_NAME
+                / image_cli.AGENT_HUB_GITHUB_CREDENTIALS_FILE_NAME
+            )
+            stored_credentials.parent.mkdir(parents=True, exist_ok=True)
+            stored_credentials.write_text(
+                "http://gitlab-user:glpat_local_test_token@gitlab.local:8929\n",
+                encoding="utf-8",
+            )
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.Path.home", return_value=tmp_path), patch(
+                "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            env_values = [
+                run_cmd[index + 1]
+                for index, part in enumerate(run_cmd[:-1])
+                if part == "--env"
+            ]
+            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=gitlab.local:8929", env_values)
+            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_SCHEME=http", env_values)
+            self.assertIn("GIT_CONFIG_KEY_1=url.http://gitlab.local:8929/.insteadOf", env_values)
+            self.assertIn("GIT_CONFIG_VALUE_1=git@gitlab.local:", env_values)
 
     def test_cli_mounts_docker_socket_into_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
