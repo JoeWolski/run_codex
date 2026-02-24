@@ -21,6 +21,15 @@ import {
   normalizeCreateProjectConfigMode,
   shouldShowManualProjectConfigInputs
 } from "./createProjectConfigMode";
+import {
+  buildChatStartConfig,
+  normalizeAgentType,
+  normalizeChatStartSettings,
+  normalizeModeOptions,
+  reasoningModeOptionsForAgent,
+  resolveProjectChatStartSettings,
+  startModelOptionsForAgent
+} from "./chatStartSettings";
 import { createFirstSeenOrderState, stableOrderItemsByFirstSeen } from "./stableListOrder";
 import { buildProjectChatFlexModels } from "./projectChatLayoutModels";
 import { terminalThemeForAppTheme } from "./theme";
@@ -96,38 +105,6 @@ function normalizeHubStatePayload(rawPayload) {
   };
 }
 
-function normalizeModeOptions(rawOptions, fallbackOptions) {
-  const source = Array.isArray(rawOptions) ? rawOptions : fallbackOptions;
-  const values = source.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
-  const unique = [];
-  const seen = new Set();
-  for (const value of values) {
-    if (seen.has(value)) {
-      continue;
-    }
-    unique.push(value);
-    seen.add(value);
-  }
-  if (!seen.has("default")) {
-    return ["default", ...unique];
-  }
-  return ["default", ...unique.filter((value) => value !== "default")];
-}
-
-function normalizeAgentType(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const normalized = String(value || "").trim().toLowerCase();
-  if (!normalized || normalized === "default") {
-    return DEFAULT_AGENT_TYPE;
-  }
-  const knownTypes = (capabilities?.agents || [])
-    .map((agent) => String(agent?.agentType || "").trim().toLowerCase())
-    .filter((agentType) => Boolean(agentType && agentType !== "default"));
-  if (knownTypes.includes(normalized)) {
-    return normalized;
-  }
-  return DEFAULT_AGENT_TYPE;
-}
-
 function normalizeHubSettings(rawSettings, capabilities = DEFAULT_AGENT_CAPABILITIES) {
   return {
     defaultAgentType: normalizeAgentType(rawSettings?.defaultAgentType || rawSettings?.default_agent_type, capabilities),
@@ -183,17 +160,6 @@ function normalizeAgentCapabilities(rawPayload) {
   };
 }
 
-function agentCapabilityForType(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const resolvedType = normalizeAgentType(agentType, capabilities);
-  const matched = (capabilities?.agents || []).find(
-    (agent) => String(agent?.agentType || "").trim().toLowerCase() === resolvedType
-  );
-  if (matched) {
-    return matched;
-  }
-  return DEFAULT_AGENT_CAPABILITIES.agents.find((agent) => agent.agentType === DEFAULT_AGENT_TYPE);
-}
-
 function agentTypeOptions(capabilities = DEFAULT_AGENT_CAPABILITIES) {
   return (capabilities?.agents || []).map((agent) => ({
     value: String(agent?.agentType || "").trim().toLowerCase(),
@@ -205,55 +171,6 @@ function agentTypeLabel(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
   const normalized = normalizeAgentType(agentType, capabilities);
   const matched = agentTypeOptions(capabilities).find((option) => option.value === normalized);
   return matched ? matched.label : "Codex";
-}
-
-function startModelOptionsForAgent(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const details = agentCapabilityForType(agentType, capabilities);
-  return normalizeModeOptions(details?.models, ["default"]);
-}
-
-function reasoningModeOptionsForAgent(agentType, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const details = agentCapabilityForType(agentType, capabilities);
-  return normalizeModeOptions(details?.reasoningModes, ["default"]);
-}
-
-function normalizeStartModel(agentType, value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const options = startModelOptionsForAgent(agentType, capabilities);
-  const normalized = String(value || "").trim().toLowerCase();
-  if (options.includes(normalized)) {
-    return normalized;
-  }
-  return "default";
-}
-
-function normalizeReasoningMode(agentType, value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const options = reasoningModeOptionsForAgent(agentType, capabilities);
-  const normalized = String(value || "").trim().toLowerCase();
-  if (options.includes(normalized)) {
-    return normalized;
-  }
-  return "default";
-}
-
-function normalizeChatStartSettings(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const resolvedAgentType = normalizeAgentType(value?.agentType || value?.agent_type, capabilities);
-  return {
-    agentType: resolvedAgentType,
-    model: normalizeStartModel(resolvedAgentType, value?.model, capabilities),
-    reasoning: normalizeReasoningMode(resolvedAgentType, value?.reasoning, capabilities)
-  };
-}
-
-function buildChatStartConfig(value, capabilities = DEFAULT_AGENT_CAPABILITIES) {
-  const normalized = normalizeChatStartSettings(value, capabilities);
-  const args = [];
-  if (normalized.model !== "default") {
-    args.push("--model", normalized.model);
-  }
-  if (normalized.agentType === "codex" && normalized.reasoning !== "default") {
-    args.push("-c", `model_reasoning_effort="${normalized.reasoning}"`);
-  }
-  return { agentType: normalized.agentType, agentArgs: args };
 }
 
 function normalizeThemePreference(value) {
@@ -1759,6 +1676,12 @@ function HubApp() {
     () => normalizeHubSettings(hubState.settings, agentCapabilities),
     [hubState.settings, agentCapabilities]
   );
+  const hubSettingsRef = useRef(hubSettings);
+  const agentCapabilitiesRef = useRef(agentCapabilities);
+  const chatStartSettingsByProjectRef = useRef(chatStartSettingsByProject);
+  hubSettingsRef.current = hubSettings;
+  agentCapabilitiesRef.current = agentCapabilities;
+  chatStartSettingsByProjectRef.current = chatStartSettingsByProject;
 
   const applyStatePayload = useCallback((payload) => {
     const normalizedPayload = normalizeHubStatePayload(payload);
@@ -2401,16 +2324,18 @@ function HubApp() {
   }
 
   function updateProjectChatStartSettings(projectId, patch) {
+    const capabilities = agentCapabilitiesRef.current;
+    const defaultAgentType = hubSettingsRef.current.defaultAgentType;
     setChatStartSettingsByProject((prev) => {
       const current = normalizeChatStartSettings(
-        prev[projectId] || { agentType: hubSettings.defaultAgentType },
-        agentCapabilities
+        prev[projectId] || { agentType: defaultAgentType },
+        capabilities
       );
       const candidate = {
         ...current,
         ...patch
       };
-      const normalized = normalizeChatStartSettings(candidate, agentCapabilities);
+      const normalized = normalizeChatStartSettings(candidate, capabilities);
       return {
         ...prev,
         [projectId]: normalized
@@ -2718,11 +2643,14 @@ function HubApp() {
     const pendingCreatedAtMs = Date.now();
     const uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const project = projectsById.get(projectId);
-    const selectedStartSettings = normalizeChatStartSettings(
-      startSettings || chatStartSettingsByProject[projectId] || { agentType: hubSettings.defaultAgentType },
-      agentCapabilities
+    const selectedStartSettings = resolveProjectChatStartSettings(
+      projectId,
+      chatStartSettingsByProjectRef.current,
+      hubSettingsRef.current.defaultAgentType,
+      agentCapabilitiesRef.current,
+      startSettings
     );
-    const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings, agentCapabilities);
+    const { agentType, agentArgs } = buildChatStartConfig(selectedStartSettings, agentCapabilitiesRef.current);
     const knownServerChatIds = (hubState.chats || [])
       .filter((chat) => String(chat.project_id || "") === String(projectId))
       .map((chat) => chat.id);
@@ -4178,7 +4106,6 @@ function HubApp() {
     const projectAgentOptions = agentTypeOptions(agentCapabilities);
     const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
     const projectReasoningOptions = reasoningModeOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
-    const projectSupportsReasoning = projectReasoningOptions.length > 1;
 
     return (
       <article className="card project-chat-group" key={`${keyPrefix}-${project.id}`}>
@@ -4232,25 +4159,23 @@ function HubApp() {
                     </option>
                   ))}
                 </select>
-                {projectSupportsReasoning ? (
-                  <select
-                    className="project-start-select"
-                    aria-label={`Reasoning mode for ${project.name}`}
-                    value={projectStartSettings.reasoning}
-                    onClick={(event) => event.stopPropagation()}
-                    onKeyDown={(event) => event.stopPropagation()}
-                    onChange={(event) => {
-                      event.stopPropagation();
-                      updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
-                    }}
-                  >
-                    {projectReasoningOptions.map((reasoningMode) => (
-                      <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
-                        {reasoningMode}
-                      </option>
-                    ))}
-                  </select>
-                ) : null}
+                <select
+                  className="project-start-select"
+                  aria-label={`Reasoning mode for ${project.name}`}
+                  value={projectStartSettings.reasoning}
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onChange={(event) => {
+                    event.stopPropagation();
+                    updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
+                  }}
+                >
+                  {projectReasoningOptions.map((reasoningMode) => (
+                    <option key={`${project.id}-reasoning-${reasoningMode}`} value={reasoningMode}>
+                      {reasoningMode}
+                    </option>
+                  ))}
+                </select>
               </>
             ) : null}
             <button
@@ -4260,7 +4185,7 @@ function HubApp() {
               onClick={(event) => {
                 event.stopPropagation();
                 if (canStartChat) {
-                  handleCreateChat(project.id, projectStartSettings);
+                  handleCreateChat(project.id);
                 } else {
                   handleBuildProject(project.id);
                 }
@@ -4351,7 +4276,6 @@ function HubApp() {
     const projectAgentOptions = agentTypeOptions(agentCapabilities);
     const projectModelOptions = startModelOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
     const projectReasoningOptions = reasoningModeOptionsForAgent(projectStartSettings.agentType, agentCapabilities);
-    const projectSupportsReasoning = projectReasoningOptions.length > 1;
 
     renderValues.stickyButtons.push(
       <div
@@ -4390,22 +4314,20 @@ function HubApp() {
                 </option>
               ))}
             </select>
-            {projectSupportsReasoning ? (
-              <select
-                className="project-start-select"
-                aria-label={`Reasoning mode for ${project.name}`}
-                value={projectStartSettings.reasoning}
-                onChange={(event) => {
-                  updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
-                }}
-              >
-                {projectReasoningOptions.map((reasoningMode) => (
-                  <option key={`${project.id}-outer-reasoning-${reasoningMode}`} value={reasoningMode}>
-                    {reasoningMode}
-                  </option>
-                ))}
-              </select>
-            ) : null}
+            <select
+              className="project-start-select"
+              aria-label={`Reasoning mode for ${project.name}`}
+              value={projectStartSettings.reasoning}
+              onChange={(event) => {
+                updateProjectChatStartSettings(project.id, { reasoning: event.target.value });
+              }}
+            >
+              {projectReasoningOptions.map((reasoningMode) => (
+                <option key={`${project.id}-outer-reasoning-${reasoningMode}`} value={reasoningMode}>
+                  {reasoningMode}
+                </option>
+              ))}
+            </select>
           </>
         ) : null}
         <button
@@ -4414,7 +4336,7 @@ function HubApp() {
           disabled={!canStartChat && isBuilding}
           onClick={() => {
             if (canStartChat) {
-              handleCreateChat(project.id, projectStartSettings);
+              handleCreateChat(project.id);
             } else {
               handleBuildProject(project.id);
             }

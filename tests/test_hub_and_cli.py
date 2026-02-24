@@ -432,6 +432,52 @@ Gemini CLI
         self.assertEqual(gemini["models"], ["default", "pro", "flash"])
         self.assertEqual(gemini["reasoning_modes"], ["default"])
 
+    def test_agent_capabilities_discovery_parses_numbered_codex_model_list(self) -> None:
+        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+            if cmd == ["codex", "--help"]:
+                return (
+                    0,
+                    """
+› 1. gpt-5.3-codex (current)  Latest frontier agentic coding model.
+  2. gpt-5.3-codex-spark      Ultra-fast coding model.
+  3. gpt-5.2-codex            Frontier agentic coding model.
+  4. gpt-5.1-codex-max        Codex-optimized flagship for deep and fast reasoning.
+  5. gpt-5.2                  Latest frontier model with improvements across knowledge, reasoning and coding.
+  6. gpt-5.1-codex-mini       Optimized for codex. Cheaper, faster, but less capable.
+--model-reasoning-effort <LEVEL> [possible values: low, medium, high]
+""",
+                )
+            if cmd == ["claude", "--help"]:
+                return 127, ""
+            if cmd == ["gemini", "--help"]:
+                return 127, ""
+            return 127, ""
+
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+            started_payload = self.state.start_agent_capabilities_discovery()
+            self.assertTrue(started_payload["discovery_in_progress"])
+            worker = self.state._agent_capabilities_discovery_thread
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+
+        payload = self.state.agent_capabilities_payload()
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        self.assertEqual(
+            codex["models"],
+            [
+                "default",
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+                "gpt-5.2-codex",
+                "gpt-5.1-codex-max",
+                "gpt-5.2",
+                "gpt-5.1-codex-mini",
+            ],
+        )
+        self.assertEqual(codex["reasoning_modes"], ["default", "low", "medium", "high"])
+
     def test_reasoning_candidate_extractor_requires_supported_modes_context(self) -> None:
         self.assertEqual(
             hub_server._extract_reasoning_candidates_from_output(

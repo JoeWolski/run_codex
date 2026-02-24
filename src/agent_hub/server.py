@@ -145,6 +145,9 @@ AGENT_CAPABILITY_HELP_INLINE_VALUES_RE = re.compile(
     r"\[\s*possible values?\s*:\s*([^\]]+)\]", re.IGNORECASE
 )
 AGENT_CAPABILITY_HELP_BULLET_VALUE_RE = re.compile(r"^\s*-\s*([A-Za-z0-9][A-Za-z0-9._-]{0,80})\b")
+AGENT_CAPABILITY_HELP_NUMBERED_VALUE_RE = re.compile(
+    r"^\s*(?:[>›]\s*)?(?:\d+[.)]\s+)([A-Za-z0-9][A-Za-z0-9._-]{0,80})\b"
+)
 AGENT_CAPABILITY_HELP_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,80}")
 AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS = float(
     os.environ.get("AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS", "8.0")
@@ -1124,12 +1127,34 @@ def _extract_model_candidates_from_output(output_text: str, agent_type: str) -> 
     except json.JSONDecodeError:
         pass
 
-    return _extract_option_values_from_help_text(
+    help_candidates = _extract_option_values_from_help_text(
         text,
         option_name_matcher=lambda option_name: option_name == "model" or option_name.endswith("-model"),
         token_validator=lambda token: _token_is_model_candidate(agent_type, token),
         contextual_list_pattern=AGENT_CAPABILITY_MODEL_LIST_RE,
     )
+    if help_candidates:
+        return help_candidates
+
+    # Some CLIs print numbered model menus without explicit --model context.
+    # Capture leading list tokens so capability discovery still reflects available models.
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = str(raw_line or "").rstrip()
+        if not line:
+            continue
+        numbered_match = AGENT_CAPABILITY_HELP_NUMBERED_VALUE_RE.match(line)
+        if not numbered_match:
+            continue
+        token = str(numbered_match.group(1) or "").strip().lower().strip(".,;:()[]{}")
+        if not token or token in seen:
+            continue
+        if not _token_is_model_candidate(agent_type, token):
+            continue
+        seen.add(token)
+        discovered.append(token)
+    return discovered
 
 
 def _extract_option_values_from_help_text(
@@ -1183,6 +1208,10 @@ def _extract_option_values_from_help_text(
             bullet_match = AGENT_CAPABILITY_HELP_BULLET_VALUE_RE.match(line)
             if bullet_match:
                 add_token(bullet_match.group(1))
+                continue
+            numbered_match = AGENT_CAPABILITY_HELP_NUMBERED_VALUE_RE.match(line)
+            if numbered_match:
+                add_token(numbered_match.group(1))
                 continue
             if not line.strip():
                 collect_bullet_values = False
