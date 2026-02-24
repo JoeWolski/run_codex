@@ -2522,6 +2522,31 @@ Gemini CLI
         self.assertEqual(reloaded["status_reason"], "chat_start_failed_during_create")
         self.assertEqual(reloaded["start_error"], "synthetic start failure")
 
+    def test_create_and_start_chat_reuses_existing_request_id_chat(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        existing_chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            create_request_id="req-123",
+        )
+
+        with patch.object(hub_server.HubState, "create_chat") as create_chat, patch.object(
+            hub_server.HubState, "start_chat"
+        ) as start_chat:
+            reused = self.state.create_and_start_chat(project["id"], request_id="req-123")
+
+        self.assertEqual(reused["id"], existing_chat["id"])
+        create_chat.assert_not_called()
+        start_chat.assert_not_called()
+
     def test_create_and_start_chat_passes_agent_type(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -7282,6 +7307,38 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             "project-1",
             agent_args=["--model", "gpt-5.3-codex"],
             agent_type="codex",
+        )
+
+    def test_project_chat_start_route_passes_request_id_when_present(self) -> None:
+        app = self._build_app()
+        chat = {"id": "chat-1", "status": "running"}
+
+        with patch(
+            "agent_hub.server.asyncio.to_thread",
+            new=AsyncMock(side_effect=self._fake_to_thread),
+        ) as to_thread, patch.object(
+            hub_server.HubState,
+            "create_and_start_chat",
+            return_value=chat,
+        ) as start_chat:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/projects/project-1/chats/start",
+                    json={
+                        "agent_type": "codex",
+                        "agent_args": ["--model", "gpt-5.3-codex"],
+                        "request_id": "req-abc",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), {"chat": chat})
+        to_thread.assert_awaited_once()
+        start_chat.assert_called_once_with(
+            "project-1",
+            agent_args=["--model", "gpt-5.3-codex"],
+            agent_type="codex",
+            request_id="req-abc",
         )
 
     def test_project_chat_start_route_uses_configured_default_agent_type_when_not_provided(self) -> None:

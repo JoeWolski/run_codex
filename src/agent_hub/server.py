@@ -3347,6 +3347,7 @@ class HubState:
             chat["artifact_prompt_history"] = _normalize_chat_artifact_prompt_history(chat.get("artifact_prompt_history"))
             chat["artifact_publish_token_hash"] = str(chat.get("artifact_publish_token_hash") or "")
             chat["artifact_publish_token_issued_at"] = str(chat.get("artifact_publish_token_issued_at") or "")
+            chat["create_request_id"] = _compact_whitespace(str(chat.get("create_request_id") or "")).strip()
         return state
 
     @staticmethod
@@ -7065,6 +7066,7 @@ class HubState:
         env_vars: list[str],
         agent_args: list[str] | None = None,
         agent_type: str | None = None,
+        create_request_id: str | None = None,
     ) -> dict[str, Any]:
         state = self.load()
         project = state["projects"].get(project_id)
@@ -7107,6 +7109,7 @@ class HubState:
             "artifact_prompt_history": [],
             "artifact_publish_token_hash": "",
             "artifact_publish_token_issued_at": "",
+            "create_request_id": _compact_whitespace(str(create_request_id or "")).strip(),
             "created_at": now,
             "updated_at": now,
         }
@@ -7126,6 +7129,7 @@ class HubState:
         project_id: str,
         agent_args: list[str] | None = None,
         agent_type: str | None = None,
+        request_id: str | None = None,
     ) -> dict[str, Any]:
         state = self.load()
         project = state["projects"].get(project_id)
@@ -7141,14 +7145,34 @@ class HubState:
             else _normalize_chat_agent_type(agent_type)
         )
         normalized_agent_args = _apply_default_model_for_agent(resolved_agent_type, normalized_agent_args)
+        normalized_request_id = _compact_whitespace(str(request_id or "")).strip()
+        if normalized_request_id:
+            existing_chat = self._chat_for_create_request(
+                state=state,
+                project_id=project_id,
+                request_id=normalized_request_id,
+            )
+            if existing_chat is not None:
+                LOGGER.info(
+                    "Reused existing chat for create request project_id=%s request_id=%s chat_id=%s",
+                    project_id,
+                    normalized_request_id,
+                    existing_chat.get("id"),
+                )
+                return existing_chat
+        create_chat_kwargs: dict[str, Any] = {
+            "profile": "",
+            "ro_mounts": list(project.get("default_ro_mounts") or []),
+            "rw_mounts": list(project.get("default_rw_mounts") or []),
+            "env_vars": list(project.get("default_env_vars") or []),
+            "agent_args": normalized_agent_args,
+            "agent_type": resolved_agent_type,
+        }
+        if normalized_request_id:
+            create_chat_kwargs["create_request_id"] = normalized_request_id
         chat = self.create_chat(
             project_id,
-            profile="",
-            ro_mounts=list(project.get("default_ro_mounts") or []),
-            rw_mounts=list(project.get("default_rw_mounts") or []),
-            env_vars=list(project.get("default_env_vars") or []),
-            agent_args=normalized_agent_args,
-            agent_type=resolved_agent_type,
+            **create_chat_kwargs,
         )
         try:
             return self.start_chat(chat["id"])
@@ -7171,6 +7195,26 @@ class HubState:
             if failed_chat is not None:
                 return failed_chat
             raise
+
+    @staticmethod
+    def _chat_for_create_request(
+        state: dict[str, Any],
+        project_id: str,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        normalized_project_id = str(project_id or "").strip()
+        normalized_request_id = _compact_whitespace(str(request_id or "")).strip()
+        if not normalized_project_id or not normalized_request_id:
+            return None
+        for chat in state.get("chats", {}).values():
+            if not isinstance(chat, dict):
+                continue
+            if str(chat.get("project_id") or "").strip() != normalized_project_id:
+                continue
+            if _compact_whitespace(str(chat.get("create_request_id") or "")).strip() != normalized_request_id:
+                continue
+            return dict(chat)
+        return None
 
     def update_chat(self, chat_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         state = self.load()
@@ -8093,6 +8137,7 @@ class HubState:
             ]
             chat_copy.pop("artifact_publish_token_hash", None)
             chat_copy.pop("artifact_publish_token_issued_at", None)
+            chat_copy.pop("create_request_id", None)
             running = _is_process_running(pid)
             normalized_status = _normalize_chat_status(chat_copy.get("status"))
             if running:
@@ -9505,16 +9550,23 @@ def main(
             agent_args = []
         if not isinstance(agent_args, list):
             raise HTTPException(status_code=400, detail="agent_args must be an array.")
+        request_id_raw = payload.get("request_id")
+        request_id = _compact_whitespace(str(request_id_raw or "")).strip()
         agent_type = (
             _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
             if "agent_type" in payload
             else state.default_chat_agent_type()
         )
+        start_kwargs: dict[str, Any] = {
+            "agent_args": [str(arg) for arg in agent_args],
+            "agent_type": agent_type,
+        }
+        if request_id:
+            start_kwargs["request_id"] = request_id
         chat = await asyncio.to_thread(
             state.create_and_start_chat,
             project_id,
-            agent_args=[str(arg) for arg in agent_args],
-            agent_type=agent_type,
+            **start_kwargs,
         )
         return {
             "chat": chat
