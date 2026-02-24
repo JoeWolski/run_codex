@@ -1508,6 +1508,11 @@ button:focus-visible {
   height: 15px;
 }
 
+.chat-header-collapse {
+  font-size: 0.98rem;
+  font-weight: 700;
+}
+
 .terminal-toolbar-actions .chat-header-icon {
   color: #94a3b8;
   border-color: transparent;
@@ -1846,8 +1851,79 @@ button:focus-visible {
   inset: 0;
 }
 
+.chat-layout-project-shell .flexlayout__tabset_tabbar_outer_top {
+  min-height: 38px;
+  padding: 5px 8px 0;
+  border: 1px solid #0f172a;
+  border-bottom: 0;
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  background: rgba(15, 23, 42, 0.96);
+  pointer-events: none;
+}
+
+.chat-layout-project-shell .flexlayout__tabset_tabbar_inner_tab_container {
+  pointer-events: none;
+}
+
+.chat-layout-project-shell .flexlayout__tab_button {
+  pointer-events: auto;
+  min-height: 30px;
+  padding: 4px 12px;
+  border-radius: 8px 8px 0 0;
+  color: #94a3b8;
+}
+
+.chat-layout-project-shell .flexlayout__tab_button:hover,
+.chat-layout-project-shell .flexlayout__tab_button--selected {
+  color: #e2e8f0;
+  background: rgba(148, 163, 184, 0.18);
+  border-color: rgba(148, 163, 184, 0.28);
+}
+
+.chat-layout-project-shell .flexlayout__tab_button--unselected {
+  color: #94a3b8;
+}
+
+.chat-layout-project-shell .flexlayout__tab_toolbar_sticky_buttons_container,
+.chat-layout-project-shell .flexlayout__tab_toolbar_sticky_buttons_container * {
+  pointer-events: auto;
+}
+
 .chat-layout-project-chat-pane > .card {
   margin: 0;
+}
+
+.chat-layout-project-chat-pane {
+  height: 100%;
+  min-height: 0;
+}
+
+.chat-layout-project-chat-pane > .card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.chat-layout-project-chat-pane > .card > .chat-card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-layout-project-chat-pane .chat-terminal-shell {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  resize: none;
+  border-top: 0;
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+}
+
+.chat-layout-project-chat-pane .chat-terminal-shell .terminal-view {
+  min-height: 0;
 }
 
 .connection-summary {
@@ -1971,9 +2047,55 @@ button:focus-visible {
 
 .terminal-toolbar-main {
   min-width: 0;
+  flex: 1 1 auto;
   display: inline-flex;
   align-items: center;
   gap: 8px;
+}
+
+.terminal-toolbar-tabs {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.terminal-toolbar-tab {
+  width: auto;
+  max-width: min(220px, 44vw);
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: #94a3b8;
+  font: inherit;
+  font-size: 0.75rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+
+.terminal-toolbar-tab:hover {
+  color: #e2e8f0;
+  background: rgba(148, 163, 184, 0.14);
+  border-color: rgba(148, 163, 184, 0.26);
+}
+
+.terminal-toolbar-tab.selected {
+  color: #e2e8f0;
+  background: rgba(148, 163, 184, 0.2);
+  border-color: rgba(148, 163, 184, 0.32);
+}
+
+.terminal-toolbar-tab:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.24);
 }
 
 .terminal-toolbar-actions {
@@ -2088,6 +2210,27 @@ button:focus-visible {
 .chat-terminal-shell .terminal-view {
   height: calc(100% - 38px);
   min-height: 180px;
+}
+
+.terminal-shell-collapsed {
+  height: auto;
+  min-height: 38px;
+  max-height: 38px;
+  resize: none;
+}
+
+.chat-layout-project-chat-pane .chat-terminal-shell.terminal-shell-collapsed {
+  flex: 0 0 auto;
+  height: 38px;
+  min-height: 38px;
+  max-height: 38px;
+}
+
+.terminal-view-collapsed {
+  height: 0 !important;
+  min-height: 0 !important;
+  padding: 0;
+  overflow: hidden;
 }
 
 .chat-terminal-placeholder {
