@@ -393,7 +393,10 @@ Gemini CLI
                 )
             return 127, ""
 
-        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe), patch(
+            "agent_hub.server._fetch_codex_models_from_docs",
+            return_value=[],
+        ):
             started_payload = self.state.start_agent_capabilities_discovery()
             self.assertTrue(started_payload["discovery_in_progress"])
             worker = self.state._agent_capabilities_discovery_thread
@@ -464,7 +467,10 @@ Gemini CLI
                 return 0, "--model <MODEL>\nchoices: pro, flash"
             return 127, ""
 
-        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe), patch(
+            "agent_hub.server._fetch_codex_models_from_docs",
+            return_value=[],
+        ):
             started_payload = self.state.start_agent_capabilities_discovery()
             self.assertTrue(started_payload["discovery_in_progress"])
             worker = self.state._agent_capabilities_discovery_thread
@@ -478,6 +484,13 @@ Gemini CLI
             calls,
             [
                 ["codex", "--help"],
+                [
+                    "codex",
+                    "exec",
+                    "-c",
+                    'model_reasoning_effort="__agent_hub_invalid_reasoning__"',
+                    "capability-probe",
+                ],
                 ["claude", "--help"],
                 ["gemini", "--help"],
             ],
@@ -513,7 +526,10 @@ Gemini CLI
                 return 127, ""
             return 127, ""
 
-        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe), patch(
+            "agent_hub.server._fetch_codex_models_from_docs",
+            return_value=[],
+        ):
             started_payload = self.state.start_agent_capabilities_discovery()
             self.assertTrue(started_payload["discovery_in_progress"])
             worker = self.state._agent_capabilities_discovery_thread
@@ -592,6 +608,101 @@ Gemini CLI
             ),
             ["default", "low", "medium", "high"],
         )
+        self.assertEqual(
+            hub_server._extract_reasoning_candidates_from_output(
+                "Error loading config.toml: expected one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh` in `model_reasoning_effort`",
+                hub_server.AGENT_TYPE_CODEX,
+            ),
+            ["default", "minimal", "low", "medium", "high", "xhigh"],
+        )
+
+    def test_fetch_codex_models_from_docs_prefers_model_card_names(self) -> None:
+        html_body = """
+<html><body>
+<astro-island props="{&quot;name&quot;:[0,&quot;gpt-5.3-codex&quot;],&quot;slug&quot;:[0,&quot;gpt-5.3-codex&quot;]}"></astro-island>
+<astro-island props="{&quot;name&quot;:[0,&quot;gpt-5.3-codex-spark&quot;],&quot;slug&quot;:[0,&quot;gpt-5.3-codex-spark&quot;]}"></astro-island>
+<astro-island props="{&quot;name&quot;:[0,&quot;gpt-5.2-codex&quot;],&quot;slug&quot;:[0,&quot;gpt-5.2-codex&quot;]}"></astro-island>
+<astro-island props="{&quot;name&quot;:[0,&quot;gpt-5.2&quot;],&quot;slug&quot;:[0,&quot;gpt-5.2&quot;]}"></astro-island>
+<astro-island props="{&quot;name&quot;:[0,&quot;gpt-5.1-codex-max&quot;],&quot;slug&quot;:[0,&quot;gpt-5.1-codex-max&quot;]}"></astro-island>
+<astro-island props="{&quot;name&quot;:[0,&quot;gpt-5-codex-mini&quot;],&quot;slug&quot;:[0,&quot;gpt-5-codex&quot;]}"></astro-island>
+<code>codex -m gpt-5.3-codex</code>
+<code>codex -m gpt-5.3-codex-spark</code>
+<code>codex -m gpt-5.2-codex</code>
+<code>codex -m gpt-5.2</code>
+<code>codex -m gpt-5.1-codex-max</code>
+<code>codex -m gpt-5-codex</code>
+</body></html>
+"""
+
+        class FakeResponse:
+            def __init__(self, body: str) -> None:
+                self._body = body
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                del exc_type, exc, tb
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return self._body.encode("utf-8")
+
+        with patch("agent_hub.server.urllib.request.urlopen", return_value=FakeResponse(html_body)):
+            models = hub_server._fetch_codex_models_from_docs(3.0)
+        self.assertEqual(
+            models,
+            [
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+                "gpt-5.2-codex",
+                "gpt-5.2",
+                "gpt-5.1-codex-max",
+                "gpt-5-codex-mini",
+            ],
+        )
+
+    def test_fetch_codex_models_from_docs_falls_back_to_codex_command_tokens(self) -> None:
+        html_body = """
+<html><body>
+<code>codex -m gpt-5.3-codex</code>
+<code>codex -m gpt-5.3-codex-spark</code>
+<code>codex -m gpt-5.2-codex</code>
+<code>codex -m gpt-5.1-codex-max</code>
+<code>codex -m gpt-5.2</code>
+</body></html>
+"""
+
+        class FakeResponse:
+            def __init__(self, body: str) -> None:
+                self._body = body
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+                del exc_type, exc, tb
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return self._body.encode("utf-8")
+
+        with patch("agent_hub.server.urllib.request.urlopen", return_value=FakeResponse(html_body)):
+            models = hub_server._fetch_codex_models_from_docs(3.0)
+        self.assertEqual(
+            models,
+            [
+                "gpt-5.3-codex",
+                "gpt-5.3-codex-spark",
+                "gpt-5.2-codex",
+                "gpt-5.1-codex-max",
+                "gpt-5.2",
+            ],
+        )
 
     def test_agent_capabilities_payload_normalizes_invalid_codex_models_and_reasoning(self) -> None:
         payload = hub_server._normalize_agent_capabilities_payload(
@@ -633,7 +744,10 @@ Gemini CLI
                 return 127, ""
             return 127, ""
 
-        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe):
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe), patch(
+            "agent_hub.server._fetch_codex_models_from_docs",
+            return_value=[],
+        ):
             started_payload = self.state.start_agent_capabilities_discovery()
             self.assertTrue(started_payload["discovery_in_progress"])
             worker = self.state._agent_capabilities_discovery_thread
@@ -652,6 +766,48 @@ Gemini CLI
             codex["reasoning_modes"],
             hub_server.AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
         )
+
+    def test_agent_capabilities_discovery_preserves_codex_docs_error_when_reasoning_fallback_succeeds(self) -> None:
+        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+            if cmd == ["codex", "--help"]:
+                return 0, "Codex CLI"
+            if cmd == list(hub_server.AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND):
+                return (
+                    1,
+                    (
+                        "Error loading config.toml: expected one of `none`, `minimal`, `low`, `medium`, `high`, "
+                        "`xhigh` in `model_reasoning_effort`"
+                    ),
+                )
+            if cmd == ["claude", "--help"]:
+                return 127, ""
+            if cmd == ["gemini", "--help"]:
+                return 127, ""
+            return 127, ""
+
+        with patch("agent_hub.server._run_agent_capability_probe", side_effect=fake_probe), patch(
+            "agent_hub.server._fetch_codex_models_from_docs",
+            side_effect=RuntimeError("failed to fetch codex docs"),
+        ):
+            started_payload = self.state.start_agent_capabilities_discovery()
+            self.assertTrue(started_payload["discovery_in_progress"])
+            worker = self.state._agent_capabilities_discovery_thread
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            worker.join(timeout=3.0)
+            self.assertFalse(worker.is_alive())
+
+        payload = self.state.agent_capabilities_payload()
+        codex = next(agent for agent in payload["agents"] if agent["agent_type"] == "codex")
+        self.assertEqual(
+            codex["models"],
+            hub_server.AGENT_CAPABILITY_DEFAULT_MODELS_BY_TYPE[hub_server.AGENT_TYPE_CODEX],
+        )
+        self.assertEqual(
+            codex["reasoning_modes"],
+            ["default", "minimal", "low", "medium", "high", "xhigh"],
+        )
+        self.assertIn("failed to fetch codex docs", codex["last_error"])
 
     def test_openai_credentials_round_trip_status(self) -> None:
         initial = self.state.openai_auth_status()

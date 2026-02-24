@@ -119,12 +119,25 @@ AGENT_CAPABILITY_DEFAULT_REASONING_BY_TYPE = {
 AGENT_CAPABILITY_MODEL_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,120}")
 AGENT_CAPABILITY_CODEX_MODEL_TOKEN_RE = re.compile(r"^(?:gpt-[a-z0-9][a-z0-9._-]*|o[0-9][a-z0-9._-]*)$")
 AGENT_CAPABILITY_GEMINI_MODEL_ALIASES = {"auto", "pro", "flash", "flash-lite"}
+AGENT_CAPABILITY_GEMINI_FALLBACK_MODELS = (
+    "auto",
+    "pro",
+    "flash",
+    "flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+)
 AGENT_CAPABILITY_REASONING_LEVELS_BY_TYPE = {
     AGENT_TYPE_CODEX: ("minimal", "low", "medium", "high", "xhigh"),
     AGENT_TYPE_CLAUDE: ("low", "medium", "high", "max"),
     AGENT_TYPE_GEMINI: ("low", "medium", "high", "max"),
 }
 AGENT_CAPABILITY_REASONING_VALUE_RE = re.compile(r"\b(?:minimal|low|medium|high|xhigh|max)\b")
+AGENT_CAPABILITY_REASONING_EXPECTED_VALUES_RE = re.compile(
+    r"\bexpected\s+one\s+of\b\s+([^\n\r]+)",
+    re.IGNORECASE,
+)
 AGENT_CAPABILITY_REASONING_LIST_RE = re.compile(
     r"(?:\b(?:reasoning|effort|thinking)(?:\s+(?:mode|modes|level|levels|effort))?\b[^:\n\r]{0,48})"
     r"(?:\b(?:possible values?|choices?|available values?|valid values?)\b)?[ \t]*[:=-][ \t]*([^\n\r]+)",
@@ -156,6 +169,22 @@ AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS = float(
 )
 AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE_ENV = "AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE"
 AGENT_CAPABILITY_DISCOVERY_RUNTIME_IMAGE_PREFIX = "agent-hub-capability"
+AGENT_CAPABILITY_CODEX_MODELS_DOC_URL = "https://developers.openai.com/codex/models"
+AGENT_CAPABILITY_CODEX_MODELS_DOC_NAME_RE = re.compile(
+    r'\bname"\s*:\s*\[0,\s*"([a-z0-9][a-z0-9.-]*(?:-[a-z0-9][a-z0-9.-]*)*)"\]',
+    re.IGNORECASE,
+)
+AGENT_CAPABILITY_CODEX_MODELS_DOC_MODEL_RE = re.compile(
+    r"\bcodex\s+-m\s+([a-z0-9][a-z0-9.-]*(?:-[a-z0-9][a-z0-9.-]*)*)\b",
+    re.IGNORECASE,
+)
+AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND = (
+    "codex",
+    "exec",
+    "-c",
+    'model_reasoning_effort="__agent_hub_invalid_reasoning__"',
+    "capability-probe",
+)
 AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE = {
     AGENT_TYPE_CODEX: (
         ("codex", "--help"),
@@ -1096,6 +1125,56 @@ def _token_is_reasoning_candidate(agent_type: str, token: str) -> bool:
     return value in levels
 
 
+def _fetch_codex_models_from_docs(timeout_seconds: float) -> list[str]:
+    request = urllib.request.Request(
+        AGENT_CAPABILITY_CODEX_MODELS_DOC_URL,
+        headers={
+            "Accept": "text/html",
+            "User-Agent": "agent-hub-capability-discovery/1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(1.0, float(timeout_seconds))) as response:
+            status = int(response.getcode() or 0)
+            body = response.read().decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"failed to fetch {AGENT_CAPABILITY_CODEX_MODELS_DOC_URL}: {exc}") from exc
+
+    if status != 200:
+        raise RuntimeError(
+            f"failed to fetch {AGENT_CAPABILITY_CODEX_MODELS_DOC_URL}: HTTP {status}"
+        )
+
+    text = html.unescape(str(body or ""))
+    discovered: list[str] = []
+    seen: set[str] = set()
+
+    # Prefer model card names from docs so we capture entries that do not have a
+    # unique `codex -m ...` command token in the rendered examples.
+    for match in AGENT_CAPABILITY_CODEX_MODELS_DOC_NAME_RE.finditer(text):
+        token = str(match.group(1) or "").strip().lower()
+        if not token or token in seen:
+            continue
+        if not _token_is_model_candidate(AGENT_TYPE_CODEX, token):
+            continue
+        seen.add(token)
+        discovered.append(token)
+
+    if discovered:
+        return discovered
+
+    for match in AGENT_CAPABILITY_CODEX_MODELS_DOC_MODEL_RE.finditer(text):
+        token = str(match.group(1) or "").strip().lower()
+        if not token or token in seen:
+            continue
+        if not _token_is_model_candidate(AGENT_TYPE_CODEX, token):
+            continue
+        seen.add(token)
+        discovered.append(token)
+    return discovered
+
+
 def _extract_models_from_json_payload(payload: Any, agent_type: str) -> list[str]:
     discovered: list[str] = []
     seen: set[str] = set()
@@ -1244,6 +1323,7 @@ def _extract_reasoning_candidates_from_output(output_text: str, agent_type: str)
     text = str(output_text or "")
     if not text:
         return []
+    lower_text = text.lower()
     discovered: list[str] = []
     seen: set[str] = set()
 
@@ -1342,6 +1422,23 @@ def _extract_reasoning_candidates_from_output(output_text: str, agent_type: str)
         normalized_json = maybe_normalized(discovered)
         if normalized_json:
             return normalized_json
+
+    has_reasoning_context = any(
+        marker in lower_text
+        for marker in (
+            "model_reasoning_effort",
+            "reasoning_effort",
+            "reasoning effort",
+            "thinking_level",
+            "thinking level",
+        )
+    )
+    if has_reasoning_context:
+        for match in AGENT_CAPABILITY_REASONING_EXPECTED_VALUES_RE.finditer(text):
+            add_from_text(match.group(1))
+        normalized_expected_values = maybe_normalized(discovered)
+        if normalized_expected_values:
+            return normalized_expected_values
 
     for match in AGENT_CAPABILITY_REASONING_LIST_RE.finditer(text):
         add_from_text(match.group(1))
@@ -3309,6 +3406,55 @@ class HubState:
                 and _option_count_excluding_default(discovered_reasoning_modes) >= 1
             ):
                 break
+
+        if resolved_type == AGENT_TYPE_CODEX and _option_count_excluding_default(discovered_models) < 1:
+            try:
+                codex_doc_models = _fetch_codex_models_from_docs(AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                LOGGER.warning("Codex model discovery from docs failed: %s", exc)
+            else:
+                if codex_doc_models:
+                    discovered_models = _normalize_model_options_for_agent(
+                        resolved_type,
+                        codex_doc_models,
+                        ["default"],
+                    )
+                    last_error = ""
+                else:
+                    last_error = f"no codex models found at {AGENT_CAPABILITY_CODEX_MODELS_DOC_URL}"
+                    LOGGER.warning("%s", last_error)
+
+        if resolved_type == AGENT_TYPE_CODEX and _option_count_excluding_default(discovered_reasoning_modes) < 1:
+            reasoning_cmd = [str(token) for token in AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND]
+            return_code, output_text = _run_agent_capability_probe(reasoning_cmd, AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
+            parsed_reasoning = _extract_reasoning_candidates_from_output(output_text, resolved_type)
+            if parsed_reasoning:
+                discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(
+                    resolved_type,
+                    parsed_reasoning,
+                    ["default"],
+                )
+                if return_code not in {127, 124} and (
+                    _option_count_excluding_default(discovered_models) >= 1 or not last_error
+                ):
+                    last_error = ""
+            elif return_code == 127:
+                last_error = f"command not found: {reasoning_cmd[0]}"
+            elif return_code == 124:
+                last_error = f"timeout running command: {' '.join(reasoning_cmd)}"
+            elif return_code != 0 and not last_error:
+                last_error = (
+                    "failed to parse codex reasoning levels from command output: "
+                    f"{' '.join(reasoning_cmd)}"
+                )
+
+        if resolved_type == AGENT_TYPE_GEMINI and _option_count_excluding_default(discovered_models) < 1:
+            discovered_models = _normalize_model_options_for_agent(
+                resolved_type,
+                list(AGENT_CAPABILITY_GEMINI_FALLBACK_MODELS),
+                ["default"],
+            )
 
         if not discovered_models:
             discovered_models = ["default"]
