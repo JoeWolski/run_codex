@@ -80,6 +80,9 @@
 - 8. Update the PR body with a `## UI/UX Demo` section containing Markdown image links (`![alt](https://...)`) using `gh api repos/<owner>/<repo>/pulls/<pr-number> -X PATCH --raw-field body=\"$(cat <body-file>)\"`.
 - 9. If using GitHub web manually, drag/drop uploads in the PR editor are allowed, but the resulting images still must appear in the PR body.
 - 10. Once UI/UX PR evidence is finished and the PR is updated, shut down any programs (such as the app server or Playwright/headless browsers) launched to generate it.
+- For Docker-in-Docker integration tests, do not mount runtime paths under container-local `/tmp` directories.
+- Use host-visible, daemon-visible bind-mounted paths for mounts and ensure each mounted path resolves to the same absolute path on the host daemon.
+- Do not use `/tmp` for `--data-dir`, `--config-file`, `--system-prompt-file`, project mounts, or other chat/workspace mounts during integration tests.
 - In the PR Validation section, list the exact commands used for server start, screenshot capture, public URL upload, and PR body update, with pass/fail status.
 
 ## Git safety
