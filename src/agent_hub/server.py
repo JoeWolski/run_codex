@@ -6021,6 +6021,9 @@ class HubState:
                 "Return exactly one JSON object with the required schema."
             )
         output_file = workspace / f".agent-hub-auto-config-{uuid.uuid4().hex}.json"
+        container_project_name = _container_project_name(_extract_repo_name(repo_url) or "auto-config")
+        container_workspace = str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name)
+        container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
         session_id, session_token = self._create_agent_tools_session(repo_url=repo_url)
         runtime_config_file = self._prepare_chat_runtime_config(f"auto-config-{session_id}")
         cmd = [
@@ -6034,7 +6037,7 @@ class HubState:
             "--project",
             str(workspace),
             "--container-project-name",
-            _container_project_name(_extract_repo_name(repo_url) or "auto-config"),
+            container_project_name,
             "--agent-home-path",
             str(self.host_agent_home),
             "--config-file",
@@ -6062,11 +6065,11 @@ class HubState:
                 "exec",
                 "--skip-git-repo-check",
                 "--cd",
-                str(workspace),
+                container_workspace,
                 "--sandbox",
                 "workspace-write",
                 "--output-last-message",
-                str(output_file),
+                container_output_file,
                 prompt,
             ]
         )

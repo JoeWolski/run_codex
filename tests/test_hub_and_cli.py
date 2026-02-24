@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+import io
 import json
 import os
 import queue
@@ -11,7 +12,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import AsyncMock, call, patch
 from types import SimpleNamespace
 
@@ -4586,6 +4587,83 @@ Gemini CLI
 
         updated_payload = self.state.agent_tools_session_credentials_list_payload(session_id)
         self.assertEqual(updated_payload.get("effective_credential_ids"), [credential_id])
+
+    def test_run_temporary_auto_config_chat_uses_container_paths_for_codex_exec(self) -> None:
+        workspace = self.tmp_path / "workspace-chat-paths"
+        workspace.mkdir(parents=True, exist_ok=True)
+        runtime_config_file = self.tmp_path / "auto-config-runtime.toml"
+        runtime_config_file.write_text("model = 'test'\n", encoding="utf-8")
+        fixed_uuid = SimpleNamespace(hex="autocfgpayload")
+        repo_url = "https://github.com/example/agent_hub.git"
+        output_file = workspace / ".agent-hub-auto-config-autocfgpayload.json"
+        container_project_name = hub_server._container_project_name(hub_server._extract_repo_name(repo_url) or "auto-config")
+        container_workspace = str(PurePosixPath(hub_server.DEFAULT_CONTAINER_HOME) / container_project_name)
+        container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
+        captured_cmd: dict[str, list[str]] = {}
+
+        def fake_popen(cmd: list[str], **kwargs):
+            del kwargs
+            captured_cmd["cmd"] = list(cmd)
+            output_file.write_text(
+                json.dumps(
+                    {
+                        "base_image_mode": "tag",
+                        "base_image_value": "ubuntu:24.04",
+                        "setup_script": "",
+                        "default_ro_mounts": [],
+                        "default_rw_mounts": [],
+                        "default_env_vars": [],
+                        "notes": "",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(
+                stdout=io.StringIO(""),
+                wait=lambda timeout=None: 0,
+            )
+
+        with patch("agent_hub.server._read_codex_auth", return_value=(True, "chatgpt")), patch.object(
+            self.state,
+            "_create_agent_tools_session",
+            return_value=("session-test", "token-test"),
+        ), patch.object(
+            self.state,
+            "_prepare_chat_runtime_config",
+            return_value=runtime_config_file,
+        ), patch.object(
+            self.state,
+            "_openai_credentials_arg",
+            return_value=[],
+        ), patch.object(
+            self.state,
+            "_github_git_args_for_repo",
+            return_value=[],
+        ), patch.object(
+            self.state,
+            "_github_git_identity_env_vars_for_repo",
+            return_value=[],
+        ), patch(
+            "agent_hub.server.subprocess.Popen",
+            side_effect=fake_popen,
+        ), patch(
+            "agent_hub.server.uuid.uuid4",
+            return_value=fixed_uuid,
+        ):
+            result = self.state._run_temporary_auto_config_chat(
+                workspace,
+                repo_url=repo_url,
+                branch="master",
+            )
+
+        self.assertEqual(result["model"], hub_server.AUTO_CONFIG_MODEL)
+        cmd = captured_cmd["cmd"]
+        self.assertEqual(cmd[cmd.index("--cd") + 1], container_workspace)
+        self.assertEqual(cmd[cmd.index("--output-last-message") + 1], container_output_file)
+        self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_URL=") for entry in cmd))
+        self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_TOKEN=") for entry in cmd))
+        self.assertIn("AGENT_HUB_AGENT_TOOLS_PROJECT_ID=", cmd)
+        self.assertIn("AGENT_HUB_AGENT_TOOLS_CHAT_ID=auto-config:session-test", cmd)
 
     def test_auto_configure_project_retries_clone_without_auth_env(self) -> None:
         attempted_clone_envs: list[dict[str, str] | None] = []
