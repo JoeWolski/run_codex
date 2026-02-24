@@ -35,6 +35,11 @@ import { buildProjectChatFlexModels } from "./projectChatLayoutModels";
 import { chatTerminalSocketStore } from "./chatTerminalSocketStore";
 import { terminalThemeForAppTheme } from "./theme";
 import {
+  markPendingAutoConfigProjectFailed,
+  projectRowFromPendingAutoConfig,
+  removePendingAutoConfigProject
+} from "./autoConfigProjects";
+import {
   MdArchive,
   MdAudiotrack,
   MdCode,
@@ -2257,17 +2262,7 @@ function HubApp() {
   }, [hubState.projects]);
 
   const projectsForList = useMemo(() => {
-    const pendingRows = pendingAutoConfigProjects.map((project) => ({
-      id: project.id,
-      stable_order_key: String(project.stable_order_key || project.id || ""),
-      name: project.name,
-      repo_url: project.repo_url,
-      default_branch: project.default_branch,
-      build_status: project.auto_config_status === "failed" ? "failed" : "building",
-      build_error: project.auto_config_error || "",
-      auto_config_log: project.auto_config_log || "",
-      is_auto_config_pending: true
-    }));
+    const pendingRows = pendingAutoConfigProjects.map((project) => projectRowFromPendingAutoConfig(project));
     const combinedRows = [...pendingRows, ...(hubState.projects || [])];
     return stableOrderItemsByFirstSeen(
       combinedRows,
@@ -2518,27 +2513,19 @@ function HubApp() {
       if (createdProjectId) {
         autoConfigProjectOrderAliasByProjectIdRef.current.set(createdProjectId, pendingProjectId);
       }
-      setPendingAutoConfigProjects((prev) => prev.filter((project) => project.id !== pendingProjectId));
+      setPendingAutoConfigProjects((prev) => removePendingAutoConfigProject(prev, pendingProjectId));
       setCreateForm(emptyCreateForm());
       setError("");
       refreshState().catch(() => {});
     } catch (err) {
       const message = err.message || String(err);
-      setPendingAutoConfigProjects((prev) =>
-        prev.map((project) =>
-          project.id === pendingProjectId
-            ? {
-              ...project,
-              auto_config_status: "failed",
-              auto_config_error: message,
-              auto_config_log: `${project.auto_config_log || ""}${message.endsWith("\n") ? message : `${message}\n`}`
-            }
-            : project
-        )
-      );
-      setError(message);
+      setPendingAutoConfigProjects((prev) => markPendingAutoConfigProjectFailed(prev, pendingProjectId, message));
       refreshState().catch(() => {});
     }
+  }
+
+  function handleDeletePendingAutoConfigProject(projectId) {
+    setPendingAutoConfigProjects((prev) => removePendingAutoConfigProject(prev, projectId));
   }
 
   async function handleCreateProject(event) {
@@ -4704,9 +4691,20 @@ function HubApp() {
                         text={project.auto_config_log || "Waiting for temporary analysis chat output...\r\n"}
                       />
                       {isFailed ? (
-                        <div className="meta build-error">
-                          {project.build_error || "Auto configure failed before project creation completed."}
-                        </div>
+                        <>
+                          <div className="meta build-error">
+                            {project.build_error || "Auto configure failed before project creation completed."}
+                          </div>
+                          <div className="actions project-collapsed-actions">
+                            <button
+                              type="button"
+                              className="btn-danger project-collapsed-delete"
+                              onClick={() => handleDeletePendingAutoConfigProject(project.id)}
+                            >
+                              Delete project
+                            </button>
+                          </div>
+                        </>
                       ) : null}
                     </article>
                   );
