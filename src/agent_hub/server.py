@@ -75,6 +75,7 @@ GIT_CREDENTIAL_DEFAULT_SCHEME = "https"
 GIT_CREDENTIAL_ALLOWED_SCHEMES = {"http", "https"}
 GIT_PROVIDER_GITHUB = "github"
 GIT_PROVIDER_GITLAB = "gitlab"
+GITLAB_PERSONAL_ACCESS_TOKEN_REQUIRED_SCOPES = frozenset({"read_repository", "write_repository"})
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_CONTAINER_HOME = "/workspace"
@@ -4379,6 +4380,34 @@ class HubState:
                     return str(value or "").strip()
         return ""
 
+    @staticmethod
+    def _token_scope_set(raw_scopes: Any) -> set[str]:
+        if raw_scopes is None:
+            return set()
+        text = str(raw_scopes).strip().lower()
+        if not text:
+            return set()
+        return {token.strip() for token in re.split(r"[\s,]+", text) if token.strip()}
+
+    @classmethod
+    def _validate_gitlab_personal_access_token_scopes(cls, token_scopes: Any) -> None:
+        scope_set = cls._token_scope_set(token_scopes)
+        if not scope_set:
+            return
+        if "api" in scope_set:
+            return
+        missing_scopes = sorted(GITLAB_PERSONAL_ACCESS_TOKEN_REQUIRED_SCOPES.difference(scope_set))
+        if not missing_scopes:
+            return
+        missing_text = ", ".join(missing_scopes)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "GitLab personal access token is missing required scopes: "
+                f"{missing_text}. Provide `api` or both `read_repository` and `write_repository`."
+            ),
+        )
+
     def _verify_github_personal_access_token(self, token: str, host: str, scheme: str = GIT_CREDENTIAL_DEFAULT_SCHEME) -> dict[str, str]:
         normalized_host = _normalize_github_credential_host(host, field_name="host")
         normalized_scheme = _normalize_github_credential_scheme(scheme, field_name="scheme")
@@ -4479,6 +4508,7 @@ class HubState:
                     "X-OAuth-Scopes",
                     "X-Oauth-Scopes",
                 )
+                self._validate_gitlab_personal_access_token_scopes(token_scopes)
                 return {
                     "provider": GIT_PROVIDER_GITLAB,
                     "account_login": account_login,

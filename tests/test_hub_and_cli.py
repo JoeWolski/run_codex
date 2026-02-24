@@ -987,6 +987,53 @@ Gemini CLI
             server.server_close()
             thread.join(timeout=1.0)
 
+    def test_connect_github_personal_access_token_rejects_gitlab_token_missing_required_scopes(self) -> None:
+        token = TEST_GITHUB_PERSONAL_ACCESS_TOKEN
+
+        class GitlabLimitedScopeHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/api/v3/user":
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{\"message\":\"Not Found\"}')
+                    return
+                if self.path == "/api/v4/user":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("X-Gitlab-Scopes", "read_repository")
+                    self.end_headers()
+                    self.wfile.write(
+                        b'{\"id\":44,\"username\":\"gitlab-user\",\"name\":\"GitLab User\",\"email\":\"gitlab-user@example.com\"}'
+                    )
+                    return
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{\"message\":\"Not Found\"}')
+
+            def log_message(self, format: str, *args) -> None:  # noqa: A003
+                del format, args
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), GitlabLimitedScopeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            port = int(server.server_address[1])
+            host_input = f"http://127.0.0.1:{port}"
+            with self.assertRaises(HTTPException) as ctx:
+                self.state.connect_github_personal_access_token(token, host=host_input)
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("missing required scopes", str(ctx.exception.detail))
+            self.assertIn("write_repository", str(ctx.exception.detail))
+            self.assertFalse(self.state.github_personal_access_token_file.exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1.0)
+
     def test_connect_github_app_clears_personal_access_token_state(self) -> None:
         self._connect_github_pat()
         with patch.object(

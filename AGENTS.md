@@ -4,6 +4,7 @@
 
 - In this repository, "core instructions" refers to `SYSTEM_PROMPT.md`.
 - Treat `SYSTEM_PROMPT.md` as the authoritative shared system prompt source across all agents.
+- Use `yarn` (not `npm`) for JavaScript package management in this repository and its subprojects.
 
 ## Design practices
 
