@@ -137,6 +137,20 @@ If you run with a custom `--config-file` or `--system-prompt-file`, those files 
 - Node.js + Corepack (only when frontend build is needed).
 - Optional NVIDIA GPU + `nvidia-container-toolkit` for GPU passthrough.
 
+## Docker-In-Docker Path Note
+
+When `agent_hub` runs inside a container and launches chat runtime containers through a host Docker daemon, use host-visible paths for:
+
+- `--data-dir`
+- `--config-file`
+- `--system-prompt-file`
+
+Container-only paths (especially `/tmp/...` paths that are not the same `/tmp` seen by the host daemon) can cause bind-mount type mismatches. A common failure is:
+
+- `Failed to read config file ... config.toml: Is a directory`
+
+If that happens, move these paths to a daemon-visible location and ensure each expected file is a regular file from the daemon's perspective, not a directory.
+
 ## Mobile (Capacitor)
 
 If you want an Android/iOS wrapper around the existing Agent Hub web server, see:
