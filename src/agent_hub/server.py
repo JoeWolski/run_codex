@@ -37,7 +37,7 @@ from typing import Any, Callable
 import click
 from agent_cli import cli as agent_cli_image
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -2860,6 +2860,156 @@ def _parse_json_object_from_text(raw_text: Any) -> dict[str, Any]:
                 return parsed
             idx = start + 1
     raise ValueError("invalid json object")
+
+
+def _json_payload_preview(raw_body: bytes, *, max_bytes: int = 160) -> str:
+    clipped = raw_body[:max_bytes]
+    return clipped.hex()
+
+
+def _is_json_content_type(content_type: str) -> bool:
+    normalized = str(content_type or "").strip().lower()
+    return normalized == "application/json" or normalized.endswith("+json") or normalized == "text/json"
+
+
+def _artifact_upload_name(request: Request, *, fallback: str) -> str:
+    requested_name = (
+        str(request.headers.get("x-agent-hub-artifact-name") or request.query_params.get("name") or "").strip()
+    )
+    if not requested_name:
+        content_type = str(request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if content_type:
+            extension = mimetypes.guess_extension(content_type) or ""
+            requested_name = f"{fallback}{extension}"
+        else:
+            requested_name = str(fallback)
+    requested_name = _normalize_artifact_name(requested_name, fallback=fallback)
+    if not requested_name:
+        requested_name = str(fallback)
+
+    safe_name = Path(requested_name).name
+    return _normalize_artifact_name(safe_name, fallback=fallback)
+
+
+def _write_artifact_upload_to_workspace(
+    workspace: Path,
+    raw_body: bytes,
+    *,
+    requested_name: str,
+    context: str,
+) -> tuple[Path, str]:
+    uploads_root = (workspace / ".agent-hub-artifacts").resolve()
+    try:
+        uploads_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Failed to prepare artifact upload staging directory.") from exc
+
+    normalized_name = _normalize_artifact_name(requested_name, fallback="artifact")
+    if not normalized_name:
+        normalized_name = "artifact"
+    normalized_name = Path(normalized_name).name
+    if not normalized_name:
+        normalized_name = "artifact"
+
+    normalized_name = _normalize_artifact_name(normalized_name, fallback="artifact")
+    staged_path = uploads_root / f"{uuid.uuid4().hex}-{normalized_name}"
+    try:
+        staged_path.write_bytes(raw_body)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to persist uploaded artifact payload to chat workspace.",
+        ) from exc
+    LOGGER.info("Staged binary artifact payload for %s to %s", context, staged_path)
+    return staged_path.resolve(), str(normalized_name)
+
+
+async def _parse_artifact_request_payload(
+    request: Request,
+    *,
+    context: str,
+    workspace: Path,
+) -> tuple[dict[str, Any], list[Path]]:
+    content_type = str(request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if content_type == "multipart/form-data":
+        form = await request.form()
+        upload: UploadFile | None = None
+        if isinstance(form.get("file"), UploadFile):
+            upload = form.get("file")  # type: ignore[assignment]
+        else:
+            for value in form.values():
+                if isinstance(value, UploadFile):
+                    upload = value
+                    break
+        if upload is None:
+            LOGGER.warning("Multipart artifact payload missing file for %s", context)
+            raise HTTPException(status_code=400, detail="Multipart payload must include a file field.")
+
+        raw_body = await upload.read()
+        requested_name = str(form.get("name") or "").strip()
+        if not requested_name:
+            requested_name = _normalize_artifact_name(upload.filename, fallback=_artifact_upload_name(request, fallback="artifact"))
+        uploaded_path, uploaded_name = _write_artifact_upload_to_workspace(
+            workspace,
+            raw_body,
+            requested_name=requested_name,
+            context=context,
+        )
+        return {"path": str(uploaded_path), "name": uploaded_name}, [uploaded_path]
+
+    raw_body = await request.body()
+    if not raw_body:
+        if _is_json_content_type(content_type):
+            LOGGER.warning("Invalid JSON payload for %s: empty body.", context)
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        LOGGER.warning("Empty artifact payload for %s", context)
+        raise HTTPException(status_code=400, detail="Artifact payload is empty.")
+
+    if _is_json_content_type(content_type):
+        try:
+            payload = json.loads(raw_body)
+        except UnicodeDecodeError as exc:
+            LOGGER.warning(
+                "Invalid UTF-8 JSON payload for %s (body_bytes=%s): %s",
+                context,
+                _json_payload_preview(raw_body),
+                exc,
+            )
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "Invalid JSON payload for %s (body_bytes=%s): %s",
+                context,
+                _json_payload_preview(raw_body),
+                exc,
+            )
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+        if not isinstance(payload, dict):
+            LOGGER.warning(
+                "Invalid JSON payload for %s: expected object, got %s. body_bytes=%s",
+                context,
+                type(payload).__name__,
+                _json_payload_preview(raw_body),
+            )
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        return payload, []
+
+    artifact_name = _artifact_upload_name(request, fallback="artifact")
+    uploaded_path, uploaded_name = _write_artifact_upload_to_workspace(
+        workspace,
+        raw_body,
+        requested_name=artifact_name,
+        context=context,
+    )
+    return {"path": str(uploaded_path), "name": uploaded_name}, [uploaded_path]
+
+
+def _cleanup_uploaded_artifact_paths(uploaded_paths: list[Path]) -> None:
+    for uploaded_path in uploaded_paths:
+        try:
+            uploaded_path.unlink()
+        except OSError:
+            continue
 
 
 def _normalize_chat_prompt_history(user_prompts: list[str]) -> list[str]:
@@ -7507,13 +7657,33 @@ class HubState:
         try:
             relative = resolved.relative_to(workspace)
         except ValueError as exc:
+            LOGGER.warning(
+                "Artifact path outside chat workspace: chat_id=%s raw_path=%s resolved=%s workspace=%s",
+                chat_id,
+                raw_path,
+                resolved,
+                workspace,
+            )
             raise HTTPException(status_code=400, detail="Artifact path must be inside the chat workspace.") from exc
         if not resolved.exists():
+            LOGGER.warning(
+                "Artifact file not found for chat_id=%s raw_path=%s resolved=%s",
+                chat_id,
+                raw_path,
+                resolved,
+            )
             raise HTTPException(status_code=404, detail=f"Artifact file not found: {raw_path}")
         if not resolved.is_file():
+            LOGGER.warning(
+                "Artifact path is not a file for chat_id=%s raw_path=%s resolved=%s",
+                chat_id,
+                raw_path,
+                resolved,
+            )
             raise HTTPException(status_code=400, detail=f"Artifact path is not a file: {raw_path}")
         relative_path = _coerce_artifact_relative_path(relative.as_posix())
         if not relative_path:
+            LOGGER.warning("Artifact path normalized to empty for chat_id=%s raw_path=%s resolved=%s", chat_id, raw_path, resolved)
             raise HTTPException(status_code=400, detail="Artifact path is invalid.")
         return resolved, relative_path
 
@@ -8206,16 +8376,40 @@ class HubState:
         try:
             candidate.relative_to(workspace)
         except ValueError as exc:
+            LOGGER.warning(
+                "Artifact path outside workspace: workspace=%s raw_path=%s candidate=%s",
+                workspace,
+                normalized_path,
+                candidate,
+            )
             raise HTTPException(status_code=400, detail="Artifact path must be inside the workspace.") from exc
 
         if not candidate.exists():
+            LOGGER.warning(
+                "Artifact file not found in workspace: workspace=%s raw_path=%s candidate=%s",
+                workspace,
+                normalized_path,
+                candidate,
+            )
             raise HTTPException(status_code=404, detail=f"Artifact file not found: {normalized_path}")
         if not candidate.is_file():
+            LOGGER.warning(
+                "Artifact path is not a file in workspace: workspace=%s raw_path=%s candidate=%s",
+                workspace,
+                normalized_path,
+                candidate,
+            )
             raise HTTPException(status_code=400, detail=f"Artifact path is not a file: {normalized_path}")
 
         relative = candidate.relative_to(workspace)
         relative_path = _coerce_artifact_relative_path(relative.as_posix())
         if not relative_path:
+            LOGGER.warning(
+                "Artifact path normalized to empty in workspace: workspace=%s raw_path=%s candidate=%s",
+                workspace,
+                normalized_path,
+                candidate,
+            )
             raise HTTPException(status_code=400, detail="Artifact path is invalid.")
         return candidate, relative_path
 
@@ -11586,18 +11780,34 @@ def main(
         if not token:
             token = str(request.headers.get("x-agent-hub-artifact-token") or "").strip()
 
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        artifact = state.publish_chat_artifact(
-            chat_id=chat_id,
-            token=token,
-            submitted_path=payload.get("path"),
-            name=payload.get("name"),
+        chat = state.chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        state._require_artifact_publish_token(chat, token)
+        workspace = state.chat_workdir(chat_id).resolve()
+        if not workspace.exists():
+            raise HTTPException(status_code=409, detail="Chat workspace is unavailable.")
+        payload, staged_paths = await _parse_artifact_request_payload(
+            request,
+            context=f"/api/chats/{chat_id}/artifacts/publish",
+            workspace=workspace,
         )
+        try:
+            artifact = state.publish_chat_artifact(
+                chat_id=chat_id,
+                token=token,
+                submitted_path=payload.get("path"),
+                name=payload.get("name"),
+            )
+        except HTTPException as exc:
+            LOGGER.warning(
+                "artifacts publish failed for chat_id=%s: %s",
+                chat_id,
+                exc.detail,
+            )
+            raise
+        finally:
+            _cleanup_uploaded_artifact_paths(staged_paths)
         return {"artifact": artifact}
 
     @app.get("/api/chats/{chat_id}/artifacts/{artifact_id}/download")
@@ -11677,18 +11887,34 @@ def main(
         if not token:
             token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
 
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        artifact = state.submit_chat_artifact(
-            chat_id=chat_id,
-            token=token,
-            submitted_path=payload.get("path"),
-            name=payload.get("name"),
+        chat = state.chat(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        state._require_agent_tools_token(chat, token)
+        workspace = state.chat_workdir(chat_id).resolve()
+        if not workspace.exists():
+            raise HTTPException(status_code=409, detail="Chat workspace is unavailable.")
+        payload, staged_paths = await _parse_artifact_request_payload(
+            request,
+            context=f"/api/chats/{chat_id}/agent-tools/artifacts/submit",
+            workspace=workspace,
         )
+        try:
+            artifact = state.submit_chat_artifact(
+                chat_id=chat_id,
+                token=token,
+                submitted_path=payload.get("path"),
+                name=payload.get("name"),
+            )
+        except HTTPException as exc:
+            LOGGER.warning(
+                "agent-tools artifact submit failed for chat_id=%s: %s",
+                chat_id,
+                exc.detail,
+            )
+            raise
+        finally:
+            _cleanup_uploaded_artifact_paths(staged_paths)
         return {"artifact": artifact}
 
     @app.get("/api/agent-tools/sessions/{session_id}/credentials")
@@ -11749,18 +11975,32 @@ def main(
         if not token:
             token = str(request.headers.get("x-agent-hub-artifact-token") or "").strip()
 
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        artifact = state.publish_session_artifact(
-            session_id=session_id,
-            token=token,
-            submitted_path=payload.get("path"),
-            name=payload.get("name"),
+        session = state._agent_tools_session(session_id)
+        state._require_session_artifact_publish_token(session, token)
+        workspace = Path(str(session.get("workspace") or "")).resolve()
+        if not workspace.exists():
+            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
+        payload, staged_paths = await _parse_artifact_request_payload(
+            request,
+            context=f"/api/agent-tools/sessions/{session_id}/artifacts/publish",
+            workspace=workspace,
         )
+        try:
+            artifact = state.publish_session_artifact(
+                session_id=session_id,
+                token=token,
+                submitted_path=payload.get("path"),
+                name=payload.get("name"),
+            )
+        except HTTPException as exc:
+            LOGGER.warning(
+                "session artifact publish failed for session_id=%s: %s",
+                session_id,
+                exc.detail,
+            )
+            raise
+        finally:
+            _cleanup_uploaded_artifact_paths(staged_paths)
         return {"artifact": artifact}
 
     @app.post("/api/agent-tools/sessions/{session_id}/artifacts/submit")
@@ -11772,18 +12012,31 @@ def main(
         if not token:
             token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
 
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
-        artifact = state.submit_session_artifact(
-            session_id=session_id,
-            token=token,
-            submitted_path=payload.get("path"),
-            name=payload.get("name"),
+        session = state.require_agent_tools_session_token(session_id, token)
+        workspace = Path(str(session.get("workspace") or "")).resolve()
+        if not workspace.exists():
+            raise HTTPException(status_code=409, detail="Session workspace is unavailable.")
+        payload, staged_paths = await _parse_artifact_request_payload(
+            request,
+            context=f"/api/agent-tools/sessions/{session_id}/artifacts/submit",
+            workspace=workspace,
         )
+        try:
+            artifact = state.submit_session_artifact(
+                session_id=session_id,
+                token=token,
+                submitted_path=payload.get("path"),
+                name=payload.get("name"),
+            )
+        except HTTPException as exc:
+            LOGGER.warning(
+                "session artifact submit failed for session_id=%s: %s",
+                session_id,
+                exc.detail,
+            )
+            raise
+        finally:
+            _cleanup_uploaded_artifact_paths(staged_paths)
         return {"artifact": artifact}
 
     @app.get("/api/agent-tools/sessions/{session_id}/artifacts/{artifact_id}/download")
