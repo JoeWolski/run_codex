@@ -23,6 +23,7 @@ Read-only analysis requirements:
 - Do not run commands that mutate files, download toolchains, compile, build, test, or install runtime artifacts.
 - Do not run `docker build`, `make`, `cmake`, `pip`, `uv`, `npm`, `yarn`, `apt`, or similar setup commands in the analysis run.
 - Instead, inspect repository files and infer the commands that SHOULD run at setup/build time, then emit them in `setup_script` only.
+- `setup_script` must install all required system and project library dependencies first (for example apt/tool dependencies, toolchains, and bootstrap artifacts) before any build-type commands (`cmake`, `make`, `ninja`, `./make.sh`, etc.) are emitted.
 - If additional commands are needed, keep them minimal and scoped to bootstrap/deferred dependency steps.
 
 Requirements:
