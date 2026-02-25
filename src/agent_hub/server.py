@@ -6783,7 +6783,7 @@ class HubState:
                     on_output=emit_auto_config_log if normalized_request_id else None,
                     request_id=normalized_request_id,
                 )
-                container_workspace = self._container_workspace_path_for_project(
+                container_workspace = _container_workspace_path_for_project(
                     _extract_repo_name(normalized_repo_url) or "auto-config"
                 )
                 recommendation = self._normalize_auto_config_recommendation(
