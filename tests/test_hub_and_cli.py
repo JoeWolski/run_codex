@@ -6169,6 +6169,14 @@ class CliEnvVarTests(unittest.TestCase):
             script.index("printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'"),
         )
 
+    def test_snapshot_setup_runtime_image_for_base_changes_with_base_image(self) -> None:
+        ubuntu_runtime = image_cli._snapshot_setup_runtime_image_for_base("ubuntu:24.04")
+        custom_runtime = image_cli._snapshot_setup_runtime_image_for_base("agent-base:project-a")
+
+        self.assertTrue(ubuntu_runtime.startswith("agent-runtime-setup-"))
+        self.assertTrue(custom_runtime.startswith("agent-runtime-setup-"))
+        self.assertNotEqual(ubuntu_runtime, custom_runtime)
+
     def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -6209,11 +6217,28 @@ class CliEnvVarTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
+            expected_setup_runtime = image_cli._snapshot_setup_runtime_image_for_base("ubuntu:24.04")
+            runtime_build_cmd = next(
+                (
+                    cmd
+                    for cmd in commands
+                    if len(cmd) >= 2
+                    and cmd[:2] == ["docker", "build"]
+                    and expected_setup_runtime in cmd
+                ),
+                None,
+            )
+            self.assertIsNotNone(runtime_build_cmd)
+            assert runtime_build_cmd is not None
+            self.assertIn("BASE_IMAGE=ubuntu:24.04", runtime_build_cmd)
+            self.assertIn("AGENT_PROVIDER=none", runtime_build_cmd)
             setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(setup_cmd)
             assert setup_cmd is not None
             self.assertIn("--entrypoint", setup_cmd)
             self.assertIn("bash", setup_cmd)
+            self.assertEqual(setup_cmd[-3], expected_setup_runtime)
+            self.assertEqual(setup_cmd[-2], "-lc")
             setup_script = setup_cmd[-1]
             self.assertIn("set -o pipefail", setup_script)
             self.assertIn("git config --global --add safe.directory '*'", setup_script)
