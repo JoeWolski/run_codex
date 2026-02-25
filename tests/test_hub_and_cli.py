@@ -5920,10 +5920,8 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertIn("/workspace/tmp", content)
         self.assertLess(
             content.index("/workspace/.config"),
-            content.index("chmod 777 /workspace/tmp"),
+            content.index("chmod -R 0777 /workspace"),
         )
-        self.assertNotIn("chmod -R 777 /workspace", content)
-        self.assertNotIn("chmod -R 0777 /workspace", content)
 
     def test_agent_hub_dockerfile_uses_build_only_uv_project_environment(self) -> None:
         content = AGENT_HUB_DOCKERFILE.read_text(encoding="utf-8")
@@ -6091,7 +6089,7 @@ class CliEnvVarTests(unittest.TestCase):
 
         self.assertIn("snapshot bootstrap: preparing writable /workspace/tmp", script)
         self.assertIn("mkdir -p /workspace/tmp", script)
-        self.assertNotIn("chmod 777 /workspace/tmp", script)
+        self.assertIn("chmod 777 /workspace/tmp", script)
         self.assertLess(
             script.index("mkdir -p /workspace/tmp"),
             script.index("printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'"),
@@ -9143,9 +9141,7 @@ class DockerEntrypointTests(unittest.TestCase):
             module._ensure_workspace_tmp(workspace_tmp=workspace_tmp)
 
             self.assertTrue(workspace_tmp.is_dir())
-            probe = workspace_tmp / "probe.txt"
-            probe.write_text("ok\n", encoding="utf-8")
-            self.assertEqual(probe.read_text(encoding="utf-8"), "ok\n")
+            self.assertEqual(workspace_tmp.stat().st_mode & 0o777, 0o777)
 
 
 if __name__ == "__main__":

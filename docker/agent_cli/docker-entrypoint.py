@@ -68,7 +68,7 @@ def _ensure_workspace_tmp(*, workspace_tmp: Path | None = None) -> None:
     except OSError as exc:
         raise RuntimeError(
             "Workspace tmp bootstrap failed: "
-            f"path={str(target)!r} unable to initialize ({exc})"
+            f"path={str(target)!r} unable to initialize with mode 0777 ({exc})"
         ) from exc
 
 
