@@ -6526,6 +6526,34 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--no-sandbox", gemini_args)
             self.assertNotIn("yolo", gemini_args)
 
+    def test_shared_prompt_context_from_config_parses_json_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = tmp_path / "runtime-config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "project_doc_auto_load": True,
+                        "project_doc_fallback_filenames": ["AGENTS.md", "README.md"],
+                        "project_doc_auto_load_extra_filenames": ["docs/agent-setup.md"],
+                        "project_doc_max_bytes": 4096,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            shared_prompt = image_cli._shared_prompt_context_from_config(
+                config,
+                core_system_prompt="Shared instruction for this run.",
+            )
+
+            self.assertIn("Shared instruction for this run.", shared_prompt)
+            self.assertIn("AGENTS.md", shared_prompt)
+            self.assertIn("README.md", shared_prompt)
+            self.assertIn("docs/agent-setup.md", shared_prompt)
+            self.assertIn("4096 bytes", shared_prompt)
+
     def test_gemini_runtime_syncs_shared_prompt_context_from_system_prompt_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

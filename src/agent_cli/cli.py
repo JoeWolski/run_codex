@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from threading import Thread
-from typing import Iterable, Iterator, Tuple
+from typing import Any, Iterable, Iterator, Tuple
 
 import click
 
@@ -153,16 +153,28 @@ def _shared_prompt_context_from_config(config_path: Path, *, core_system_prompt:
     except (OSError, UnicodeError):
         return "\n\n".join(section for section in sections if section)
 
-    try:
-        parsed = tomllib.loads(raw)
-    except tomllib.TOMLDecodeError as exc:
+    parsed: dict[str, Any] | None = None
+    parse_error: Exception | None = None
+    parse_strategies = (json.loads, tomllib.loads)
+
+    for parser in parse_strategies:
+        try:
+            candidate = parser(raw)
+        except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
+            parse_error = exc
+            continue
+
+        if isinstance(candidate, dict):
+            parsed = candidate
+            break
+
+        parse_error = ValueError(f"{parser.__name__} parsed a non-dict root value")
+
+    if parsed is None:
         click.echo(
-            f"Warning: unable to parse shared prompt context from {config_path}: {exc}",
+            f"Warning: unable to parse shared prompt context from {config_path}: {parse_error}",
             err=True,
         )
-        return "\n\n".join(section for section in sections if section)
-
-    if not isinstance(parsed, dict):
         return "\n\n".join(section for section in sections if section)
 
     project_doc_auto_load = parsed.get("project_doc_auto_load") is True
