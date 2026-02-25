@@ -271,6 +271,20 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(exc.exception.status_code, 400)
         self.assertIn("chat_layout_engine must be one of", str(exc.exception.detail))
 
+    def test_auto_config_analysis_model_prefers_explicit_model(self) -> None:
+        self.assertEqual(
+            hub_server._auto_config_analysis_model("codex", ["--model", "gpt-5-codex"]),
+            "gpt-5-codex",
+        )
+        self.assertEqual(
+            hub_server._auto_config_analysis_model("codex", ["--model", "default"]),
+            hub_server.AUTO_CONFIG_MODEL,
+        )
+        self.assertEqual(
+            hub_server._auto_config_analysis_model("claude", []),
+            "claude-default",
+        )
+
     def test_agent_capabilities_cache_loads_on_startup(self) -> None:
         cache_payload = {
             "version": 1,
@@ -4822,6 +4836,7 @@ Gemini CLI
         container_workspace = str(PurePosixPath(hub_server.DEFAULT_CONTAINER_HOME) / container_project_name)
         container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
         captured_cmd: dict[str, list[str]] = {}
+        selected_agent_args = ["--model", "gpt-5-codex", "-c", 'model_reasoning_effort="high"']
 
         def fake_popen(cmd: list[str], **kwargs):
             del kwargs
@@ -4876,12 +4891,21 @@ Gemini CLI
                 workspace,
                 repo_url=repo_url,
                 branch="master",
+                agent_type="codex",
+                agent_args=selected_agent_args,
             )
 
-        self.assertEqual(result["model"], hub_server.AUTO_CONFIG_MODEL)
+        self.assertEqual(result["model"], "gpt-5-codex")
+        self.assertEqual(result["agent_type"], "codex")
+        self.assertEqual(result["agent_args"], selected_agent_args)
         cmd = captured_cmd["cmd"]
         self.assertEqual(cmd[cmd.index("--cd") + 1], container_workspace)
         self.assertEqual(cmd[cmd.index("--output-last-message") + 1], container_output_file)
+        self.assertIn("--model", cmd)
+        self.assertIn("gpt-5-codex", cmd)
+        self.assertIn("-c", cmd)
+        self.assertIn('model_reasoning_effort="high"', cmd)
+        self.assertLess(cmd.index("--model"), cmd.index("exec"))
         self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_URL=") for entry in cmd))
         self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_TOKEN=") for entry in cmd))
         self.assertIn("AGENT_HUB_AGENT_TOOLS_PROJECT_ID=", cmd)
@@ -5013,6 +5037,8 @@ Gemini CLI
             workspace: Path,
             repo_url: str,
             branch: str,
+            agent_type: str = "codex",
+            agent_args: list[str] | None = None,
             on_output: Callable[[str], None] | None = None,
             retry_feedback: str = "",
             request_id: str = "",
@@ -5020,6 +5046,8 @@ Gemini CLI
             self.assertTrue(workspace.exists())
             self.assertEqual(repo_url, "https://example.com/org/repo.git")
             self.assertEqual(branch, "main")
+            self.assertEqual(agent_type, "codex")
+            self.assertEqual(agent_args or [], [])
             self.assertEqual(request_id, "pending-auto-123")
             self.assertEqual(retry_feedback, "")
             if on_output is not None:
@@ -5094,6 +5122,8 @@ Gemini CLI
             workspace: Path,
             repo_url: str,
             branch: str,
+            agent_type: str = "codex",
+            agent_args: list[str] | None = None,
             on_output: Callable[[str], None] | None = None,
             retry_feedback: str = "",
             request_id: str = "",
@@ -5101,6 +5131,8 @@ Gemini CLI
             self.assertTrue(workspace.exists())
             self.assertEqual(repo_url, "https://example.com/org/repo.git")
             self.assertEqual(branch, "main")
+            self.assertEqual(agent_type, "codex")
+            self.assertEqual(agent_args or [], [])
             retry_feedbacks.append(retry_feedback)
             self.assertEqual(request_id, "")
             if on_output is not None:
@@ -8384,6 +8416,8 @@ class HubApiAsyncRouteTests(unittest.TestCase):
                         "repo_url": "https://example.com/org/repo.git",
                         "default_branch": "main",
                         "request_id": "pending-auto-123",
+                        "agent_type": "codex",
+                        "agent_args": ["--model", "gpt-5-codex", "-c", 'model_reasoning_effort="high"'],
                     },
                 )
 
@@ -8394,7 +8428,23 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
             request_id="pending-auto-123",
+            agent_type="codex",
+            agent_args=["--model", "gpt-5-codex", "-c", 'model_reasoning_effort="high"'],
         )
+
+    def test_auto_configure_route_rejects_non_array_agent_args(self) -> None:
+        app = self._build_app()
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/projects/auto-configure",
+                json={
+                    "repo_url": "https://example.com/org/repo.git",
+                    "agent_type": "codex",
+                    "agent_args": "not-an-array",
+                },
+            )
+        self.assertEqual(response.status_code, 400, msg=response.text)
+        self.assertEqual(response.json()["detail"], "agent_args must be an array.")
 
     def test_auto_configure_cancel_route_calls_state_and_returns_result(self) -> None:
         app = self._build_app()

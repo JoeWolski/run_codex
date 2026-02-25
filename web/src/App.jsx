@@ -70,6 +70,7 @@ import {
 
 const THEME_STORAGE_KEY = "agent_hub_theme";
 const CREATE_PROJECT_CONFIG_MODE_STORAGE_KEY = "agent_hub_project_config_mode";
+const AUTO_CONFIG_START_SETTINGS_STORAGE_KEY = "agent_hub_auto_config_start_settings_v1";
 const CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY = "agent_hub_chat_flexlayout_outer_layout_v1";
 const CHAT_FLEX_PROJECT_LAYOUT_STORAGE_KEY = "agent_hub_chat_flexlayout_project_layout_v1";
 const CHAT_TERMINAL_COLLAPSE_STORAGE_KEY = "agent_hub_chat_terminal_collapse_v1";
@@ -257,6 +258,22 @@ function readLocalStorageJson(storageKey, fallbackValue) {
   } catch {
     return fallbackValue;
   }
+}
+
+function loadAutoConfigStartSettings() {
+  const loaded = readLocalStorageJson(AUTO_CONFIG_START_SETTINGS_STORAGE_KEY, null);
+  if (!loaded || typeof loaded !== "object" || Array.isArray(loaded)) {
+    return {
+      agentType: DEFAULT_AGENT_TYPE,
+      model: "default",
+      reasoning: "default"
+    };
+  }
+  return {
+    agentType: String(loaded.agentType || loaded.agent_type || DEFAULT_AGENT_TYPE),
+    model: String(loaded.model || "default"),
+    reasoning: String(loaded.reasoning || "default")
+  };
 }
 
 function writeLocalStorageJson(storageKey, value) {
@@ -1612,6 +1629,7 @@ function HubApp() {
   });
   const [collapsedProjectChats, setCollapsedProjectChats] = useState({});
   const [chatStartSettingsByProject, setChatStartSettingsByProject] = useState({});
+  const [autoConfigStartSettings, setAutoConfigStartSettings] = useState(() => loadAutoConfigStartSettings());
   const [fullscreenChatId, setFullscreenChatId] = useState("");
   const [artifactPreview, setArtifactPreview] = useState(null);
   const [pendingSessions, setPendingSessions] = useState([]);
@@ -1715,9 +1733,11 @@ function HubApp() {
   const hubSettingsRef = useRef(hubSettings);
   const agentCapabilitiesRef = useRef(agentCapabilities);
   const chatStartSettingsByProjectRef = useRef(chatStartSettingsByProject);
+  const autoConfigStartSettingsRef = useRef(autoConfigStartSettings);
   hubSettingsRef.current = hubSettings;
   agentCapabilitiesRef.current = agentCapabilities;
   chatStartSettingsByProjectRef.current = chatStartSettingsByProject;
+  autoConfigStartSettingsRef.current = autoConfigStartSettings;
 
   const applyStatePayload = useCallback((payload) => {
     const normalizedPayload = normalizeHubStatePayload(payload);
@@ -2075,6 +2095,38 @@ function HubApp() {
   }, [createProjectConfigMode]);
 
   useEffect(() => {
+    setAutoConfigStartSettings((prev) => {
+      const normalized = normalizeChatStartSettings(
+        prev,
+        agentCapabilities,
+        hubSettings.defaultAgentType
+      );
+      if (
+        normalized.agentType === String(prev?.agentType || "") &&
+        normalized.model === String(prev?.model || "") &&
+        normalized.reasoning === String(prev?.reasoning || "")
+      ) {
+        return prev;
+      }
+      return normalized;
+    });
+  }, [agentCapabilities, hubSettings.defaultAgentType]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(
+        AUTO_CONFIG_START_SETTINGS_STORAGE_KEY,
+        JSON.stringify(autoConfigStartSettings)
+      );
+    } catch {
+      // Local storage persistence failure should not block project creation.
+    }
+  }, [autoConfigStartSettings]);
+
+  useEffect(() => {
     let stopped = false;
     let reconnectTimer = null;
     let ws = null;
@@ -2375,6 +2427,21 @@ function HubApp() {
   }, [agentCapabilities]);
   const settingsChatLayoutEngineOptions = useMemo(() => chatLayoutEngineOptions(), []);
   const createProjectManualMode = shouldShowManualProjectConfigInputs(createProjectConfigMode);
+  const autoConfigStartSettingsResolved = normalizeChatStartSettings(
+    autoConfigStartSettings,
+    agentCapabilities,
+    hubSettings.defaultAgentType
+  );
+  const autoConfigModelOptions = startModelOptionsForAgent(
+    autoConfigStartSettingsResolved.agentType,
+    agentCapabilities,
+    hubSettings.defaultAgentType
+  );
+  const autoConfigReasoningOptions = reasoningModeOptionsForAgent(
+    autoConfigStartSettingsResolved.agentType,
+    agentCapabilities,
+    hubSettings.defaultAgentType
+  );
 
   function updateCreateForm(patch) {
     setCreateForm((prev) => ({ ...prev, ...patch }));
@@ -2404,6 +2471,22 @@ function HubApp() {
         ...prev,
         [projectId]: normalized
       };
+    });
+  }
+
+  function updateAutoConfigStartSettings(patch) {
+    const capabilities = agentCapabilitiesRef.current;
+    const defaultAgentType = hubSettingsRef.current.defaultAgentType;
+    setAutoConfigStartSettings((prev) => {
+      const current = normalizeChatStartSettings(prev, capabilities, defaultAgentType);
+      return normalizeChatStartSettings(
+        {
+          ...current,
+          ...patch
+        },
+        capabilities,
+        defaultAgentType
+      );
     });
   }
 
@@ -2523,7 +2606,7 @@ function HubApp() {
     });
   }, []);
 
-  async function handleAutoConfigureCreateForm(formSnapshot) {
+  async function handleAutoConfigureCreateForm(formSnapshot, autoConfigChatStartSettings = null) {
     const repoUrl = String(formSnapshot.repoUrl || "").trim();
     if (!repoUrl) {
       setError("Repo URL is required before auto configure.");
@@ -2538,6 +2621,16 @@ function HubApp() {
       setError(err.message || String(err));
       return;
     }
+    const resolvedAutoConfigStartSettings = normalizeChatStartSettings(
+      autoConfigChatStartSettings || autoConfigStartSettingsRef.current,
+      agentCapabilitiesRef.current,
+      hubSettingsRef.current.defaultAgentType
+    );
+    const { agentType: autoConfigAgentType, agentArgs: autoConfigAgentArgs } = buildChatStartConfig(
+      resolvedAutoConfigStartSettings,
+      agentCapabilitiesRef.current,
+      hubSettingsRef.current.defaultAgentType
+    );
 
     const pendingProjectId = `pending-auto-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const pendingProjectName = String(formSnapshot.name || "").trim() || extractProjectNameFromRepoUrl(repoUrl);
@@ -2563,7 +2656,9 @@ function HubApp() {
         body: JSON.stringify({
           repo_url: repoUrl,
           default_branch: formSnapshot.defaultBranch,
-          request_id: pendingProjectId
+          request_id: pendingProjectId,
+          agent_type: autoConfigAgentType,
+          agent_args: autoConfigAgentArgs
         })
       });
       const recommendation = payload?.recommendation || {};
@@ -2685,9 +2780,14 @@ function HubApp() {
       defaultVolumes: (createForm.defaultVolumes || []).map((entry) => ({ ...entry })),
       defaultEnvVars: (createForm.defaultEnvVars || []).map((entry) => ({ ...entry }))
     };
+    const autoConfigStartSettingsSnapshot = normalizeChatStartSettings(
+      autoConfigStartSettingsRef.current,
+      agentCapabilitiesRef.current,
+      hubSettingsRef.current.defaultAgentType
+    );
     setCreateForm((prev) => ({ ...prev, repoUrl: "" }));
     if (isAutoCreateProjectConfigMode(createProjectConfigMode)) {
-      await handleAutoConfigureCreateForm(formSnapshot);
+      await handleAutoConfigureCreateForm(formSnapshot, autoConfigStartSettingsSnapshot);
       return;
     }
     try {
@@ -4871,6 +4971,55 @@ function HubApp() {
                       </div>
                     </div>
                   </div>
+                  {!createProjectManualMode ? (
+                    <div className="auto-config-chat-settings" role="group" aria-label="Auto-config chat start settings">
+                      <div className="label auto-config-chat-settings-label">Auto-config chat settings</div>
+                      <div className="row three auto-config-chat-settings-row">
+                        <select
+                          aria-label="Auto-config chat agent"
+                          value={autoConfigStartSettingsResolved.agentType}
+                          onChange={(event) => {
+                            updateAutoConfigStartSettings({ agentType: event.target.value });
+                          }}
+                        >
+                          {settingsAgentOptions.map((option) => (
+                            <option key={`auto-config-agent-${option.value}`} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          aria-label="Auto-config chat model"
+                          value={autoConfigStartSettingsResolved.model}
+                          onChange={(event) => {
+                            updateAutoConfigStartSettings({ model: event.target.value });
+                          }}
+                        >
+                          {autoConfigModelOptions.map((modelOption) => (
+                            <option
+                              key={`auto-config-model-${autoConfigStartSettingsResolved.agentType}-${modelOption}`}
+                              value={modelOption}
+                            >
+                              {modelOption}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          aria-label="Auto-config chat effort"
+                          value={autoConfigStartSettingsResolved.reasoning}
+                          onChange={(event) => {
+                            updateAutoConfigStartSettings({ reasoning: event.target.value });
+                          }}
+                        >
+                          {autoConfigReasoningOptions.map((reasoningMode) => (
+                            <option key={`auto-config-reasoning-${reasoningMode}`} value={reasoningMode}>
+                              {reasoningMode}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  ) : null}
                   {createProjectManualMode ? (
                     <>
                       <div className="row two">

@@ -618,6 +618,33 @@ def _has_cli_option(args: list[str], *, long_option: str, short_option: str | No
     return any(_cli_arg_matches_option(str(arg), long_option=long_option, short_option=short_option) for arg in args)
 
 
+def _cli_option_value(args: list[str], *, long_option: str, short_option: str | None = None) -> str:
+    normalized_args = [str(arg) for arg in args]
+    selected = ""
+    for index, arg in enumerate(normalized_args):
+        if arg == long_option or (short_option and arg == short_option):
+            selected = str(normalized_args[index + 1]).strip() if index + 1 < len(normalized_args) else ""
+            continue
+        if arg.startswith(f"{long_option}="):
+            _, _, selected = arg.partition("=")
+            selected = str(selected).strip()
+            continue
+        if short_option and arg.startswith(f"{short_option}="):
+            _, _, selected = arg.partition("=")
+            selected = str(selected).strip()
+            continue
+    return selected
+
+
+def _auto_config_analysis_model(agent_type: str, agent_args: list[str]) -> str:
+    selected_model = _cli_option_value(agent_args, long_option="--model", short_option="-m")
+    if selected_model and selected_model.lower() != "default":
+        return selected_model
+    if agent_type == AGENT_TYPE_CODEX:
+        return AUTO_CONFIG_MODEL
+    return f"{agent_type}-default"
+
+
 def _strip_explicit_codex_default_model(agent_args: list[str]) -> list[str]:
     normalized_args = [str(arg) for arg in agent_args]
     filtered: list[str] = []
@@ -6332,11 +6359,15 @@ class HubState:
         workspace: Path,
         repo_url: str,
         branch: str,
+        agent_type: str = AGENT_TYPE_CODEX,
+        agent_args: list[str] | None = None,
         on_output: Callable[[str], None] | None = None,
         retry_feedback: str = "",
         request_id: str = "",
     ) -> dict[str, Any]:
         normalized_request_id = self._normalize_auto_config_request_id(request_id)
+        resolved_agent_type = _normalize_chat_agent_type(agent_type, strict=True)
+        normalized_agent_args = [str(arg) for arg in (agent_args or []) if str(arg).strip()]
 
         def emit(chunk: str) -> None:
             if on_output is None:
@@ -6349,9 +6380,10 @@ class HubState:
             except Exception:
                 LOGGER.exception("Auto-config output callback failed.")
 
-        account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
-        if not account_connected:
-            raise HTTPException(status_code=409, detail=AUTO_CONFIG_NOT_CONNECTED_ERROR)
+        if resolved_agent_type == AGENT_TYPE_CODEX:
+            account_connected, _ = _read_codex_auth(self.openai_codex_auth_file)
+            if not account_connected:
+                raise HTTPException(status_code=409, detail=AUTO_CONFIG_NOT_CONNECTED_ERROR)
 
         prompt = self._auto_config_prompt(repo_url, branch)
         retry_feedback_text = str(retry_feedback or "").strip()
@@ -6373,7 +6405,7 @@ class HubState:
         agent_tools_chat_id = f"auto-config:{session_id}"
         runtime_config_file = self._prepare_chat_runtime_config(
             f"auto-config-{session_id}",
-            agent_type=AGENT_TYPE_CODEX,
+            agent_type=resolved_agent_type,
             agent_tools_url=agent_tools_url,
             agent_tools_token=session_token,
             agent_tools_project_id="",
@@ -6387,6 +6419,7 @@ class HubState:
                 self._agent_tools_sessions[session_id] = active_session
 
         extra_args = [
+            *normalized_agent_args,
             "exec",
             "--skip-git-repo-check",
             "--cd",
@@ -6401,7 +6434,7 @@ class HubState:
             workspace=workspace,
             container_project_name=container_project_name,
             runtime_config_file=runtime_config_file,
-            agent_type=AGENT_TYPE_CODEX,
+            agent_type=resolved_agent_type,
             agent_tools_url=agent_tools_url,
             agent_tools_token=session_token,
             agent_tools_project_id="",
@@ -6491,7 +6524,12 @@ class HubState:
                 parsed_payload = _parse_json_object_from_text(raw_payload_text)
             except ValueError as exc:
                 raise HTTPException(status_code=502, detail=AUTO_CONFIG_INVALID_OUTPUT_ERROR) from exc
-            return {"payload": parsed_payload, "model": AUTO_CONFIG_MODEL}
+            return {
+                "payload": parsed_payload,
+                "model": _auto_config_analysis_model(resolved_agent_type, normalized_agent_args),
+                "agent_type": resolved_agent_type,
+                "agent_args": normalized_agent_args,
+            }
         finally:
             self._set_auto_config_request_process(normalized_request_id, None)
             try:
@@ -6510,10 +6548,19 @@ class HubState:
         repo_url: Any,
         default_branch: Any = None,
         request_id: Any = None,
+        agent_type: Any = None,
+        agent_args: Any = None,
     ) -> dict[str, Any]:
         normalized_repo_url = str(repo_url or "").strip()
         if not normalized_repo_url:
             raise HTTPException(status_code=400, detail="repo_url is required.")
+        resolved_agent_type = _normalize_chat_agent_type(agent_type)
+        if agent_args is None:
+            normalized_agent_args: list[str] = []
+        elif isinstance(agent_args, list):
+            normalized_agent_args = [str(arg) for arg in agent_args if str(arg).strip()]
+        else:
+            raise HTTPException(status_code=400, detail="agent_args must be an array.")
         normalized_request_id = str(request_id or "").strip()[:AUTO_CONFIG_REQUEST_ID_MAX_CHARS]
         if normalized_request_id:
             self._register_auto_config_request(normalized_request_id)
@@ -6549,6 +6596,10 @@ class HubState:
         emit_auto_config_log("Preparing repository checkout for temporary analysis chat...\n")
         emit_auto_config_log(f"Repository URL: {normalized_repo_url}\n")
         emit_auto_config_log(f"Requested branch: {requested_branch or 'auto-detect'}\n")
+        emit_auto_config_log(f"Analysis agent: {resolved_agent_type}\n")
+        emit_auto_config_log(
+            f"Analysis model: {_auto_config_analysis_model(resolved_agent_type, normalized_agent_args)}\n"
+        )
 
         if self._is_auto_config_request_cancelled(normalized_request_id):
             raise HTTPException(status_code=409, detail=AUTO_CONFIG_CANCELLED_ERROR)
@@ -6634,6 +6685,8 @@ class HubState:
                             workspace,
                             normalized_repo_url,
                             resolved_branch,
+                            agent_type=resolved_agent_type,
+                            agent_args=normalized_agent_args,
                             on_output=emit_auto_config_log if normalized_request_id else None,
                             retry_feedback=retry_feedback,
                             request_id=normalized_request_id,
@@ -6643,6 +6696,8 @@ class HubState:
                             workspace,
                             normalized_repo_url,
                             resolved_branch,
+                            agent_type=resolved_agent_type,
+                            agent_args=normalized_agent_args,
                             on_output=emit_auto_config_log if normalized_request_id else None,
                             request_id=normalized_request_id,
                         )
@@ -6715,6 +6770,12 @@ class HubState:
 
         recommendation["default_branch"] = resolved_branch
         recommendation["analysis_model"] = str(chat_result.get("model") or "")
+        recommendation["analysis_agent_type"] = str(chat_result.get("agent_type") or resolved_agent_type)
+        recommendation["analysis_agent_args"] = [
+            str(arg)
+            for arg in (chat_result.get("agent_args") or normalized_agent_args)
+            if str(arg).strip()
+        ]
         recommendation["analysis_auth_mode"] = CHAT_TITLE_AUTH_MODE_ACCOUNT
         recommendation["analyzed_repo_url"] = normalized_repo_url
         auto_project = {
@@ -11089,11 +11150,23 @@ def main(
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        agent_args = payload.get("agent_args")
+        if agent_args is None:
+            agent_args = []
+        if not isinstance(agent_args, list):
+            raise HTTPException(status_code=400, detail="agent_args must be an array.")
+        agent_type = (
+            _normalize_chat_agent_type(payload.get("agent_type"), strict=True)
+            if "agent_type" in payload
+            else AGENT_TYPE_CODEX
+        )
         recommendation = await asyncio.to_thread(
             state.auto_configure_project,
             repo_url=payload.get("repo_url"),
             default_branch=payload.get("default_branch"),
             request_id=payload.get("request_id"),
+            agent_type=agent_type,
+            agent_args=[str(arg) for arg in agent_args if str(arg).strip()],
         )
         return {"recommendation": recommendation}
 

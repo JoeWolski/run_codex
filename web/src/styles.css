@@ -664,6 +664,10 @@ code {
   grid-template-columns: 1fr;
 }
 
+.row.three {
+  grid-template-columns: 1fr;
+}
+
 .create-project-submit-button {
   margin-top: 2px;
 }
@@ -671,6 +675,15 @@ code {
 .create-project-config-mode {
   display: grid;
   gap: 0;
+}
+
+.auto-config-chat-settings {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.auto-config-chat-settings-label {
+  margin: 0;
 }
 
 .create-project-config-mode-inline {
@@ -2609,6 +2622,10 @@ button:focus-visible {
 @media (min-width: 760px) {
   .row.two {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .row.three {
+    grid-template-columns: 1fr 1fr 1fr;
   }
 
   .settings-auth-input-row {
