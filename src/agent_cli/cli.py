@@ -122,37 +122,6 @@ def _toml_basic_string_literal(value: str) -> str:
     return json.dumps(str(value or ""))
 
 
-def _codex_default_runtime_flags(
-    *,
-    no_alt_screen: bool,
-    explicit_args: Iterable[str],
-    shared_prompt_context: str,
-) -> list[str]:
-    parsed_args = [str(arg) for arg in explicit_args]
-    flags: list[str] = []
-    bypass_all = _has_cli_option(
-        parsed_args,
-        long_option="--dangerously-bypass-approvals-and-sandbox",
-    )
-    if not bypass_all:
-        if not _has_cli_option(parsed_args, long_option="--ask-for-approval", short_option="-a"):
-            flags.extend(["--ask-for-approval", DEFAULT_CODEX_APPROVAL_POLICY])
-        if not _has_cli_option(parsed_args, long_option="--sandbox", short_option="-s"):
-            flags.extend(["--sandbox", DEFAULT_CODEX_SANDBOX_MODE])
-
-    if shared_prompt_context and not _has_codex_config_override(parsed_args, key="developer_instructions"):
-        flags.extend(
-            [
-                "--config",
-                f"developer_instructions={_toml_basic_string_literal(shared_prompt_context)}",
-            ]
-        )
-
-    if no_alt_screen:
-        flags.append("--no-alt-screen")
-    return flags
-
-
 def _normalize_string_list(raw_value: object) -> list[str]:
     if not isinstance(raw_value, list):
         return []
@@ -215,35 +184,6 @@ def _shared_prompt_context_from_config(config_path: Path, *, core_system_prompt:
     return "\n\n".join(section for section in sections if section)
 
 
-def _claude_default_runtime_flags(*, explicit_args: Iterable[str], shared_prompt_context: str) -> list[str]:
-    parsed_args = [str(arg) for arg in explicit_args]
-    flags: list[str] = []
-    if not _has_cli_option(parsed_args, long_option="--model", short_option="-m"):
-        flags.extend(["--model", DEFAULT_CLAUDE_MODEL])
-    if not _has_cli_option(parsed_args, long_option="--dangerously-skip-permissions") and not _has_cli_option(
-        parsed_args, long_option="--permission-mode"
-    ):
-        flags.extend(["--permission-mode", DEFAULT_CLAUDE_PERMISSION_MODE])
-
-    has_explicit_system_prompt = _has_cli_option(parsed_args, long_option="--append-system-prompt") or _has_cli_option(
-        parsed_args, long_option="--append-system-prompt-file"
-    )
-    if shared_prompt_context and not has_explicit_system_prompt:
-        flags.extend(["--append-system-prompt", shared_prompt_context])
-
-    return flags
-
-
-def _gemini_default_runtime_flags(*, explicit_args: Iterable[str]) -> list[str]:
-    parsed_args = [str(arg) for arg in explicit_args]
-    flags: list[str] = []
-    if not _has_cli_option(parsed_args, long_option="--approval-mode") and not _has_cli_option(
-        parsed_args, long_option="--yolo"
-    ):
-        flags.extend(["--approval-mode", DEFAULT_GEMINI_APPROVAL_MODE])
-    return flags
-
-
 def _sync_gemini_shared_context_file(*, host_gemini_dir: Path, shared_prompt_context: str) -> None:
     context_file = host_gemini_dir / GEMINI_CONTEXT_FILE_NAME
     updated_context = str(shared_prompt_context or "").strip()
@@ -268,17 +208,6 @@ def _sync_gemini_shared_context_file(*, host_gemini_dir: Path, shared_prompt_con
             context_file.unlink()
     except OSError as exc:
         click.echo(f"Warning: unable to update Gemini context file {context_file}: {exc}", err=True)
-
-
-def _resume_shell_command(*, no_alt_screen: bool, agent_command: str, codex_runtime_flags: Iterable[str] = ()) -> str:
-    resolved_command = str(agent_command or DEFAULT_AGENT_COMMAND).strip() or DEFAULT_AGENT_COMMAND
-    command_parts = [resolved_command]
-    if resolved_command == DEFAULT_AGENT_COMMAND:
-        command_parts.extend(str(flag) for flag in codex_runtime_flags)
-    elif no_alt_screen:
-        command_parts.append("--no-alt-screen")
-    resolved = " ".join(shlex.quote(part) for part in command_parts)
-    return f"if {resolved} resume --last; then :; else exec {resolved}; fi"
 
 
 def _repo_root() -> Path:

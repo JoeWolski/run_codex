@@ -100,6 +100,9 @@ class CodexProvider(AgentProvider):
                 flags.extend(["--ask-for-approval", "never"])
             if not has_cli_option(parsed_args, long_option="--sandbox", short_option="-s"):
                 flags.extend(["--sandbox", "danger-full-access"])
+        
+        if not has_cli_option(parsed_args, long_option="--full-auto"):
+            flags.append("--full-auto")
 
         if shared_prompt_context and not has_codex_config_override(parsed_args, key="developer_instructions"):
             flags.extend(
@@ -167,10 +170,8 @@ class ClaudeProvider(AgentProvider):
 
         if not has_cli_option(parsed_args, long_option="--model", short_option="-m"):
             flags.extend(["--model", "opus"])
-        if not has_cli_option(parsed_args, long_option="--dangerously-skip-permissions") and not has_cli_option(
-            parsed_args, long_option="--permission-mode"
-        ):
-            flags.extend(["--permission-mode", "bypassPermissions"])
+        if not has_cli_option(parsed_args, long_option="--dangerously-skip-permissions"):
+            flags.append("--dangerously-skip-permissions")
 
         has_explicit_system_prompt = has_cli_option(parsed_args, long_option="--append-system-prompt") or has_cli_option(
             parsed_args, long_option="--append-system-prompt-file"
@@ -241,7 +242,9 @@ class GeminiProvider(AgentProvider):
         if not has_cli_option(parsed_args, long_option="--approval-mode") and not has_cli_option(
             parsed_args, long_option="--yolo"
         ):
-            flags.extend(["--approval-mode", "yolo"])
+            flags.append("--yolo")
+        if not has_cli_option(parsed_args, long_option="--no-sandbox"):
+            flags.append("--no-sandbox")
         return flags
 
     def resume_shell_command(
