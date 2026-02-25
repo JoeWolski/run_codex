@@ -4692,6 +4692,38 @@ Gemini CLI
         self.assertNotIn(unexpected_mount, recommendation["default_rw_mounts"])
         self.assertTrue((fake_home / ".ccache").exists())
 
+    def test_normalize_auto_config_recommendation_drops_project_workspace_mount(self) -> None:
+        workspace = self.tmp_path / "workspace-project-mount"
+        workspace.mkdir(parents=True, exist_ok=True)
+        keep_host = self.tmp_path / "safe-volume"
+        keep_host.mkdir(parents=True, exist_ok=True)
+        project_container_workspace = hub_server._container_workspace_path_for_project("test-repo")
+        fake_home = self.tmp_path / "fake-home-project-mount"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        with patch("agent_hub.server.Path.home", return_value=fake_home):
+            recommendation = self.state._normalize_auto_config_recommendation(
+                {
+                    "base_image_mode": "tag",
+                    "base_image_value": "ubuntu:22.04",
+                    "setup_script": "",
+                    "default_ro_mounts": [],
+                    "default_rw_mounts": [
+                        f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data",
+                        f"{keep_host}:{project_container_workspace}",
+                        f"{keep_host}:{project_container_workspace}/src",
+                    ],
+                    "default_env_vars": [],
+                    "notes": "",
+                },
+                workspace,
+                project_container_workspace=project_container_workspace,
+            )
+
+        self.assertEqual(
+            recommendation["default_rw_mounts"],
+            [f"{keep_host}:{hub_server.DEFAULT_CONTAINER_HOME}/data"],
+        )
+
     def test_normalize_auto_config_recommendation_drops_undetected_cache_mounts(self) -> None:
         workspace = self.tmp_path / "workspace-no-cache"
         workspace.mkdir(parents=True, exist_ok=True)
