@@ -28,11 +28,7 @@ def _configure_git_identity() -> None:
 
 
 def _prepare_git_credentials() -> None:
-    # Keep runtime git auth deterministic: only credential helper entries are allowed.
-    os.environ.pop("GH_TOKEN", None)
-    os.environ.pop("GITHUB_TOKEN", None)
-    os.environ.pop("GH_HOST", None)
-
+    # Keep runtime git auth deterministic by providing a credential helper file when configured.
     source_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_SOURCE", "").strip()
     target_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_FILE", "").strip()
     if not source_raw:

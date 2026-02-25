@@ -8975,7 +8975,7 @@ class DockerEntrypointTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 module._configure_git_identity()
 
-    def test_prepare_git_credentials_copies_source_and_clears_gh_env_tokens(self) -> None:
+    def test_prepare_git_credentials_copies_source_and_preserves_gh_env_tokens(self) -> None:
         module = self._load_entrypoint_module()
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -8999,9 +8999,9 @@ class DockerEntrypointTests(unittest.TestCase):
                 clear=False,
             ):
                 module._prepare_git_credentials()
-                self.assertIsNone(os.environ.get("GH_TOKEN"))
-                self.assertIsNone(os.environ.get("GITHUB_TOKEN"))
-                self.assertIsNone(os.environ.get("GH_HOST"))
+                self.assertEqual(os.environ.get("GH_TOKEN"), "legacy-gh-token")
+                self.assertEqual(os.environ.get("GITHUB_TOKEN"), "legacy-github-token")
+                self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
 
             self.assertTrue(target_path.exists())
             self.assertEqual(
@@ -9011,7 +9011,7 @@ class DockerEntrypointTests(unittest.TestCase):
             target_mode = target_path.stat().st_mode & 0o777
             self.assertEqual(target_mode, 0o600)
 
-    def test_prepare_git_credentials_without_source_clears_gh_env_tokens(self) -> None:
+    def test_prepare_git_credentials_without_source_preserves_gh_env_tokens(self) -> None:
         module = self._load_entrypoint_module()
         with patch.dict(
             os.environ,
@@ -9026,9 +9026,9 @@ class DockerEntrypointTests(unittest.TestCase):
             clear=False,
         ):
             module._prepare_git_credentials()
-            self.assertIsNone(os.environ.get("GH_TOKEN"))
-            self.assertIsNone(os.environ.get("GITHUB_TOKEN"))
-            self.assertIsNone(os.environ.get("GH_HOST"))
+            self.assertEqual(os.environ.get("GH_TOKEN"), "legacy-gh-token")
+            self.assertEqual(os.environ.get("GITHUB_TOKEN"), "legacy-github-token")
+            self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
 
     def test_ensure_claude_native_command_path_creates_home_symlink(self) -> None:
         module = self._load_entrypoint_module()
