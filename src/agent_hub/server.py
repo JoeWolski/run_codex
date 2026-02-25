@@ -631,9 +631,9 @@ def _strip_explicit_codex_default_model(agent_args: list[str]) -> list[str]:
             next_value = str(normalized_args[index + 1]).strip().lower() if index + 1 < len(normalized_args) else ""
             if next_value != "default":
                 filtered.append(arg)
+                if index + 1 < len(normalized_args):
+                    filtered.append(normalized_args[index + 1])
             skip_next = index + 1 < len(normalized_args)
-            if not skip_next:
-                continue
             continue
 
         if arg.startswith("--model="):
@@ -646,9 +646,9 @@ def _strip_explicit_codex_default_model(agent_args: list[str]) -> list[str]:
             next_value = str(normalized_args[index + 1]).strip().lower() if index + 1 < len(normalized_args) else ""
             if next_value != "default":
                 filtered.append(arg)
+                if index + 1 < len(normalized_args):
+                    filtered.append(normalized_args[index + 1])
             skip_next = index + 1 < len(normalized_args)
-            if not skip_next:
-                continue
             continue
 
         if arg.startswith("-m="):
