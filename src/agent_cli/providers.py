@@ -258,7 +258,7 @@ class GeminiProvider(AgentProvider):
         return f"if {resolved} --resume; then :; else exec {resolved}; fi"
 
     def get_mcp_config_mount_target(self, container_home: str) -> str:
-        return f"{container_home}/.gemini/config.toml"
+        return f"{container_home}/.gemini/settings.json"
 
     def build_mcp_config(
         self,
@@ -266,18 +266,23 @@ class GeminiProvider(AgentProvider):
         mcp_env: dict[str, str],
         script_path: str,
     ) -> str:
-        merged_config = _strip_mcp_server_toml(base_config_text, "agent_tools")
-        merged_config += (
-            "\n[mcp_servers.agent_tools]\n"
-            'command = "python3"\n'
-            f"args = [{json.dumps(script_path)}]\n"
-            "startup_timeout_sec = 20\n"
-            "tool_timeout_sec = 120\n"
-            "\n[mcp_servers.agent_tools.env]\n"
-        )
-        for k, v in mcp_env.items():
-            merged_config += f"{k} = {json.dumps(v)}\n"
-        return merged_config
+        try:
+            config = json.loads(base_config_text) if base_config_text.strip() else {}
+        except json.JSONDecodeError:
+            config = {}
+        
+        if not isinstance(config, dict):
+            config = {}
+
+        if "mcpServers" not in config or not isinstance(config["mcpServers"], dict):
+            config["mcpServers"] = {}
+
+        config["mcpServers"]["agent_tools"] = {
+            "command": "python3",
+            "args": [script_path],
+            "env": mcp_env
+        }
+        return json.dumps(config, indent=2)
 
     def sync_shared_context_file(self, host_agent_home: Path, shared_prompt_context: str) -> None:
         import click
