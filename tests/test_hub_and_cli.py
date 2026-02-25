@@ -6028,6 +6028,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("never", codex_args)
             self.assertIn("--sandbox", codex_args)
             self.assertIn("danger-full-access", codex_args)
+            self.assertIn("--full-auto", codex_args)
             self.assertIn("--config", codex_args)
             config_index = codex_args.index("--config")
             self.assertGreater(len(codex_args), config_index + 1)
@@ -6128,8 +6129,7 @@ class CliEnvVarTests(unittest.TestCase):
             claude_args = run_cmd[image_index + 2 :]
             self.assertIn("--model", claude_args)
             self.assertIn(image_cli.DEFAULT_CLAUDE_MODEL, claude_args)
-            self.assertIn("--permission-mode", claude_args)
-            self.assertIn("bypassPermissions", claude_args)
+            self.assertIn("--dangerously-skip-permissions", claude_args)
 
     def test_claude_runtime_appends_shared_prompt_context_from_system_prompt_file_and_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6293,8 +6293,8 @@ class CliEnvVarTests(unittest.TestCase):
             image_index = run_cmd.index(image_cli.GEMINI_RUNTIME_IMAGE)
             self.assertEqual(run_cmd[image_index + 1], "gemini")
             gemini_args = run_cmd[image_index + 2 :]
-            self.assertIn("--approval-mode", gemini_args)
-            self.assertIn("yolo", gemini_args)
+            self.assertIn("--yolo", gemini_args)
+            self.assertIn("--no-sandbox", gemini_args)
 
     def test_gemini_runtime_flags_respect_explicit_approval_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6341,6 +6341,7 @@ class CliEnvVarTests(unittest.TestCase):
             gemini_args = run_cmd[image_index + 2 :]
             self.assertIn("--approval-mode", gemini_args)
             self.assertIn("default", gemini_args)
+            self.assertIn("--no-sandbox", gemini_args)
             self.assertNotIn("yolo", gemini_args)
 
     def test_gemini_runtime_syncs_shared_prompt_context_from_system_prompt_file(self) -> None:
@@ -6505,6 +6506,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn("--sandbox", codex_args)
             self.assertIn("workspace-write", codex_args)
             self.assertNotIn("danger-full-access", codex_args)
+            self.assertIn("--full-auto", codex_args)
 
     def test_claude_runtime_flags_respect_explicit_permission_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6551,6 +6553,7 @@ class CliEnvVarTests(unittest.TestCase):
             claude_args = run_cmd[image_index + 2 :]
             self.assertIn("--permission-mode", claude_args)
             self.assertIn("acceptEdits", claude_args)
+            self.assertIn("--dangerously-skip-permissions", claude_args)
             self.assertNotIn("bypassPermissions", claude_args)
 
     def test_claude_runtime_flags_respect_explicit_model(self) -> None:
@@ -6820,10 +6823,10 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(run_cmd[image_index + 1], "bash")
             self.assertEqual(run_cmd[image_index + 2], "-lc")
             resume_script = run_cmd[image_index + 3]
-            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
+            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access --full-auto --config", resume_script)
             self.assertIn("developer_instructions=", resume_script)
             self.assertIn("resume --last", resume_script)
-            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
+            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --full-auto --config", resume_script)
 
     def test_resume_with_no_alt_screen_passes_flag_to_resume_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6865,10 +6868,10 @@ class CliEnvVarTests(unittest.TestCase):
             assert run_cmd is not None
             image_index = run_cmd.index(image_cli.DEFAULT_RUNTIME_IMAGE)
             resume_script = run_cmd[image_index + 3]
-            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
+            self.assertIn("codex --ask-for-approval never --sandbox danger-full-access --full-auto --config", resume_script)
             self.assertIn("--no-alt-screen resume --last", resume_script)
             self.assertIn("developer_instructions=", resume_script)
-            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --config", resume_script)
+            self.assertIn("exec codex --ask-for-approval never --sandbox danger-full-access --full-auto --config", resume_script)
 
     def test_resume_supports_claude_agent_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
