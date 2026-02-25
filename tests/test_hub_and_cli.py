@@ -1156,6 +1156,154 @@ Gemini CLI
         self.assertEqual(fallback_payload["personal_access_token"], TEST_GITHUB_PERSONAL_ACCESS_TOKEN)
         self.assertNotEqual(str(first_token_id), str(second_token_id))
 
+    def test_github_git_env_for_repo_prefers_verified_repo_access_credentials(self) -> None:
+        repo_url = "https://github.com/acme-org/private-repo.git"
+        contexts: list[tuple[str, str, dict[str, str]]] = [
+            (
+                hub_server.GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN,
+                "github.com",
+                {
+                    "credential_id": "token-a",
+                    "account_login": "user-a",
+                    "personal_access_token": "token-a-secret",
+                    "scheme": "https",
+                },
+            ),
+            (
+                hub_server.GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN,
+                "github.com",
+                {
+                    "credential_id": "token-b",
+                    "account_login": "user-b",
+                    "personal_access_token": "token-b-secret",
+                    "scheme": "https",
+                },
+            ),
+        ]
+        refresh_calls: list[list[str]] = []
+
+        def fake_refresh(
+            contexts_to_write: list[tuple[str, str, dict[str, str]]],
+            *,
+            context_key: str = "",
+        ) -> str:
+            del context_key
+            credential_ids = [str(item[2].get("credential_id") or "") for item in contexts_to_write]
+            refresh_calls.append(credential_ids)
+            filename = "-".join(credential_ids) if credential_ids else "empty"
+            path = self.tmp_path / f"{filename}.git-credentials"
+            path.write_text(
+                "https://placeholder:placeholder@github.com\n",
+                encoding="utf-8",
+            )
+            return str(path)
+
+        def fake_run(
+            cmd: list[str],
+            cwd: Path | None = None,
+            capture: bool = False,
+            check: bool = True,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess:
+            del cwd, capture, check
+            if cmd[:3] == ["git", "ls-remote", "--exit-code"] and cmd[3] == repo_url:
+                helper_value = str((env or {}).get("GIT_CONFIG_VALUE_0") or "")
+                if "token-a.git-credentials" in helper_value:
+                    return subprocess.CompletedProcess(cmd, 1, "", "fatal: HTTP 403")
+                if "token-b.git-credentials" in helper_value:
+                    return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(
+            self.state,
+            "_github_repo_all_auth_contexts",
+            return_value=contexts,
+        ), patch.object(
+            self.state,
+            "_refresh_all_github_git_credentials",
+            side_effect=fake_refresh,
+        ), patch(
+            "agent_hub.server._run",
+            side_effect=fake_run,
+        ):
+            git_env = self.state._github_git_env_for_repo(repo_url, context_key="git-env-test")
+
+        self.assertEqual(refresh_calls[-1], ["token-b", "token-a"])
+        self.assertEqual(git_env.get("GIT_TERMINAL_PROMPT"), "0")
+        self.assertIn("token-b-token-a.git-credentials", str(git_env.get("GIT_CONFIG_VALUE_0") or ""))
+
+    def test_github_git_env_for_repo_keeps_original_order_when_no_credential_verifies_access(self) -> None:
+        repo_url = "https://github.com/acme-org/private-repo.git"
+        contexts: list[tuple[str, str, dict[str, str]]] = [
+            (
+                hub_server.GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN,
+                "github.com",
+                {
+                    "credential_id": "token-a",
+                    "account_login": "user-a",
+                    "personal_access_token": "token-a-secret",
+                    "scheme": "https",
+                },
+            ),
+            (
+                hub_server.GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN,
+                "github.com",
+                {
+                    "credential_id": "token-b",
+                    "account_login": "user-b",
+                    "personal_access_token": "token-b-secret",
+                    "scheme": "https",
+                },
+            ),
+        ]
+        refresh_calls: list[list[str]] = []
+
+        def fake_refresh(
+            contexts_to_write: list[tuple[str, str, dict[str, str]]],
+            *,
+            context_key: str = "",
+        ) -> str:
+            del context_key
+            credential_ids = [str(item[2].get("credential_id") or "") for item in contexts_to_write]
+            refresh_calls.append(credential_ids)
+            filename = "-".join(credential_ids) if credential_ids else "empty"
+            path = self.tmp_path / f"{filename}.git-credentials"
+            path.write_text(
+                "https://placeholder:placeholder@github.com\n",
+                encoding="utf-8",
+            )
+            return str(path)
+
+        def fake_run(
+            cmd: list[str],
+            cwd: Path | None = None,
+            capture: bool = False,
+            check: bool = True,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess:
+            del cwd, capture, check, env
+            if cmd[:3] == ["git", "ls-remote", "--exit-code"] and cmd[3] == repo_url:
+                return subprocess.CompletedProcess(cmd, 1, "", "fatal: HTTP 403")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(
+            self.state,
+            "_github_repo_all_auth_contexts",
+            return_value=contexts,
+        ), patch.object(
+            self.state,
+            "_refresh_all_github_git_credentials",
+            side_effect=fake_refresh,
+        ), patch(
+            "agent_hub.server._run",
+            side_effect=fake_run,
+        ):
+            git_env = self.state._github_git_env_for_repo(repo_url, context_key="git-env-test")
+
+        self.assertEqual(refresh_calls[-1], ["token-a", "token-b"])
+        self.assertEqual(git_env.get("GIT_TERMINAL_PROMPT"), "0")
+        self.assertIn("token-a-token-b.git-credentials", str(git_env.get("GIT_CONFIG_VALUE_0") or ""))
+
     def test_connect_github_personal_access_token_keeps_multiple_tokens_for_same_account(self) -> None:
         first_verification = dict(TEST_GITHUB_PERSONAL_ACCESS_VERIFICATION)
         first_verification["token_scopes"] = "repo"

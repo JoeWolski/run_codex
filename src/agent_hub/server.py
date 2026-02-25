@@ -5121,6 +5121,81 @@ class HubState:
         _write_private_env_file(output_file, "".join(lines))
         return str(output_file)
 
+    @staticmethod
+    def _git_scheme_for_auth_context(
+        mode: str,
+        auth_payload: dict[str, Any],
+    ) -> str:
+        if mode != GIT_CONNECTION_MODE_PERSONAL_ACCESS_TOKEN:
+            return GIT_CREDENTIAL_DEFAULT_SCHEME
+        try:
+            return _normalize_github_credential_scheme(
+                auth_payload.get("scheme"),
+                field_name="scheme",
+            )
+        except HTTPException:
+            return GIT_CREDENTIAL_DEFAULT_SCHEME
+
+    def _ordered_repo_auth_contexts_for_git(
+        self,
+        repo_url: str,
+        contexts: list[tuple[str, str, dict[str, Any]]],
+        *,
+        context_key: str = "",
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        if len(contexts) <= 1:
+            return contexts
+
+        normalized_repo_url = str(repo_url or "").strip()
+        if not normalized_repo_url:
+            return contexts
+
+        normalized_context_key = str(context_key or "").strip()
+        if normalized_context_key:
+            probe_prefix = f"{normalized_context_key}:probe"
+        else:
+            repo_digest = hashlib.sha256(normalized_repo_url.encode("utf-8")).hexdigest()[:12]
+            probe_prefix = f"repo-auth-probe:{repo_digest}"
+
+        verified_contexts: list[tuple[str, str, dict[str, Any]]] = []
+        unverified_contexts: list[tuple[str, str, dict[str, Any]]] = []
+        for index, context in enumerate(contexts):
+            mode, host, auth_payload = context
+            credential_id = str(auth_payload.get("credential_id") or "").strip() or f"{mode}:{host}:{index}"
+            probe_context_key = f"{probe_prefix}:{credential_id}:{index}"
+
+            try:
+                credentials_file = self._refresh_all_github_git_credentials(
+                    [context],
+                    context_key=probe_context_key,
+                )
+            except HTTPException:
+                unverified_contexts.append(context)
+                continue
+            if not credentials_file:
+                unverified_contexts.append(context)
+                continue
+
+            probe_env = self._git_env_for_credentials_file(
+                credentials_file,
+                host,
+                scheme=self._git_scheme_for_auth_context(mode, auth_payload),
+            )
+            probe_result = _run(
+                ["git", "ls-remote", "--exit-code", normalized_repo_url, "HEAD"],
+                capture=True,
+                check=False,
+                env=probe_env,
+            )
+            if probe_result.returncode == 0:
+                verified_contexts.append(context)
+            else:
+                unverified_contexts.append(context)
+
+        if verified_contexts:
+            return [*verified_contexts, *unverified_contexts]
+        return contexts
+
     def _github_git_env_for_repo(
         self,
         repo_url: str,
@@ -5128,17 +5203,25 @@ class HubState:
         *,
         context_key: str = "",
     ) -> dict[str, str]:
-        contexts = self._github_repo_all_auth_contexts(repo_url, project=project)
-        if not contexts:
+        ordered_contexts = self._ordered_repo_auth_contexts_for_git(
+            repo_url,
+            self._github_repo_all_auth_contexts(repo_url, project=project),
+            context_key=context_key,
+        )
+        if not ordered_contexts:
             return {}
         credentials_file = self._refresh_all_github_git_credentials(
-            contexts,
+            ordered_contexts,
             context_key=context_key,
         )
         if not credentials_file:
             return {}
-        _mode, host, _auth_payload = contexts[0]
-        return self._git_env_for_credentials_file(credentials_file, host)
+        mode, host, auth_payload = ordered_contexts[0]
+        return self._git_env_for_credentials_file(
+            credentials_file,
+            host,
+            scheme=self._git_scheme_for_auth_context(mode, auth_payload),
+        )
 
     def _github_git_args_for_repo(
         self,
@@ -5147,16 +5230,20 @@ class HubState:
         *,
         context_key: str = "",
     ) -> list[str]:
-        contexts = self._github_repo_all_auth_contexts(repo_url, project=project)
-        if not contexts:
+        ordered_contexts = self._ordered_repo_auth_contexts_for_git(
+            repo_url,
+            self._github_repo_all_auth_contexts(repo_url, project=project),
+            context_key=context_key,
+        )
+        if not ordered_contexts:
             return []
         credentials_file = self._refresh_all_github_git_credentials(
-            contexts,
+            ordered_contexts,
             context_key=context_key,
         )
         if not credentials_file:
             return []
-        _mode, host, _auth_payload = contexts[0]
+        _mode, host, _auth_payload = ordered_contexts[0]
         return [
             "--git-credential-file",
             credentials_file,
