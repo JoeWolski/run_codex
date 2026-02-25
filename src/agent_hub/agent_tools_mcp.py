@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import json
 import os
 import sys
@@ -13,8 +14,11 @@ from typing import Any
 
 
 SUBMIT_ARTIFACT_MAX_ATTEMPTS_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_MAX_ATTEMPTS"
+SUBMIT_ARTIFACT_HARD_MAX_ATTEMPTS = 3
 SUBMIT_ARTIFACT_RETRY_DELAY_BASE_SEC_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_RETRY_DELAY_BASE_SEC"
 SUBMIT_ARTIFACT_RETRY_DELAY_MAX_SEC_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_RETRY_DELAY_MAX_SEC"
+
+LOGGER = logging.getLogger("agent_tools_mcp")
 
 TOOL_LIST = [
     {
@@ -114,24 +118,58 @@ def _api_request(path: str, *, method: str = "GET", payload: dict[str, Any] | No
         "Authorization": f"Bearer {token}",
         "User-Agent": "agent-tools-mcp/1.0",
     }
+    if payload is not None:
+        payload_preview = str(payload)
+        if len(payload_preview) > 400:
+            payload_preview = f"{payload_preview[:400]}..."
+    else:
+        payload_preview = "None"
+    LOGGER.debug(
+        "agent_tools API request: method=%s url=%s payload=%s",
+        method,
+        url,
+        payload_preview,
+    )
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, headers=headers, method=method, data=data)
     try:
         with urllib.request.urlopen(request, timeout=20.0) as response:
-            body = response.read().decode("utf-8", errors="ignore")
+            body = response.read().decode("utf-8", errors="replace")
             if not body.strip():
+                LOGGER.debug("agent_tools API response for %s %s was empty", method, url)
                 return {}
-            parsed = json.loads(body)
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError as exc:
+                response_preview = body[:400]
+                if len(body) > 400:
+                    response_preview = f"{response_preview}..."
+                LOGGER.error(
+                    "agent_tools API response for %s %s was non-JSON: %s body=%s",
+                    method,
+                    url,
+                    exc,
+                    response_preview,
+                )
+                raise RuntimeError(f"agent_tools API request returned non-JSON response: {response_preview}") from exc
             if isinstance(parsed, dict):
                 return parsed
             return {"value": parsed}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
         detail = body.strip() or f"HTTP {exc.code}"
+        LOGGER.warning(
+            "agent_tools API request failed for %s %s: HTTP %s body=%s",
+            method,
+            url,
+            exc.code,
+            body.strip()[:400] if body else "None",
+        )
         raise RuntimeError(f"agent_tools API request failed: {method} {url} -> {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
+        LOGGER.error("agent_tools API request failed for %s %s: %s", method, url, exc)
         raise RuntimeError(f"agent_tools API request failed: {method} {url}: {exc}") from exc
 
 
@@ -254,10 +292,17 @@ def _submit_artifacts(arguments: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("--name can only be used when submitting exactly one file.")
 
     max_attempts = _positive_int(
-        arguments.get("max_attempts", os.environ.get(SUBMIT_ARTIFACT_MAX_ATTEMPTS_ENV, "8")),
+        arguments.get("max_attempts", os.environ.get(SUBMIT_ARTIFACT_MAX_ATTEMPTS_ENV, "3")),
         field_name="max_attempts",
         minimum=1,
     )
+    if max_attempts > SUBMIT_ARTIFACT_HARD_MAX_ATTEMPTS:
+        LOGGER.warning(
+            "submit_artifact max_attempts=%s exceeds hard cap; clamping to %s",
+            max_attempts,
+            SUBMIT_ARTIFACT_HARD_MAX_ATTEMPTS,
+        )
+        max_attempts = SUBMIT_ARTIFACT_HARD_MAX_ATTEMPTS
     retry_delay_base_sec = _non_negative_int(
         arguments.get("retry_delay_base_sec", os.environ.get(SUBMIT_ARTIFACT_RETRY_DELAY_BASE_SEC_ENV, "1")),
         field_name="retry_delay_base_sec",
@@ -270,21 +315,43 @@ def _submit_artifacts(arguments: dict[str, Any]) -> dict[str, Any]:
     submitted_artifacts: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
 
+    LOGGER.debug(
+        "submit_artifact queued=%d paths; max_attempts=%s retry_base_sec=%s retry_max_sec=%s",
+        len(upload_paths),
+        max_attempts,
+        retry_delay_base_sec,
+        retry_delay_max_sec,
+    )
+
     for path in upload_paths:
         per_file_name = submitted_name if len(upload_paths) == 1 else ""
         last_error = ""
         for attempt in range(1, max_attempts + 1):
             try:
+                LOGGER.debug("submit_artifact attempt=%s/%s path=%s", attempt, max_attempts, path)
                 artifact_payload = _submit_artifact_path(path, name=per_file_name)
+                LOGGER.info("submit_artifact succeeded path=%s attempt=%s/%s", path, attempt, max_attempts)
                 submitted_artifacts.append(artifact_payload)
                 last_error = ""
                 break
             except Exception as exc:  # pragma: no cover - error branches are tested via higher-level outcomes.
                 last_error = str(exc)
+                LOGGER.warning(
+                    "submit_artifact attempt=%s/%s failed for path=%s: %s",
+                    attempt,
+                    max_attempts,
+                    path,
+                    last_error,
+                )
                 if attempt >= max_attempts:
                     break
                 delay_seconds = _retry_delay_seconds(attempt, retry_delay_base_sec, retry_delay_max_sec)
                 if delay_seconds > 0:
+                    LOGGER.debug(
+                        "submit_artifact retry scheduled path=%s delay_seconds=%s",
+                        path,
+                        delay_seconds,
+                    )
                     time.sleep(delay_seconds)
 
         if last_error:
@@ -303,6 +370,8 @@ def _submit_artifacts(arguments: dict[str, Any]) -> dict[str, Any]:
         "failed_paths": [entry["path"] for entry in failures],
     }
     if failures:
+        failed_paths = [entry["path"] for entry in failures]
+        LOGGER.error("submit_artifact failed for %d/%d paths: %s", len(failures), len(upload_paths), failed_paths)
         failure_payload = json.dumps(
             {
                 "failed_count": len(failures),
