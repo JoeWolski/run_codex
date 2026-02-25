@@ -38,9 +38,9 @@ Do not introduce fallback implementation paths unless the user explicitly reques
 When a requested implementation fails, fail fast with a hard error.
 Log the exact failing command, input context, and root-cause evidence needed to reproduce the failure.
 Do not swallow, mask, or ignore errors with permissive operators (for example `|| true`) in critical setup or build flows.
-For git credentials, use the `agent_tools` MCP tools instead of asking users for resource-owner names or token ordering.
-If a project does not yet have attached credential binding, perform a one-time auth check:
-1) call `credentials_list`,
-2) call `credentials_resolve` with mode `auto` or `single` as needed for the current task,
+For git credentials, use the `agent_tools` MCP tools if credential-related errors are encountered.
+When a clone, push/pull, or PR operation fails for authentication or authorization reasons, resolve credentials as a targeted remediation:
+1) call `credentials_list` to inspect available credentials for the active repository context;
+2) call `credentials_resolve` with mode `auto` or `single` as needed for the current task;
 3) once a working credential set is confirmed, call `project_attach_credentials` so future chats reuse it automatically.
 If no credentials are available from `agent_tools`, explicitly report the missing credential requirement to the hub/user and continue without hidden fallback behavior.

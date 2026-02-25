@@ -5067,6 +5067,39 @@ class HubState:
                     )
         return contexts
 
+    def _auto_discover_project_credential_binding(
+        self,
+        repo_url: str,
+        credential_binding: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_binding = _normalize_project_credential_binding(credential_binding)
+        if (
+            normalized_binding["mode"] != PROJECT_CREDENTIAL_BINDING_MODE_AUTO
+            or normalized_binding["credential_ids"]
+        ):
+            return normalized_binding
+
+        normalized_repo_url = str(repo_url or "").strip()
+        if not normalized_repo_url:
+            return normalized_binding
+
+        discovered_ids = self._resolve_agent_tools_credential_ids(
+            {"repo_url": normalized_repo_url, "credential_binding": normalized_binding},
+            PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
+            [],
+        )
+        if not discovered_ids:
+            return normalized_binding
+
+        return _normalize_project_credential_binding(
+            {
+                "mode": PROJECT_CREDENTIAL_BINDING_MODE_SET,
+                "credential_ids": discovered_ids,
+                "source": normalized_binding["source"] or "auto_create",
+                "updated_at": _iso_now(),
+            }
+        )
+
     def _github_repo_auth_context(
         self,
         repo_url: str,
@@ -8209,7 +8242,10 @@ class HubState:
         state = self.load()
         project_id = uuid.uuid4().hex
         project_name = name or _extract_repo_name(repo_url)
-        normalized_binding = _normalize_project_credential_binding(credential_binding)
+        normalized_binding = self._auto_discover_project_credential_binding(
+            repo_url,
+            credential_binding=credential_binding,
+        )
         resolved_default_branch = str(default_branch or "").strip()
         if not resolved_default_branch:
             git_env = self._github_git_env_for_repo(
