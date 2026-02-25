@@ -6352,7 +6352,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
             self.assertIn(
-                f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.gemini/config.json:ro",
+                f"{runtime_config}:{image_cli.DEFAULT_CONTAINER_HOME}/.gemini/settings.json:ro",
                 run_cmd,
             )
             self.assertTrue(fake_bridge.closed)

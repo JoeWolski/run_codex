@@ -261,7 +261,7 @@ class GeminiProvider(AgentProvider):
         return f"if {resolved} --resume; then :; else exec {resolved}; fi"
 
     def get_mcp_config_mount_target(self, container_home: str) -> str:
-        return f"{container_home}/.gemini/config.json"
+        return f"{container_home}/.gemini/settings.json"
 
     def build_mcp_config(
         self,
