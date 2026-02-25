@@ -61,6 +61,18 @@ def _prepare_git_credentials() -> None:
                 pass
 
 
+def _ensure_workspace_tmp(*, workspace_tmp: Path | None = None) -> None:
+    target = workspace_tmp or Path("/workspace/tmp")
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        target.chmod(0o777)
+    except OSError as exc:
+        raise RuntimeError(
+            "Workspace tmp bootstrap failed: "
+            f"path={str(target)!r} unable to initialize with mode 0777 ({exc})"
+        ) from exc
+
+
 def _set_umask() -> None:
     local_umask = os.environ.get("LOCAL_UMASK", "0022")
     if local_umask and len(local_umask) in (3, 4) and local_umask.isdigit():
@@ -138,6 +150,7 @@ def _entrypoint_main() -> None:
     if command and Path(command[0]).name == "claude":
         _ensure_claude_json_file(Path(os.environ["HOME"]) / ".claude.json")
 
+    _ensure_workspace_tmp()
     _set_umask()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _prepare_git_credentials()

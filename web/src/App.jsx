@@ -2630,15 +2630,6 @@ function HubApp() {
       setError("Repo URL is required before auto configure.");
       return;
     }
-    let fallbackMounts;
-    let fallbackEnvVars;
-    try {
-      fallbackMounts = buildMountPayload(formSnapshot.defaultVolumes);
-      fallbackEnvVars = buildEnvPayload(formSnapshot.defaultEnvVars);
-    } catch (err) {
-      setError(err.message || String(err));
-      return;
-    }
     const resolvedAutoConfigStartSettings = normalizeChatStartSettings(
       autoConfigChatStartSettings || autoConfigStartSettingsRef.current,
       agentCapabilitiesRef.current,
@@ -2688,18 +2679,9 @@ function HubApp() {
         base_image_value: String(recommendation.base_image_value || formSnapshot.baseImageValue || ""),
         setup_script: String(recommendation.setup_script || formSnapshot.setupScript || ""),
         credential_binding: recommendation.credential_binding || undefined,
-        default_ro_mounts: normalizeStringArray(
-          recommendation.default_ro_mounts,
-          fallbackMounts.roMounts
-        ),
-        default_rw_mounts: normalizeStringArray(
-          recommendation.default_rw_mounts,
-          fallbackMounts.rwMounts
-        ),
-        default_env_vars: normalizeStringArray(
-          recommendation.default_env_vars,
-          fallbackEnvVars
-        )
+        default_ro_mounts: normalizeStringArray(recommendation.default_ro_mounts),
+        default_rw_mounts: normalizeStringArray(recommendation.default_rw_mounts),
+        default_env_vars: normalizeStringArray(recommendation.default_env_vars)
       };
       const createProjectResponse = await fetchJson("/api/projects", {
         method: "POST",

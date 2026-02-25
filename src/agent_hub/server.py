@@ -5976,7 +5976,28 @@ class HubState:
             return True
         return normalized.endswith("/docker.sock")
 
-    def _normalize_auto_config_mounts(self, entries: list[str], direction: str) -> list[str]:
+    @staticmethod
+    def _is_auto_config_container_workspace_mount(
+        container_path: str,
+        reserved_container_workspace: str | None = None,
+    ) -> bool:
+        normalized_container = HubState._normalize_auto_config_mount_path(container_path)
+        if not normalized_container:
+            return False
+        normalized_workspace = HubState._normalize_auto_config_mount_path(reserved_container_workspace or "")
+        if not normalized_workspace or normalized_workspace == "/":
+            return False
+        if normalized_container == normalized_workspace:
+            return True
+        return normalized_container.startswith(f"{normalized_workspace}/")
+
+    def _normalize_auto_config_mounts(
+        self,
+        entries: list[str],
+        direction: str,
+        *,
+        reserved_container_workspace: str | None = None,
+    ) -> list[str]:
         normalized_entries: list[str] = []
         home_root = Path.home().resolve()
         for raw_entry in entries:
@@ -6011,10 +6032,20 @@ class HubState:
                         host_path = host_path_resolved
                     except OSError:
                         pass
+            if self._is_auto_config_container_workspace_mount(
+                container,
+                reserved_container_workspace=reserved_container_workspace,
+            ):
+                continue
             normalized_entries.append(f"{host_path}:{container}")
         return _parse_mounts(normalized_entries, direction)
 
-    def _normalize_auto_config_recommendation(self, raw_payload: dict[str, Any], workspace: Path) -> dict[str, Any]:
+    def _normalize_auto_config_recommendation(
+        self,
+        raw_payload: dict[str, Any],
+        workspace: Path,
+        project_container_workspace: str | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(raw_payload, dict):
             raise HTTPException(status_code=400, detail="Auto-config output must be a JSON object.")
 
@@ -6033,10 +6064,12 @@ class HubState:
         default_ro_mounts = self._normalize_auto_config_mounts(
             _empty_list(raw_payload.get("default_ro_mounts")),
             "default read-only mount",
+            reserved_container_workspace=project_container_workspace,
         )
         default_rw_mounts = self._normalize_auto_config_mounts(
             _empty_list(raw_payload.get("default_rw_mounts")),
             "default read-write mount",
+            reserved_container_workspace=project_container_workspace,
         )
         default_rw_mounts = self._augment_auto_config_cache_mounts(workspace, default_rw_mounts)
         default_env_vars = _parse_env_vars(_empty_list(raw_payload.get("default_env_vars")))
@@ -6744,9 +6777,20 @@ class HubState:
                     on_output=emit_auto_config_log if normalized_request_id else None,
                     request_id=normalized_request_id,
                 )
-                recommendation = self._normalize_auto_config_recommendation(chat_result.get("payload") or {}, workspace)
+                container_workspace = self._container_workspace_path_for_project(
+                    _extract_repo_name(normalized_repo_url) or "auto-config"
+                )
+                recommendation = self._normalize_auto_config_recommendation(
+                    chat_result.get("payload") or {},
+                    workspace,
+                    project_container_workspace=container_workspace,
+                )
                 recommendation = self._apply_auto_config_repository_hints(recommendation, workspace)
-                recommendation = self._normalize_auto_config_recommendation(recommendation, workspace)
+                recommendation = self._normalize_auto_config_recommendation(
+                    recommendation,
+                    workspace,
+                    project_container_workspace=container_workspace,
+                )
                 emit_auto_config_log("Auto-config recommendation discovery completed.\n")
         except HTTPException as exc:
             detail = str(exc.detail or f"HTTP {exc.status_code}")
