@@ -5336,6 +5336,32 @@ class HubState:
         if not discovered_ids:
             return normalized_binding
 
+        # Verify each discovered credential can actually access this specific repo,
+        # not just the host. Tokens may be scoped to certain repositories.
+        discovered_id_set = set(discovered_ids)
+        stub_project: dict[str, Any] = {"repo_url": normalized_repo_url, "credential_binding": normalized_binding}
+        all_contexts = self._github_repo_all_auth_contexts(normalized_repo_url, project=stub_project)
+        candidate_contexts = [
+            ctx for ctx in all_contexts
+            if str(ctx[2].get("credential_id") or "").strip() in discovered_id_set
+        ]
+        if candidate_contexts:
+            verified_contexts = self._verify_repo_access_for_contexts(
+                normalized_repo_url,
+                candidate_contexts,
+                context_key="auto-discover",
+            )
+            if verified_contexts:
+                verified_id_set = set(
+                    str(ctx[2].get("credential_id") or "").strip()
+                    for ctx in verified_contexts
+                )
+                # Preserve original ordering, keep only verified
+                discovered_ids = [cid for cid in discovered_ids if cid in verified_id_set]
+
+        if not discovered_ids:
+            return normalized_binding
+
         return _normalize_project_credential_binding(
             {
                 "mode": PROJECT_CREDENTIAL_BINDING_MODE_SET,
@@ -5414,19 +5440,17 @@ class HubState:
         except HTTPException:
             return GIT_CREDENTIAL_DEFAULT_SCHEME
 
-    def _ordered_repo_auth_contexts_for_git(
+    def _verify_repo_access_for_contexts(
         self,
         repo_url: str,
         contexts: list[tuple[str, str, dict[str, Any]]],
         *,
         context_key: str = "",
     ) -> list[tuple[str, str, dict[str, Any]]]:
-        if len(contexts) <= 1:
-            return contexts
-
+        """Probe each credential context with ``git ls-remote`` and return only those that can access *repo_url*."""
         normalized_repo_url = str(repo_url or "").strip()
-        if not normalized_repo_url:
-            return contexts
+        if not normalized_repo_url or not contexts:
+            return []
 
         normalized_context_key = str(context_key or "").strip()
         if normalized_context_key:
@@ -5435,8 +5459,7 @@ class HubState:
             repo_digest = hashlib.sha256(normalized_repo_url.encode("utf-8")).hexdigest()[:12]
             probe_prefix = f"repo-auth-probe:{repo_digest}"
 
-        verified_contexts: list[tuple[str, str, dict[str, Any]]] = []
-        unverified_contexts: list[tuple[str, str, dict[str, Any]]] = []
+        verified: list[tuple[str, str, dict[str, Any]]] = []
         for index, context in enumerate(contexts):
             mode, host, auth_payload = context
             credential_id = str(auth_payload.get("credential_id") or "").strip() or f"{mode}:{host}:{index}"
@@ -5448,10 +5471,8 @@ class HubState:
                     context_key=probe_context_key,
                 )
             except HTTPException:
-                unverified_contexts.append(context)
                 continue
             if not credentials_file:
-                unverified_contexts.append(context)
                 continue
 
             probe_env = self._git_env_for_credentials_file(
@@ -5466,13 +5487,29 @@ class HubState:
                 env=probe_env,
             )
             if probe_result.returncode == 0:
-                verified_contexts.append(context)
-            else:
-                unverified_contexts.append(context)
+                verified.append(context)
 
-        if verified_contexts:
-            return [*verified_contexts, *unverified_contexts]
-        return contexts
+        return verified
+
+    def _ordered_repo_auth_contexts_for_git(
+        self,
+        repo_url: str,
+        contexts: list[tuple[str, str, dict[str, Any]]],
+        *,
+        context_key: str = "",
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        if len(contexts) <= 1:
+            return contexts
+
+        verified = self._verify_repo_access_for_contexts(
+            repo_url, contexts, context_key=context_key,
+        )
+        if not verified:
+            return contexts
+
+        verified_set = set(id(ctx) for ctx in verified)
+        unverified = [ctx for ctx in contexts if id(ctx) not in verified_set]
+        return [*verified, *unverified]
 
     def _github_git_env_for_repo(
         self,
