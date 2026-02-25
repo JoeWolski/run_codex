@@ -45,7 +45,7 @@ RUN if ! id -u agent >/dev/null 2>&1; then \
  && chmod 1777 /tmp \
  && mkdir -p /workspace/.cache/uv /workspace/.codex /workspace/.config /workspace/tmp \
  && chmod 777 /workspace/tmp \
- && chmod -R 0777 /workspace
+ && chmod -R 777 /workspace
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 COPY docker/agent_cli/hub_artifact /usr/local/bin/hub_artifact

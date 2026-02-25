@@ -65,7 +65,6 @@ def _ensure_workspace_tmp(*, workspace_tmp: Path | None = None) -> None:
     target = workspace_tmp or Path("/workspace/tmp")
     try:
         target.mkdir(parents=True, exist_ok=True)
-        target.chmod(0o777)
     except OSError as exc:
         raise RuntimeError(
             "Workspace tmp bootstrap failed: "
