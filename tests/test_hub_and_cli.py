@@ -5982,6 +5982,7 @@ class CliEnvVarTests(unittest.TestCase):
         content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
 
         self.assertIn("/workspace/.config", content)
+        self.assertIn("/workspace/tmp", content)
         self.assertLess(
             content.index("/workspace/.config"),
             content.index("chmod -R 0777 /workspace"),
@@ -6147,6 +6148,17 @@ class CliEnvVarTests(unittest.TestCase):
     def test_parse_env_var_invalid(self) -> None:
         with self.assertRaises(Exception):
             image_cli._parse_env_var("NO_EQUALS", "--env-var")
+
+    def test_snapshot_setup_script_prepares_workspace_tmp(self) -> None:
+        script = image_cli._build_snapshot_setup_shell_script("echo hello")
+
+        self.assertIn("snapshot bootstrap: preparing writable /workspace/tmp", script)
+        self.assertIn("mkdir -p /workspace/tmp", script)
+        self.assertIn("chmod 777 /workspace/tmp", script)
+        self.assertLess(
+            script.index("mkdir -p /workspace/tmp"),
+            script.index("printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'"),
+        )
 
     def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9048,6 +9060,8 @@ class DockerEntrypointTests(unittest.TestCase):
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
+            module, "_ensure_workspace_tmp", return_value=None
+        ) as ensure_workspace_tmp, patch.object(
             module, "_prepare_git_credentials", return_value=None
         ) as prepare_credentials, patch.object(
             module, "_configure_git_identity", return_value=None
@@ -9057,6 +9071,7 @@ class DockerEntrypointTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 module._entrypoint_main()
 
+        ensure_workspace_tmp.assert_called_once_with()
         prepare_credentials.assert_called_once_with()
         configure_git.assert_called_once_with()
         execvp.assert_called_once_with("codex", ["codex"])
@@ -9073,6 +9088,8 @@ class DockerEntrypointTests(unittest.TestCase):
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "bash", "-lc", "echo ok"]), patch.object(
+            module, "_ensure_workspace_tmp", return_value=None
+        ) as ensure_workspace_tmp, patch.object(
             module, "_prepare_git_credentials", return_value=None
         ), patch.object(
             module, "_configure_git_identity", return_value=None
@@ -9085,6 +9102,7 @@ class DockerEntrypointTests(unittest.TestCase):
 
         self.assertEqual(observed_home, "/tmp/entrypoint-local-home")
         execvp.assert_called_once_with("bash", ["bash", "-lc", "echo ok"])
+        ensure_workspace_tmp.assert_called_once_with()
 
     def test_entrypoint_main_bootstraps_claude_native_command_path(self) -> None:
         module = self._load_entrypoint_module()
@@ -9096,6 +9114,8 @@ class DockerEntrypointTests(unittest.TestCase):
             },
             clear=False,
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "claude", "--help"]), patch.object(
+            module, "_ensure_workspace_tmp", return_value=None
+        ) as ensure_workspace_tmp, patch.object(
             module, "_ensure_claude_native_command_path", return_value=None
         ) as ensure_claude_native_path, patch.object(
             module, "_prepare_git_credentials", return_value=None
@@ -9107,11 +9127,22 @@ class DockerEntrypointTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 module._entrypoint_main()
 
+        ensure_workspace_tmp.assert_called_once_with()
         ensure_claude_native_path.assert_called_once_with(
             command=["claude", "--help"],
             home="/tmp/entrypoint-home",
         )
         execvp.assert_called_once_with("claude", ["claude", "--help"])
+
+    def test_entrypoint_ensure_workspace_tmp(self) -> None:
+        module = self._load_entrypoint_module()
+        with self._temporary_exec_dir() as tmp:
+            workspace_tmp = Path(tmp) / "workspace" / "tmp"
+
+            module._ensure_workspace_tmp(workspace_tmp=workspace_tmp)
+
+            self.assertTrue(workspace_tmp.is_dir())
+            self.assertEqual(workspace_tmp.stat().st_mode & 0o777, 0o777)
 
 
 if __name__ == "__main__":
