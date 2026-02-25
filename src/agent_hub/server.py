@@ -4651,6 +4651,19 @@ class HubState:
         tokens = self._personal_access_tokens_for_repo(repo_url, credential_binding=credential_binding)
         return tokens[0] if tokens else None
 
+    def _github_personal_access_token_for_repo(
+        self,
+        repo_url: str,
+        credential_binding: dict[str, Any] | None = None,
+    ) -> str:
+        token_record = self._personal_access_token_for_repo(repo_url, credential_binding=credential_binding)
+        if (
+            token_record is None
+            or str(token_record.get("provider") or "").strip().lower() != GIT_PROVIDER_GITHUB
+        ):
+            return ""
+        return str(token_record.get("personal_access_token") or "").strip()
+
     def _github_connected_personal_access_tokens(self) -> list[dict[str, Any]]:
         return self._connected_personal_access_tokens(GIT_PROVIDER_GITHUB)
 
@@ -8320,6 +8333,14 @@ class HubState:
             repo_url,
             credential_binding=credential_binding,
         )
+        normalized_env_vars = self._dedupe_entries(default_env_vars or [])
+        if not any(
+            str(entry).split("=", 1)[0].strip().upper() == "GH_TOKEN"
+            for entry in normalized_env_vars
+        ):
+            gh_token = self._github_personal_access_token_for_repo(repo_url, credential_binding=normalized_binding)
+            if gh_token:
+                normalized_env_vars.append(f"GH_TOKEN={gh_token}")
         resolved_default_branch = str(default_branch or "").strip()
         if not resolved_default_branch:
             git_env = self._github_git_env_for_repo(
@@ -8336,7 +8357,7 @@ class HubState:
             "base_image_value": (base_image_value or "").strip(),
             "default_ro_mounts": default_ro_mounts or [],
             "default_rw_mounts": default_rw_mounts or [],
-            "default_env_vars": default_env_vars or [],
+            "default_env_vars": normalized_env_vars,
             "default_branch": resolved_default_branch,
             "created_at": _iso_now(),
             "updated_at": _iso_now(),

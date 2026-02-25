@@ -218,6 +218,25 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(binding["source"], "auto_create")
         self.assertIsInstance(binding["updated_at"], str)
 
+    def test_project_creation_auto_discovers_github_pat_and_adds_gh_token_env_var(self) -> None:
+        self._connect_github_pat()
+        project = self.state.add_project(
+            repo_url="https://github.com/org/robotics-repo.git",
+            default_branch="main",
+        )
+        self.assertEqual(project["default_env_vars"], [f"GH_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}"])
+
+    def test_project_creation_preserves_explicit_gh_token_env_var(self) -> None:
+        self._connect_github_pat()
+        project = self.state.add_project(
+            repo_url="https://github.com/org/robotics-repo.git",
+            default_branch="main",
+            default_env_vars=["GH_TOKEN=manual-token", "FOO=bar"],
+        )
+        self.assertIn("GH_TOKEN=manual-token", project["default_env_vars"])
+        self.assertNotIn(f"GH_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}", project["default_env_vars"])
+        self.assertIn("FOO=bar", project["default_env_vars"])
+
     def test_project_creation_auto_discovers_gitlab_credential_binding(self) -> None:
         self._connect_gitlab_pat()
         project = self.state.add_project(
@@ -237,6 +256,15 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(binding["credential_ids"], expected_ids)
         self.assertEqual(binding["source"], "auto_create")
         self.assertIsInstance(binding["updated_at"], str)
+
+    def test_project_creation_with_gitlab_auto_discovery_does_not_add_gh_token(self) -> None:
+        self._connect_gitlab_pat()
+        project = self.state.add_project(
+            repo_url="https://gitlab.com/org/robotics-repo.git",
+            default_branch="main",
+        )
+        self.assertEqual(project["default_env_vars"], [])
+        self.assertFalse(any(str(entry).startswith("GH_TOKEN=") for entry in project["default_env_vars"]))
 
     def test_project_setup_snapshot_tag_includes_runtime_input_fingerprint(self) -> None:
         project = self.state.add_project(
