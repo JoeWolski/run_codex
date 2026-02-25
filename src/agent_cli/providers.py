@@ -101,9 +101,6 @@ class CodexProvider(AgentProvider):
             if not has_cli_option(parsed_args, long_option="--sandbox", short_option="-s"):
                 flags.extend(["--sandbox", "danger-full-access"])
         
-        if not has_cli_option(parsed_args, long_option="--full-auto"):
-            flags.append("--full-auto")
-
         if shared_prompt_context and not has_codex_config_override(parsed_args, key="developer_instructions"):
             flags.extend(
                 [
