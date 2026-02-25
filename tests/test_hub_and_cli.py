@@ -202,6 +202,42 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(loaded["setup_snapshot_image"], self.state._project_setup_snapshot_tag(project))
         self.assertEqual(loaded["build_status"], "ready")
 
+    def test_project_creation_auto_discovers_credential_binding(self) -> None:
+        self._connect_github_pat()
+        project = self.state.add_project(
+            repo_url="https://github.com/org/robotics-repo.git",
+            default_branch="main",
+        )
+        binding = project.get("credential_binding")
+        self.assertIsInstance(binding, dict)
+        assert isinstance(binding, dict)
+        catalog = self.state._credential_catalog()
+        expected_ids = [entry.get("credential_id") for entry in catalog if str(entry.get("kind") or "") == "personal_access_token"]
+        self.assertEqual(binding["mode"], "set")
+        self.assertEqual(binding["credential_ids"], expected_ids)
+        self.assertEqual(binding["source"], "auto_create")
+        self.assertIsInstance(binding["updated_at"], str)
+
+    def test_project_creation_auto_discovers_gitlab_credential_binding(self) -> None:
+        self._connect_gitlab_pat()
+        project = self.state.add_project(
+            repo_url="https://gitlab.com/org/robotics-repo.git",
+            default_branch="main",
+        )
+        binding = project.get("credential_binding")
+        self.assertIsInstance(binding, dict)
+        assert isinstance(binding, dict)
+        catalog = self.state._credential_catalog()
+        expected_ids = [
+            entry.get("credential_id")
+            for entry in catalog
+            if str(entry.get("kind") or "") == "personal_access_token" and str(entry.get("provider") or "") == "gitlab"
+        ]
+        self.assertEqual(binding["mode"], "set")
+        self.assertEqual(binding["credential_ids"], expected_ids)
+        self.assertEqual(binding["source"], "auto_create")
+        self.assertIsInstance(binding["updated_at"], str)
+
     def test_project_setup_snapshot_tag_includes_runtime_input_fingerprint(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -2452,6 +2488,63 @@ Gemini CLI
         self.assertIn("github.com", cmd)
         self.assertIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
         self.assertIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
+
+    def test_start_chat_passes_gitlab_pat_credentials_and_identity_when_configured(self) -> None:
+        self._connect_gitlab_pat()
+        project = self.state.add_project(
+            repo_url="https://gitlab.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4244
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState,
+            "_sync_checkout_to_remote",
+            lambda *args, **kwargs: None,
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertIn("--git-credential-file", cmd)
+        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
+        self.assertTrue(credential_path.exists())
+        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
+        self.assertIn("--git-credential-host", cmd)
+        self.assertIn("gitlab.com", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_NAME=GitLab User", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=gitlab-user@example.com", cmd)
 
     def test_start_chat_uses_configured_artifact_publish_base_url(self) -> None:
         self.state.artifact_publish_base_url = "http://172.17.0.4:8765/hub"
