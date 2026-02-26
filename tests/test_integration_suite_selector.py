@@ -26,6 +26,7 @@ class IntegrationSuiteSelectorTests(unittest.TestCase):
         suites = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         self.assertIn("tests/integration/test_agent_tools_ack_routes.py", suites)
         self.assertIn("tests/integration/test_hub_chat_lifecycle_api.py", suites)
+        self.assertIn("tests/integration/test_provider_local_e2e.py", suites)
 
     def test_selector_returns_default_suite_when_no_changes(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
