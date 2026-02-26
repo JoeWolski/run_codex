@@ -9149,14 +9149,17 @@ class HubState:
         self._emit_state_changed(reason="project_credential_binding_updated")
         return self.project_credential_binding_payload(project_id)
 
+    def _start_project_build_thread_locked(self, project_id: str) -> None:
+        thread = self._project_build_threads.get(project_id)
+        if thread and thread.is_alive():
+            return
+        thread = Thread(target=self._project_build_worker, args=(project_id,), daemon=True)
+        self._project_build_threads[project_id] = thread
+        thread.start()
+
     def _schedule_project_build(self, project_id: str) -> None:
         with self._project_build_lock:
-            thread = self._project_build_threads.get(project_id)
-            if thread and thread.is_alive():
-                return
-            thread = Thread(target=self._project_build_worker, args=(project_id,), daemon=True)
-            self._project_build_threads[project_id] = thread
-            thread.start()
+            self._start_project_build_thread_locked(project_id)
 
     def _project_build_worker(self, project_id: str) -> None:
         try:
@@ -9192,6 +9195,10 @@ class HubState:
                 existing = self._project_build_threads.get(project_id)
                 if existing is not None and existing.ident == current_thread().ident:
                     self._project_build_threads.pop(project_id, None)
+                    state = self.load()
+                    project = state["projects"].get(project_id)
+                    if project is not None and str(project.get("build_status") or "") in {"pending", "building"}:
+                        self._start_project_build_thread_locked(project_id)
 
     def _build_project_snapshot(self, project_id: str) -> dict[str, Any]:
         state = self.load()
@@ -9236,6 +9243,27 @@ class HubState:
         current = state["projects"].get(project_id)
         if current is None:
             raise HTTPException(status_code=404, detail="Project not found.")
+        current_candidate = dict(current)
+        current_candidate["repo_head_sha"] = project_copy.get("repo_head_sha") or ""
+        expected_snapshot = self._project_setup_snapshot_tag(current_candidate)
+        if snapshot_tag != expected_snapshot:
+            current["setup_snapshot_image"] = ""
+            current["repo_head_sha"] = ""
+            current.pop("snapshot_updated_at", None)
+            current["build_status"] = "pending"
+            current["build_error"] = ""
+            current["build_started_at"] = ""
+            current["build_finished_at"] = ""
+            current["updated_at"] = _iso_now()
+            state["projects"][project_id] = current
+            self.save(state, reason="project_build_superseded")
+            LOGGER.debug(
+                "Project build output superseded for project=%s built=%s expected=%s; keeping project pending",
+                project_id,
+                snapshot_tag,
+                expected_snapshot,
+            )
+            return current
         current["setup_snapshot_image"] = snapshot_tag
         current["repo_head_sha"] = project_copy.get("repo_head_sha") or ""
         current["snapshot_updated_at"] = _iso_now()

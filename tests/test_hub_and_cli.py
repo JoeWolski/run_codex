@@ -3713,6 +3713,109 @@ Gemini CLI
         self.assertEqual(refreshed["build_status"], "failed")
         self.assertEqual(refreshed["build_error"], "Command failed (uv) with exit code 1")
 
+    def test_build_project_snapshot_keeps_pending_when_inputs_change_mid_build(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://github.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo original",
+            base_image_mode="repo_path",
+            base_image_value="docker/base",
+        )
+        built_snapshots: list[str] = []
+
+        def snapshot_with_mid_build_update(project_copy: dict[str, object], **_kwargs) -> str:
+            project_copy["repo_head_sha"] = "head-for-original-inputs"
+            built_snapshot = self.state._project_setup_snapshot_tag(project_copy)
+            built_snapshots.append(built_snapshot)
+
+            state_data = self.state.load()
+            updated = dict(state_data["projects"][project["id"]])
+            updated["setup_script"] = "echo refreshed"
+            updated["setup_snapshot_image"] = ""
+            updated["repo_head_sha"] = ""
+            updated["build_status"] = "pending"
+            updated["build_error"] = ""
+            updated["build_started_at"] = ""
+            updated["build_finished_at"] = ""
+            updated["updated_at"] = hub_server._iso_now()
+            state_data["projects"][project["id"]] = updated
+            self.state.save(state_data, reason="test_project_inputs_changed_during_build")
+            return built_snapshot
+
+        with patch.object(
+            hub_server.HubState,
+            "_prepare_project_snapshot_for_project",
+            side_effect=snapshot_with_mid_build_update,
+        ):
+            result = self.state._build_project_snapshot(project["id"])
+
+        refreshed = self.state.load()["projects"][project["id"]]
+        self.assertEqual(len(built_snapshots), 1)
+        self.assertEqual(result["build_status"], "pending")
+        self.assertEqual(refreshed["build_status"], "pending")
+        self.assertEqual(refreshed["setup_snapshot_image"], "")
+        self.assertEqual(refreshed["repo_head_sha"], "")
+        self.assertEqual(refreshed["build_error"], "")
+        self.assertEqual(refreshed["build_started_at"], "")
+        self.assertEqual(refreshed["build_finished_at"], "")
+        self.assertNotEqual(refreshed["setup_snapshot_image"], built_snapshots[0])
+
+    def test_project_build_worker_restarts_when_pending_update_appears_during_shutdown(self) -> None:
+        project_id = "project-race"
+        expected_snapshot = "agent-hub-setup-project-race-expected"
+        pending_project = {
+            "id": project_id,
+            "build_status": "pending",
+            "setup_snapshot_image": "",
+        }
+        ready_project = {
+            **pending_project,
+            "build_status": "ready",
+            "setup_snapshot_image": expected_snapshot,
+        }
+        late_pending_project = dict(pending_project)
+
+        load_sequence = [
+            {"projects": {project_id: dict(pending_project)}},
+            {"projects": {project_id: dict(ready_project)}},
+            {"projects": {project_id: dict(late_pending_project)}},
+        ]
+
+        def fake_load() -> dict[str, object]:
+            if load_sequence:
+                return load_sequence.pop(0)
+            return {"projects": {project_id: dict(late_pending_project)}}
+
+        started_threads: list[tuple[object, tuple[str]]] = []
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs) -> None:
+                self.ident = 99999
+                self._target = kwargs.get("target")
+                self._args = tuple(kwargs.get("args") or ())
+
+            def is_alive(self) -> bool:
+                return False
+
+            def start(self) -> None:
+                started_threads.append((self._target, self._args))
+
+        with patch.object(self.state, "load", side_effect=fake_load), patch.object(
+            self.state, "_build_project_snapshot", return_value={"build_status": "ready"}
+        ) as build_snapshot, patch.object(
+            self.state, "_project_setup_snapshot_tag", return_value=expected_snapshot
+        ), patch("agent_hub.server._docker_image_exists", return_value=True), patch(
+            "agent_hub.server.Thread",
+            FakeThread,
+        ):
+            self.state._project_build_threads[project_id] = threading.current_thread()
+            self.state._project_build_worker(project_id)
+
+        build_snapshot.assert_called_once_with(project_id)
+        self.assertEqual(len(started_threads), 1)
+        self.assertEqual(started_threads[0][1], (project_id,))
+        self.assertIn(project_id, self.state._project_build_threads)
+
     def test_run_logged_records_exit_status_in_build_log(self) -> None:
         class FakeProcess:
             def __init__(self, lines: list[str], returncode: int) -> None:
