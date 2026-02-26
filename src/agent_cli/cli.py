@@ -27,7 +27,9 @@ import click
 from agent_cli import providers as agent_providers
 
 
-DEFAULT_BASE_IMAGE = "ubuntu:24.04"
+DEFAULT_AGENT_CLI_BASE_DOCKERFILE = "docker/agent_cli/Dockerfile.base"
+AGENT_CLI_BASE_IMAGE = "agent-cli-base"
+DEFAULT_BASE_IMAGE = AGENT_CLI_BASE_IMAGE
 DEFAULT_SETUP_RUNTIME_IMAGE = "agent-ubuntu2204-setup:latest"
 DEFAULT_RUNTIME_IMAGE = "agent-ubuntu2204-codex:latest"
 CLAUDE_RUNTIME_IMAGE = "agent-ubuntu2204-claude:latest"
@@ -1258,12 +1260,36 @@ def _build_runtime_image(
     )
 
 
+def _ensure_agent_cli_base_image_built() -> None:
+    if _docker_image_exists(AGENT_CLI_BASE_IMAGE):
+        return
+    with _runtime_image_build_lock(AGENT_CLI_BASE_IMAGE):
+        if _docker_image_exists(AGENT_CLI_BASE_IMAGE):
+            return
+        click.echo(f"Building base image '{AGENT_CLI_BASE_IMAGE}' from {DEFAULT_AGENT_CLI_BASE_DOCKERFILE}")
+        _run(
+            [
+                "docker",
+                "build",
+                "-f",
+                str(_repo_root() / DEFAULT_AGENT_CLI_BASE_DOCKERFILE),
+                "-t",
+                AGENT_CLI_BASE_IMAGE,
+                str(_repo_root()),
+            ],
+            cwd=_repo_root(),
+        )
+
+
 def _ensure_runtime_image_built_if_missing(
     *,
     base_image: str,
     target_image: str,
     agent_provider: str,
 ) -> None:
+    if base_image == AGENT_CLI_BASE_IMAGE:
+        _ensure_agent_cli_base_image_built()
+
     if _docker_image_exists(target_image):
         return
     with _runtime_image_build_lock(target_image):

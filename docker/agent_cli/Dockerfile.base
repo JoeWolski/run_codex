@@ -1,0 +1,38 @@
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+USER root
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/root
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    docker.io \
+    gh \
+    git \
+    less \
+    openssh-client \
+    python3 \
+    passwd \
+    sudo \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends nodejs \
+ && npm cache clean --force \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN if ! id -u agent >/dev/null 2>&1; then \
+      useradd --home-dir /home/agent --create-home --shell /bin/bash agent; \
+    fi \
+ && agent_group="$(id -gn agent)" \
+ && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
+ && chown -R "agent:${agent_group}" /home/agent \
+ && mkdir -p /tmp \
+ && chmod 1777 /tmp \
+ && mkdir -p /workspace \
+ && chown agent:${agent_group} /workspace

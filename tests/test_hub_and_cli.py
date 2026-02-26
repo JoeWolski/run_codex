@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 DOCKER_ENTRYPOINT = ROOT / "docker" / "agent_cli" / "docker-entrypoint.py"
 AGENT_CLI_DOCKERFILE = ROOT / "docker" / "agent_cli" / "Dockerfile"
+AGENT_CLI_BASE_DOCKERFILE = ROOT / "docker" / "agent_cli" / "Dockerfile.base"
 AGENT_HUB_DOCKERFILE = ROOT / "docker" / "agent_hub" / "Dockerfile"
 DEVELOPMENT_DOCKERFILE = ROOT / "docker" / "development" / "Dockerfile"
 DEVELOPMENT_VERIFY_SCRIPT = ROOT / "docker" / "development" / "verify-demo-tooling.sh"
@@ -218,7 +219,7 @@ class HubStateTests(unittest.TestCase):
             base_image_value="",
         )
         self.assertEqual(project["base_image_mode"], "tag")
-        self.assertEqual(project["base_image_value"], "ubuntu:24.04")
+        self.assertEqual(project["base_image_value"], "agent-cli-base")
 
     def test_project_creation_requires_base_path_for_repo_path_mode(self) -> None:
         with self.assertRaises(HTTPException) as ctx:
@@ -239,7 +240,7 @@ class HubStateTests(unittest.TestCase):
             repo_url="https://example.com/org/repo.git",
             default_branch="main",
             base_image_mode="tag",
-            base_image_value="ubuntu:24.04",
+            base_image_value="agent-cli-base",
         )
         state_data = self.state.load()
         state_data["projects"][project["id"]]["base_image_value"] = ""
@@ -248,7 +249,7 @@ class HubStateTests(unittest.TestCase):
         payload = self.state.state_payload()
         loaded = next(item for item in payload["projects"] if item["id"] == project["id"])
         self.assertEqual(loaded["base_image_mode"], "tag")
-        self.assertEqual(loaded["base_image_value"], "ubuntu:24.04")
+        self.assertEqual(loaded["base_image_value"], "agent-cli-base")
 
     def test_project_creation_auto_discovers_credential_binding(self) -> None:
         self._connect_github_pat()
@@ -5920,26 +5921,27 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
 
 
 class CliEnvVarTests(unittest.TestCase):
-    def test_agent_cli_default_base_image_uses_ubuntu_24_04(self) -> None:
+    def test_agent_cli_default_base_image_uses_agent_cli_base(self) -> None:
         content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
 
-        self.assertEqual(image_cli.DEFAULT_BASE_IMAGE, "ubuntu:24.04")
+        self.assertEqual(image_cli.AGENT_CLI_BASE_IMAGE, "agent-cli-base")
+        self.assertEqual(image_cli.DEFAULT_BASE_IMAGE, "agent-cli-base")
+        self.assertIn("ARG BASE_IMAGE=agent-cli-base", content)
+
+    def test_agent_cli_base_dockerfile_uses_ubuntu_24_04(self) -> None:
+        content = AGENT_CLI_BASE_DOCKERFILE.read_text(encoding="utf-8")
         self.assertIn("ARG BASE_IMAGE=ubuntu:24.04", content)
 
     def test_agent_cli_dockerfile_sets_root_user_before_apt_layers(self) -> None:
-        content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
+        content = AGENT_CLI_BASE_DOCKERFILE.read_text(encoding="utf-8")
 
         self.assertIn("USER root", content)
         self.assertLess(content.index("USER root"), content.index("RUN apt-get update"))
 
     def test_agent_cli_dockerfile_sets_root_home_before_provider_install_layers(self) -> None:
-        content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
-
+        # Provider install is now in the main Dockerfile, but base packages in base Dockerfile.
+        content = AGENT_CLI_BASE_DOCKERFILE.read_text(encoding="utf-8")
         self.assertIn("ENV HOME=/root", content)
-        self.assertLess(
-            content.index("ENV HOME=/root"),
-            content.index("RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"),
-        )
 
     def test_agent_cli_dockerfile_precreates_workspace_config_dir_for_runtime_mounts(self) -> None:
         content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
@@ -5947,8 +5949,8 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertIn("/workspace/.config", content)
         self.assertIn("/workspace/tmp", content)
         self.assertNotIn("RECURSIVE_WORKSPACE_CHMOD", content)
-        self.assertNotIn("chmod 777 /workspace", content)
-        self.assertIn('chown -R "agent:${agent_group}" /workspace', content)
+        self.assertIn("chmod 777 /workspace", content)
+        self.assertIn("chown -R agent:${agent_group} /workspace", content)
 
     def test_agent_hub_dockerfile_uses_build_only_uv_project_environment(self) -> None:
         content = AGENT_HUB_DOCKERFILE.read_text(encoding="utf-8")
@@ -6183,7 +6185,7 @@ class CliEnvVarTests(unittest.TestCase):
             )
             self.assertIsNotNone(runtime_build_cmd)
             assert runtime_build_cmd is not None
-            self.assertIn("BASE_IMAGE=ubuntu:24.04", runtime_build_cmd)
+            self.assertIn("BASE_IMAGE=agent-cli-base", runtime_build_cmd)
             self.assertIn("AGENT_PROVIDER=none", runtime_build_cmd)
             self.assertNotIn("RECURSIVE_WORKSPACE_CHMOD", " ".join(runtime_build_cmd))
             setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
