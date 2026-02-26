@@ -1261,11 +1261,7 @@ def _build_runtime_image(
 
 
 def _ensure_agent_cli_base_image_built() -> None:
-    if _docker_image_exists(AGENT_CLI_BASE_IMAGE):
-        return
     with _runtime_image_build_lock(AGENT_CLI_BASE_IMAGE):
-        if _docker_image_exists(AGENT_CLI_BASE_IMAGE):
-            return
         click.echo(f"Building base image '{AGENT_CLI_BASE_IMAGE}' from {DEFAULT_AGENT_CLI_BASE_DOCKERFILE}")
         _run(
             [
@@ -1750,6 +1746,8 @@ def main(
             click.echo(f"Building base image '{tag}' from {resolved_dockerfile}")
             _run(["docker", "build", "-f", str(resolved_dockerfile), "-t", tag, str(resolved_context)])
             selected_base_image = tag
+        elif selected_base_image == AGENT_CLI_BASE_IMAGE:
+            _ensure_agent_cli_base_image_built()
 
         selected_base_image_resolved = True
         return selected_base_image

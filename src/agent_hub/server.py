@@ -315,9 +315,13 @@ AUTO_CONFIG_CACHE_SIGNAL_FILENAMES = {
 }
 SNAPSHOT_AGENT_CLI_RUNTIME_INPUT_FILES = (
     "docker/agent_cli/Dockerfile",
+    "docker/agent_cli/Dockerfile.base",
+    "docker/agent_hub/Dockerfile",
+    "docker/development/Dockerfile",
     "docker/agent_cli/docker-entrypoint.py",
     "src/agent_hub/agent_tools_mcp.py",
     "src/agent_cli/cli.py",
+    "src/agent_cli/providers.py",
 )
 ARTIFACT_STORAGE_DIR_NAME = "artifacts"
 ARTIFACT_STORAGE_CHAT_DIR_NAME = "chats"

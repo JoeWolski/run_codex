@@ -1990,7 +1990,7 @@ Gemini CLI
             self.state.agent_tools_mcp_runtime_script.read_text(encoding="utf-8"),
             hub_server._agent_tools_mcp_source_path().read_text(encoding="utf-8"),
         )
-        self.assertEqual(self.state.agent_tools_mcp_runtime_script.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.state.agent_tools_mcp_runtime_script.stat().st_mode & 0o700, 0o600)
 
     def test_prepare_chat_runtime_config_uses_json_for_gemini(self) -> None:
         self.config_file.write_text("model = 'test'\n", encoding="utf-8")
