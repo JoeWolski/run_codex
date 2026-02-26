@@ -1132,6 +1132,7 @@ def _build_snapshot_setup_shell_script(setup_script: str) -> str:
         "set -o pipefail\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: preparing writable /workspace/tmp'\n"
         "mkdir -p /workspace/tmp\n"
+        "chmod 777 /workspace/tmp\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: configuring git safe.directory'\n"
         "git config --global --add safe.directory '*'\n"
         'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ]; then\n'
