@@ -41,6 +41,7 @@ SUITE_MAP: list[tuple[str, list[str], list[str]]] = [
             "tests/integration/test_hub_chat_lifecycle_api.py",
             "tests/integration/test_hub_api_real_process.py",
             "tests/integration/test_provider_local_e2e.py",
+            "tests/integration/test_provider_local_api_real_process.py",
             "tests/integration/test_agent_matrix.py",
             "tests/integration/test_snapshot_builds.py",
         ],

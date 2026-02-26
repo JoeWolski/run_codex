@@ -11,6 +11,7 @@ def insert_ready_project(
     project_id: str = "project-1",
     name: str = "project",
     repo_url: str = "https://example.test/repo.git",
+    default_branch: str = "main",
     setup_script: str = "",
 ) -> dict[str, Any]:
     now = hub_server._iso_now()
@@ -24,7 +25,7 @@ def insert_ready_project(
         "default_ro_mounts": [],
         "default_rw_mounts": [],
         "default_env_vars": [],
-        "default_branch": "main",
+        "default_branch": str(default_branch or "main"),
         "created_at": now,
         "updated_at": now,
         "setup_snapshot_image": "snapshot:test",
