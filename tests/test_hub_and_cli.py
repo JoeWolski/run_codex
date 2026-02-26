@@ -5495,6 +5495,47 @@ Gemini CLI
             {"request_id": request_id, "cancelled": False, "active": False},
         )
 
+    def test_cancel_project_build_marks_project_cancelled_with_active_process(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        state_data = self.state.load()
+        state_data["projects"][project["id"]]["build_status"] = "building"
+        state_data["projects"][project["id"]]["build_error"] = ""
+        self.state.save(state_data)
+
+        fake_process = SimpleNamespace(pid=22345, stdout=None)
+        self.state._register_project_build_request(project["id"])
+        self.state._set_project_build_request_process(project["id"], fake_process)
+
+        with patch("agent_hub.server._is_process_running", return_value=True), patch(
+            "agent_hub.server._stop_process"
+        ) as stop_process:
+            result = self.state.cancel_project_build(project["id"])
+
+        self.assertEqual(
+            result,
+            {"project_id": project["id"], "cancelled": True, "active": True},
+        )
+        stop_process.assert_called_once_with(22345)
+        updated = self.state.project(project["id"])
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated["build_status"], "cancelled")
+        self.assertEqual(updated["build_error"], hub_server.PROJECT_BUILD_CANCELLED_ERROR)
+
+    def test_cancel_project_build_returns_inactive_when_project_not_building(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+        )
+        result = self.state.cancel_project_build(project["id"])
+        self.assertEqual(
+            result,
+            {"project_id": project["id"], "cancelled": False, "active": False},
+        )
+
     def test_auto_configure_project_aborts_if_request_cancelled(self) -> None:
         request_id = "cancel-auto-002"
         self.state._register_auto_config_request(request_id)
@@ -8824,6 +8865,21 @@ class HubApiAsyncRouteTests(unittest.TestCase):
             response = client.post("/api/projects/auto-configure/cancel", json=["not-an-object"])
         self.assertEqual(response.status_code, 400, msg=response.text)
         self.assertEqual(response.json()["detail"], "Invalid JSON payload.")
+
+    def test_project_build_cancel_route_calls_state_and_returns_result(self) -> None:
+        app = self._build_app()
+        cancellation_result = {"project_id": "project-1", "cancelled": True, "active": True}
+        with patch.object(
+            hub_server.HubState,
+            "cancel_project_build",
+            return_value=cancellation_result,
+        ) as cancel_project_build:
+            with TestClient(app) as client:
+                response = client.post("/api/projects/project-1/build/cancel")
+
+        self.assertEqual(response.status_code, 200, msg=response.text)
+        self.assertEqual(response.json(), cancellation_result)
+        cancel_project_build.assert_called_once_with("project-1")
 
     def test_create_project_route_runs_state_call_in_worker_thread(self) -> None:
         app = self._build_app()

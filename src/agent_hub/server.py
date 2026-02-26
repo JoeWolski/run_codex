@@ -270,6 +270,7 @@ AUTO_CONFIG_NOT_CONNECTED_ERROR = (
 AUTO_CONFIG_CANCELLED_ERROR = "Auto-configure was cancelled by user."
 AUTO_CONFIG_MISSING_OUTPUT_ERROR = "Temporary auto-config chat did not return a JSON recommendation."
 AUTO_CONFIG_INVALID_OUTPUT_ERROR = "Temporary auto-config chat returned invalid JSON."
+PROJECT_BUILD_CANCELLED_ERROR = "Project build was cancelled by user."
 AUTO_CONFIG_NOTES_MAX_CHARS = 400
 AUTO_CONFIG_REPO_DOCKERFILE_MIN_SCORE = 70
 AUTO_CONFIG_REQUEST_ID_MAX_CHARS = 120
@@ -467,6 +468,13 @@ class OpenAIAccountLoginSession:
 @dataclass
 class AutoConfigRequestState:
     request_id: str
+    process: subprocess.Popen[str] | None = None
+    cancel_requested: bool = False
+
+
+@dataclass
+class ProjectBuildRequestState:
+    project_id: str
     process: subprocess.Popen[str] | None = None
     cancel_requested: bool = False
 
@@ -1033,6 +1041,7 @@ def _run_logged(
     cwd: Path | None = None,
     check: bool = True,
     on_output: Callable[[str], None] | None = None,
+    on_process_start: Callable[[subprocess.Popen[str]], None] | None = None,
 ) -> subprocess.CompletedProcess:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command_line = " ".join(cmd)
@@ -1050,7 +1059,10 @@ def _run_logged(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             bufsize=1,
+            start_new_session=True,
         )
+        if on_process_start is not None:
+            on_process_start(process)
         stdout = process.stdout
         if stdout is not None:
             for line in iter(stdout.readline, ""):
@@ -3675,6 +3687,8 @@ class HubState:
         self._agent_tools_sessions: dict[str, dict[str, Any]] = {}
         self._auto_config_requests_lock = Lock()
         self._auto_config_requests: dict[str, AutoConfigRequestState] = {}
+        self._project_build_requests_lock = Lock()
+        self._project_build_requests: dict[str, ProjectBuildRequestState] = {}
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
@@ -3861,6 +3875,10 @@ class HubState:
     def _normalize_auto_config_request_id(self, request_id: Any) -> str:
         return str(request_id or "").strip()[:AUTO_CONFIG_REQUEST_ID_MAX_CHARS]
 
+    @staticmethod
+    def _normalize_project_build_request_id(project_id: Any) -> str:
+        return str(project_id or "").strip()
+
     def _auto_config_request_state(self, request_id: str) -> AutoConfigRequestState | None:
         normalized_request_id = self._normalize_auto_config_request_id(request_id)
         if not normalized_request_id:
@@ -3908,6 +3926,77 @@ class HubState:
         with self._auto_config_requests_lock:
             self._auto_config_requests.pop(normalized_request_id, None)
 
+    def _project_build_request_state(self, project_id: str) -> ProjectBuildRequestState | None:
+        normalized_project_id = self._normalize_project_build_request_id(project_id)
+        if not normalized_project_id:
+            return None
+        with self._project_build_requests_lock:
+            return self._project_build_requests.get(normalized_project_id)
+
+    def _register_project_build_request(self, project_id: str) -> None:
+        normalized_project_id = self._normalize_project_build_request_id(project_id)
+        if not normalized_project_id:
+            return
+        with self._project_build_requests_lock:
+            existing = self._project_build_requests.get(normalized_project_id)
+            if existing is None:
+                self._project_build_requests[normalized_project_id] = ProjectBuildRequestState(project_id=normalized_project_id)
+                return
+            existing.cancel_requested = False
+
+    def _set_project_build_request_process(
+        self,
+        project_id: str,
+        process: subprocess.Popen[str] | None = None,
+    ) -> None:
+        normalized_project_id = self._normalize_project_build_request_id(project_id)
+        if not normalized_project_id:
+            return
+        should_stop_process = False
+        with self._project_build_requests_lock:
+            state = self._project_build_requests.get(normalized_project_id)
+            if state is None:
+                state = ProjectBuildRequestState(project_id=normalized_project_id)
+                self._project_build_requests[normalized_project_id] = state
+            state.process = process
+            should_stop_process = (
+                bool(state.cancel_requested)
+                and process is not None
+                and _is_process_running(process.pid)
+            )
+        if should_stop_process:
+            _stop_process(process.pid)
+
+    def _is_project_build_cancelled(self, project_id: str) -> bool:
+        state = self._project_build_request_state(project_id)
+        return bool(state and state.cancel_requested)
+
+    def _clear_project_build_request(self, project_id: str) -> None:
+        normalized_project_id = self._normalize_project_build_request_id(project_id)
+        if not normalized_project_id:
+            return
+        with self._project_build_requests_lock:
+            self._project_build_requests.pop(normalized_project_id, None)
+
+    def _mark_project_build_cancelled(self, project_id: str, message: str = PROJECT_BUILD_CANCELLED_ERROR) -> bool:
+        normalized_project_id = self._normalize_project_build_request_id(project_id)
+        if not normalized_project_id:
+            return False
+        state = self.load()
+        project = state["projects"].get(normalized_project_id)
+        if project is None:
+            return False
+        if str(project.get("build_status") or "") not in {"pending", "building"}:
+            return False
+        now = _iso_now()
+        project["build_status"] = "cancelled"
+        project["build_error"] = str(message or PROJECT_BUILD_CANCELLED_ERROR)
+        project["build_finished_at"] = now
+        project["updated_at"] = now
+        state["projects"][normalized_project_id] = project
+        self.save(state, reason="project_build_cancelled")
+        return True
+
     def cancel_auto_configure_project(self, request_id: str) -> dict[str, Any]:
         normalized_request_id = self._normalize_auto_config_request_id(request_id)
         if not normalized_request_id:
@@ -3925,6 +4014,33 @@ class HubState:
         if was_active:
             _stop_process(process_to_cancel.pid)
         return {"request_id": normalized_request_id, "cancelled": True, "active": was_active}
+
+    def cancel_project_build(self, project_id: Any) -> dict[str, Any]:
+        normalized_project_id = self._normalize_project_build_request_id(project_id)
+        if not normalized_project_id:
+            raise HTTPException(status_code=400, detail="project_id is required.")
+        project = self.project(normalized_project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        if str(project.get("build_status") or "") not in {"pending", "building"}:
+            return {"project_id": normalized_project_id, "cancelled": False, "active": False}
+
+        process_to_cancel: subprocess.Popen[str] | None = None
+        with self._project_build_requests_lock:
+            request_state = self._project_build_requests.get(normalized_project_id)
+            if request_state is None:
+                request_state = ProjectBuildRequestState(project_id=normalized_project_id)
+                self._project_build_requests[normalized_project_id] = request_state
+            request_state.cancel_requested = True
+            process_to_cancel = request_state.process if request_state.process is not None else None
+
+        was_active = bool(process_to_cancel is not None and _is_process_running(process_to_cancel.pid))
+        if was_active:
+            _stop_process(process_to_cancel.pid)
+        cancelled = self._mark_project_build_cancelled(normalized_project_id)
+        if not cancelled:
+            self._clear_project_build_request(normalized_project_id)
+        return {"project_id": normalized_project_id, "cancelled": cancelled, "active": was_active}
 
     def _emit_openai_account_session_changed(self, reason: str = "") -> None:
         payload = self.openai_account_session_payload()
@@ -6940,6 +7056,7 @@ class HubState:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=1,
+                start_new_session=True,
             )
             self._set_auto_config_request_process(normalized_request_id, process)
         except OSError as exc:
@@ -9158,12 +9275,16 @@ class HubState:
         thread.start()
 
     def _schedule_project_build(self, project_id: str) -> None:
+        self._register_project_build_request(project_id)
         with self._project_build_lock:
             self._start_project_build_thread_locked(project_id)
 
     def _project_build_worker(self, project_id: str) -> None:
         try:
             while True:
+                if self._is_project_build_cancelled(project_id):
+                    self._mark_project_build_cancelled(project_id)
+                    return
                 state = self.load()
                 project = state["projects"].get(project_id)
                 if project is None:
@@ -9182,6 +9303,9 @@ class HubState:
                 if status == "ready" and snapshot == expected and _docker_image_exists(snapshot):
                     return
                 if status == "pending":
+                    if self._is_project_build_cancelled(project_id):
+                        self._mark_project_build_cancelled(project_id)
+                        return
                     continue
                 if status == "ready" and snapshot != expected:
                     project["build_status"] = "pending"
@@ -9199,12 +9323,21 @@ class HubState:
                     project = state["projects"].get(project_id)
                     if project is not None and str(project.get("build_status") or "") in {"pending", "building"}:
                         self._start_project_build_thread_locked(project_id)
+            self._clear_project_build_request(project_id)
 
     def _build_project_snapshot(self, project_id: str) -> dict[str, Any]:
         state = self.load()
         project = state["projects"].get(project_id)
         if project is None:
+            self._clear_project_build_request(project_id)
             raise HTTPException(status_code=404, detail="Project not found.")
+        if self._is_project_build_cancelled(project_id):
+            self._mark_project_build_cancelled(project_id)
+            self._clear_project_build_request(project_id)
+            current_project = self.project(project_id)
+            if current_project is None:
+                raise HTTPException(status_code=404, detail="Project not found.")
+            return current_project
 
         started_at = _iso_now()
         project["build_status"] = "building"
@@ -9228,21 +9361,40 @@ class HubState:
             state = self.load()
             current = state["projects"].get(project_id)
             if current is None:
+                self._clear_project_build_request(project_id)
                 raise
             detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            current["build_status"] = "failed"
-            current["build_error"] = str(detail)
-            current["build_finished_at"] = _iso_now()
-            current["updated_at"] = _iso_now()
+            now = _iso_now()
+            is_cancelled = self._is_project_build_cancelled(project_id)
+            current["build_status"] = "cancelled" if is_cancelled else "failed"
+            current["build_error"] = PROJECT_BUILD_CANCELLED_ERROR if is_cancelled else str(detail)
+            current["build_finished_at"] = now
+            current["updated_at"] = now
             state["projects"][project_id] = current
-            self.save(state, reason="project_build_failed")
-            LOGGER.warning("Project build failed for project=%s: %s", project_id, detail)
+            if is_cancelled:
+                self.save(state, reason="project_build_cancelled")
+                LOGGER.info("Project build cancelled for project=%s", project_id)
+            else:
+                self.save(state, reason="project_build_failed")
+                LOGGER.warning("Project build failed for project=%s: %s", project_id, detail)
+            self._clear_project_build_request(project_id)
             return current
 
         state = self.load()
         current = state["projects"].get(project_id)
         if current is None:
+            self._clear_project_build_request(project_id)
             raise HTTPException(status_code=404, detail="Project not found.")
+        if self._is_project_build_cancelled(project_id):
+            now = _iso_now()
+            current["build_status"] = "cancelled"
+            current["build_error"] = PROJECT_BUILD_CANCELLED_ERROR
+            current["build_finished_at"] = now
+            current["updated_at"] = now
+            state["projects"][project_id] = current
+            self.save(state, reason="project_build_cancelled")
+            self._clear_project_build_request(project_id)
+            return current
         current_candidate = dict(current)
         current_candidate["repo_head_sha"] = project_copy.get("repo_head_sha") or ""
         expected_snapshot = self._project_setup_snapshot_tag(current_candidate)
@@ -9274,12 +9426,21 @@ class HubState:
         state["projects"][project_id] = current
         self.save(state, reason="project_build_ready")
         LOGGER.debug("Project build completed for project=%s snapshot=%s", project_id, snapshot_tag)
+        self._clear_project_build_request(project_id)
         return current
 
     def delete_project(self, project_id: str) -> None:
         state = self.load()
         if project_id not in state["projects"]:
             raise HTTPException(status_code=404, detail="Project not found.")
+
+        process_to_cancel: subprocess.Popen[str] | None = None
+        with self._project_build_requests_lock:
+            request_state = self._project_build_requests.pop(project_id, None)
+            if request_state is not None:
+                process_to_cancel = request_state.process
+        if process_to_cancel is not None and _is_process_running(process_to_cancel.pid):
+            _stop_process(process_to_cancel.pid)
 
         project_chats = [chat for chat in self.list_chats() if chat["project_id"] == project_id]
         for chat in project_chats:
@@ -10478,12 +10639,23 @@ class HubState:
                     if on_output is not None:
                         on_output(chunk)
 
-            _run_logged(
-                cmd,
-                log_path=log_path,
-                check=True,
-                on_output=emit_build_output,
-            )
+            on_process_start: Callable[[subprocess.Popen[str]], None] | None = None
+            if resolved_project_id:
+
+                def on_process_start(process: subprocess.Popen[str]) -> None:
+                    self._set_project_build_request_process(resolved_project_id, process)
+
+            try:
+                _run_logged(
+                    cmd,
+                    log_path=log_path,
+                    check=True,
+                    on_output=emit_build_output,
+                    on_process_start=on_process_start,
+                )
+            finally:
+                if resolved_project_id:
+                    self._set_project_build_request_process(resolved_project_id, None)
         return snapshot_tag
 
     def _prepare_project_snapshot_for_project(
@@ -10491,8 +10663,15 @@ class HubState:
         project: dict[str, Any],
         log_path: Path | None = None,
     ) -> str:
+        project_id = str(project.get("id") or "")
+        if project_id and self._is_project_build_cancelled(project_id):
+            raise HTTPException(status_code=409, detail=PROJECT_BUILD_CANCELLED_ERROR)
         workspace = self._ensure_project_clone(project)
+        if project_id and self._is_project_build_cancelled(project_id):
+            raise HTTPException(status_code=409, detail=PROJECT_BUILD_CANCELLED_ERROR)
         self._sync_checkout_to_remote(workspace, project)
+        if project_id and self._is_project_build_cancelled(project_id):
+            raise HTTPException(status_code=409, detail=PROJECT_BUILD_CANCELLED_ERROR)
         head_result = _run_for_repo(["rev-parse", "HEAD"], workspace, capture=True)
         project["repo_head_sha"] = head_result.stdout.strip()
         return self._ensure_project_setup_snapshot(
@@ -12104,6 +12283,10 @@ def main(
     @app.delete("/api/projects/{project_id}")
     def api_delete_project(project_id: str) -> None:
         state.delete_project(project_id)
+
+    @app.post("/api/projects/{project_id}/build/cancel")
+    def api_cancel_project_build(project_id: str) -> dict[str, Any]:
+        return state.cancel_project_build(project_id)
 
     @app.get("/api/projects/{project_id}/build-logs", response_class=PlainTextResponse)
     def api_project_build_logs(project_id: str) -> str:

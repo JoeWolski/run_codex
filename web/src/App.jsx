@@ -78,6 +78,7 @@ const CHAT_TERMINAL_COLLAPSE_STORAGE_KEY = "agent_hub_chat_terminal_collapse_v1"
 const DEFAULT_BASE_IMAGE_TAG = "ubuntu:24.04";
 const DEFAULT_AGENT_TYPE = "codex";
 const AUTO_CONFIG_CANCELLED_ERROR_TEXT = "Auto-configure was cancelled by user.";
+const PROJECT_BUILD_CANCELLED_ERROR_TEXT = "Project build was cancelled by user.";
 const DEFAULT_HUB_SETTINGS = {
   defaultAgentType: DEFAULT_AGENT_TYPE,
   chatLayoutEngine: DEFAULT_CHAT_LAYOUT_ENGINE
@@ -713,6 +714,9 @@ function projectStatusInfo(buildStatus) {
   }
   if (buildStatus === "building") {
     return { key: "building", label: "Building image" };
+  }
+  if (buildStatus === "cancelled") {
+    return { key: "failed", label: "Build cancelled" };
   }
   if (buildStatus === "failed") {
     return { key: "failed", label: "Build failed" };
@@ -1654,6 +1658,7 @@ function HubApp() {
   const [artifactPreview, setArtifactPreview] = useState(null);
   const [pendingSessions, setPendingSessions] = useState([]);
   const [pendingProjectBuilds, setPendingProjectBuilds] = useState({});
+  const [pendingProjectBuildCancels, setPendingProjectBuildCancels] = useState({});
   const [pendingChatStarts, setPendingChatStarts] = useState({});
   const [pendingContainerRefreshes, setPendingContainerRefreshes] = useState({});
   const [pendingProjectChatCreates, setPendingProjectChatCreates] = useState({});
@@ -1767,6 +1772,15 @@ function HubApp() {
     setPendingSessions((prev) => reconcilePendingSessions(prev, serverChatMap));
     setPendingChatStarts((prev) => reconcilePendingChatStarts(prev, serverChatMap));
     setPendingProjectBuilds((prev) => {
+      const next = {};
+      for (const project of normalizedPayload.projects || []) {
+        if (prev[project.id] && String(project.build_status || "") === "building") {
+          next[project.id] = true;
+        }
+      }
+      return next;
+    });
+    setPendingProjectBuildCancels((prev) => {
       const next = {};
       for (const project of normalizedPayload.projects || []) {
         if (prev[project.id] && String(project.build_status || "") === "building") {
@@ -3074,6 +3088,11 @@ function HubApp() {
       cachedDraft,
       serverProjectDraft
     });
+    setPendingProjectBuildCancels((prev) => {
+      const next = { ...prev };
+      delete next[normalizedProjectId];
+      return next;
+    });
     markProjectBuilding(normalizedProjectId);
     try {
       await persistProjectSettings(normalizedProjectId, draft);
@@ -3093,6 +3112,54 @@ function HubApp() {
       });
       setError(err.message || String(err));
       refreshState().catch(() => {});
+    }
+  }
+
+  async function handleCancelProjectBuild(projectId) {
+    const normalizedProjectId = String(projectId || "").trim();
+    if (!normalizedProjectId) {
+      setError("Project id is required.");
+      return;
+    }
+    setPendingProjectBuildCancels((prev) => ({ ...prev, [normalizedProjectId]: true }));
+    setError("");
+    try {
+      const response = await fetchJson(`/api/projects/${normalizedProjectId}/build/cancel`, {
+        method: "POST"
+      });
+      if (!response?.cancelled) {
+        setError(response?.active
+          ? "Unable to cancel the project build right now."
+          : "Project build is no longer running.");
+        return;
+      }
+      setHubState((prev) => ({
+        ...prev,
+        projects: (prev.projects || []).map((project) =>
+          project.id === normalizedProjectId
+            ? {
+              ...project,
+              build_status: "cancelled",
+              build_error: PROJECT_BUILD_CANCELLED_ERROR_TEXT
+            }
+            : project
+        )
+      }));
+      setPendingProjectBuilds((prev) => {
+        const next = { ...prev };
+        delete next[normalizedProjectId];
+        return next;
+      });
+      refreshState().catch(() => {});
+    } catch (err) {
+      setError(err.message || String(err));
+      refreshState().catch(() => {});
+    } finally {
+      setPendingProjectBuildCancels((prev) => {
+        const next = { ...prev };
+        delete next[normalizedProjectId];
+        return next;
+      });
     }
   }
 
@@ -4456,6 +4523,7 @@ function HubApp() {
     const buildStatus = String(project.build_status || "pending");
     const canStartChat = buildStatus === "ready";
     const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+    const isCancellingBuild = Boolean(pendingProjectBuildCancels[project.id]);
     const isCreatingChat = Boolean(pendingProjectChatCreates[project.id]);
     const projectRowsCollapsed = Boolean(collapsedProjectChats[project.id]);
     const projectStartSettings = normalizeChatStartSettings(
@@ -4560,6 +4628,19 @@ function HubApp() {
                   ? <SpinnerLabel text="Building image..." />
                   : "Build image"}
             </button>
+            {!canStartChat && isBuilding ? (
+              <button
+                type="button"
+                className="btn-secondary project-group-action"
+                disabled={isCancellingBuild}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleCancelProjectBuild(project.id);
+                }}
+              >
+                {isCancellingBuild ? <SpinnerLabel text="Cancelling..." /> : "Cancel"}
+              </button>
+            ) : null}
           </div>
         </div>
 
@@ -4632,6 +4713,7 @@ function HubApp() {
     const buildStatus = String(project.build_status || "pending");
     const canStartChat = buildStatus === "ready";
     const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+    const isCancellingBuild = Boolean(pendingProjectBuildCancels[project.id]);
     const isCreatingChat = Boolean(pendingProjectChatCreates[project.id]);
     const projectStartSettings = normalizeChatStartSettings(
       chatStartSettingsByProject[project.id] || { agentType: hubSettings.defaultAgentType },
@@ -4716,6 +4798,18 @@ function HubApp() {
               ? <SpinnerLabel text="Building image..." />
               : "Build image"}
         </button>
+        {!canStartChat && isBuilding ? (
+          <button
+            type="button"
+            className="btn-secondary project-group-action chat-layout-project-control-button"
+            disabled={isCancellingBuild}
+            onClick={() => {
+              handleCancelProjectBuild(project.id);
+            }}
+          >
+            {isCancellingBuild ? <SpinnerLabel text="Cancelling..." /> : "Cancel"}
+          </button>
+        ) : null}
       </div>
     );
   }
@@ -5187,6 +5281,7 @@ function HubApp() {
                 const buildStatus = String(project.build_status || "pending");
                 const statusInfo = projectStatusInfo(buildStatus);
                 const isBuilding = buildStatus === "building" || Boolean(pendingProjectBuilds[project.id]);
+                const isCancellingBuild = Boolean(pendingProjectBuildCancels[project.id]);
                 const canStartChat = buildStatus === "ready";
                 const isCreatingChat = Boolean(pendingProjectChatCreates[project.id]);
                 const isEditing = Boolean(editingProjects[project.id]);
@@ -5293,6 +5388,16 @@ function HubApp() {
                                 ? <SpinnerLabel text="Building image..." />
                                 : "Build"}
                           </button>
+                          {!canStartChat && isBuilding ? (
+                            <button
+                              type="button"
+                              className="btn-secondary project-collapsed-primary"
+                              onClick={() => handleCancelProjectBuild(project.id)}
+                              disabled={isCancellingBuild}
+                            >
+                              {isCancellingBuild ? <SpinnerLabel text="Cancelling..." /> : "Cancel"}
+                            </button>
+                          ) : null}
                           <button
                             type="button"
                             className="btn-danger project-collapsed-delete"
@@ -5367,6 +5472,16 @@ function HubApp() {
                             >
                               {isBuilding ? <SpinnerLabel text="Building image..." /> : "Build"}
                             </button>
+                            {isBuilding ? (
+                              <button
+                                type="button"
+                                className="btn-secondary"
+                                onClick={() => handleCancelProjectBuild(project.id)}
+                                disabled={isCancellingBuild}
+                              >
+                                {isCancellingBuild ? <SpinnerLabel text="Cancelling..." /> : "Cancel"}
+                              </button>
+                            ) : null}
                             <button
                               type="button"
                               className="btn-danger project-edit-delete"
