@@ -195,8 +195,6 @@ AGENT_CAPABILITY_HELP_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,80}")
 AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS = float(
     os.environ.get("AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS", "8.0")
 )
-AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE_ENV = "AGENT_HUB_AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE"
-AGENT_CAPABILITY_DISCOVERY_RUNTIME_IMAGE_PREFIX = "agent-hub-capability"
 AGENT_CAPABILITY_CODEX_MODELS_DOC_URL = "https://developers.openai.com/codex/models"
 AGENT_CAPABILITY_CODEX_MODELS_DOC_NAME_RE = re.compile(
     r'\bname"\s*:\s*\[0,\s*"([a-z0-9][a-z0-9.-]*(?:-[a-z0-9][a-z0-9.-]*)*)"\]',
@@ -1617,7 +1615,50 @@ def _extract_reasoning_candidates_from_output(output_text: str, agent_type: str)
     return []
 
 
-def _run_agent_capability_probe(cmd: list[str], timeout_seconds: float) -> tuple[int, str]:
+def _agent_capability_probe_docker_run_args(
+    *,
+    local_uid: int,
+    local_gid: int,
+    local_supp_gids_csv: str,
+    local_umask: str,
+    host_codex_dir: Path,
+    config_file: Path,
+) -> list[str]:
+    container_home = DEFAULT_CONTAINER_HOME
+    run_args = [
+        "--init",
+        "--user",
+        f"{local_uid}:{local_gid}",
+        "--workdir",
+        container_home,
+        "--tmpfs",
+        TMP_DIR_TMPFS_SPEC,
+        "--volume",
+        f"{host_codex_dir}:{container_home}/.codex",
+        "--volume",
+        f"{config_file}:{container_home}/.codex/config.toml:ro",
+        "--env",
+        f"LOCAL_UMASK={local_umask}",
+        "--env",
+        f"HOME={container_home}",
+        "--env",
+        f"CONTAINER_HOME={container_home}",
+        "--env",
+        f"PATH={container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]
+    for supp_gid in _parse_gid_csv(local_supp_gids_csv):
+        if supp_gid == local_gid:
+            continue
+        run_args.extend(["--group-add", str(supp_gid)])
+    return run_args
+
+
+def _run_agent_capability_probe(
+    cmd: list[str],
+    timeout_seconds: float,
+    *,
+    docker_run_args: list[str] | None = None,
+) -> tuple[int, str]:
     tokens = [str(token).strip() for token in cmd if str(token).strip()]
     if not tokens:
         return 2, "empty capability probe command"
@@ -1631,7 +1672,7 @@ def _run_agent_capability_probe(cmd: list[str], timeout_seconds: float) -> tuple
     except RuntimeError as exc:
         return 125, str(exc)
 
-    docker_cmd = ["docker", "run", "--rm", runtime_image, *tokens]
+    docker_cmd = ["docker", "run", "--rm", *(docker_run_args or []), runtime_image, *tokens]
     try:
         result = subprocess.run(
             docker_cmd,
@@ -1657,36 +1698,12 @@ def _agent_capability_provider_for_command(command: str) -> str:
     return ""
 
 
-def _agent_capability_discovery_base_image() -> str:
-    configured = str(os.environ.get(AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE_ENV, "")).strip()
-    if configured:
-        return configured
-    return DEFAULT_AGENT_IMAGE
-
-
-def _agent_capability_runtime_image_tag(agent_provider: str, base_image: str) -> str:
-    safe_provider = re.sub(r"[^a-z0-9_.-]+", "-", str(agent_provider or "").strip().lower()).strip("-")
-    if not safe_provider:
-        safe_provider = "agent"
-    payload = json.dumps(
-        {
-            "provider": str(agent_provider or "").strip().lower(),
-            "base_image": str(base_image or "").strip(),
-            "runtime_inputs_fingerprint": _agent_cli_runtime_inputs_fingerprint(),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-    return f"{AGENT_CAPABILITY_DISCOVERY_RUNTIME_IMAGE_PREFIX}-{safe_provider}-{digest}"
-
-
 def _ensure_agent_capability_runtime_image(agent_provider: str) -> str:
     normalized_provider = _normalize_chat_agent_type(agent_provider)
     if normalized_provider not in SUPPORTED_CHAT_AGENT_TYPES:
         raise RuntimeError(f"Unsupported capability discovery provider: {agent_provider}")
-    base_image = _agent_capability_discovery_base_image()
-    runtime_image = _agent_capability_runtime_image_tag(normalized_provider, base_image)
+    base_image = agent_cli_image.DEFAULT_BASE_IMAGE
+    runtime_image = agent_cli_image._default_runtime_image_for_provider(normalized_provider)
     try:
         agent_cli_image._ensure_runtime_image_built_if_missing(
             base_image=base_image,
@@ -3895,6 +3912,14 @@ class HubState:
     def _discover_agent_capabilities_for_type(self, agent_type: str, previous: dict[str, Any]) -> dict[str, Any]:
         resolved_type = _normalize_chat_agent_type(agent_type)
         commands = AGENT_CAPABILITY_DISCOVERY_COMMANDS_BY_TYPE.get(resolved_type, ())
+        probe_run_args = _agent_capability_probe_docker_run_args(
+            local_uid=self.local_uid,
+            local_gid=self.local_gid,
+            local_supp_gids_csv=self.local_supp_gids,
+            local_umask=self.local_umask,
+            host_codex_dir=self.host_codex_dir,
+            config_file=self.config_file,
+        )
         discovered_models: list[str] = ["default"]
         discovered_reasoning_modes: list[str] = ["default"]
         last_error = ""
@@ -3902,7 +3927,11 @@ class HubState:
 
         for raw_cmd in commands:
             cmd = [str(token) for token in raw_cmd]
-            return_code, output_text = _run_agent_capability_probe(cmd, AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
+            return_code, output_text = _run_agent_capability_probe(
+                cmd,
+                AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS,
+                docker_run_args=probe_run_args,
+            )
             if return_code == 127:
                 last_error = f"command not found: {cmd[0]}"
                 LOGGER.info("Agent capability discovery skipped for agent=%s: %s", resolved_type, last_error)
@@ -3963,7 +3992,11 @@ class HubState:
 
         if resolved_type == AGENT_TYPE_CODEX and _option_count_excluding_default(discovered_reasoning_modes) < 1:
             reasoning_cmd = [str(token) for token in AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND]
-            return_code, output_text = _run_agent_capability_probe(reasoning_cmd, AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS)
+            return_code, output_text = _run_agent_capability_probe(
+                reasoning_cmd,
+                AGENT_CAPABILITY_DISCOVERY_TIMEOUT_SECONDS,
+                docker_run_args=probe_run_args,
+            )
             parsed_reasoning = _extract_reasoning_candidates_from_output(output_text, resolved_type)
             if parsed_reasoning:
                 discovered_reasoning_modes = _normalize_reasoning_mode_options_for_agent(

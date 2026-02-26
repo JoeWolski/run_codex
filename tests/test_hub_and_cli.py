@@ -470,31 +470,26 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(codex["models"], ["default", "gpt-6-codex"])
         self.assertEqual(codex["reasoning_modes"], ["default", "low", "high"])
 
-    def test_ensure_agent_capability_runtime_image_uses_default_base_image(self) -> None:
-        with patch.dict(
-            os.environ,
-            {hub_server.AGENT_CAPABILITY_DISCOVERY_BASE_IMAGE_ENV: ""},
-            clear=False,
-        ), patch(
-            "agent_hub.server._agent_cli_runtime_inputs_fingerprint",
-            return_value="runtime-fingerprint-test",
-        ), patch(
+    def test_ensure_agent_capability_runtime_image_uses_default_runtime_tag(self) -> None:
+        expected_runtime_image = "agent-ubuntu2204-gemini:latest"
+        with patch(
+            "agent_hub.server.agent_cli_image._default_runtime_image_for_provider",
+            return_value=expected_runtime_image,
+        ) as default_runtime_image, patch(
             "agent_hub.server.agent_cli_image._ensure_runtime_image_built_if_missing",
         ) as ensure_runtime_image:
-            expected_runtime_image = hub_server._agent_capability_runtime_image_tag(
-                hub_server.AGENT_TYPE_GEMINI,
-                hub_server.DEFAULT_AGENT_IMAGE,
-            )
             runtime_image = hub_server._ensure_agent_capability_runtime_image(hub_server.AGENT_TYPE_GEMINI)
         self.assertEqual(runtime_image, expected_runtime_image)
+        default_runtime_image.assert_called_once_with(hub_server.AGENT_TYPE_GEMINI)
         ensure_runtime_image.assert_called_once_with(
-            base_image=hub_server.DEFAULT_AGENT_IMAGE,
-            target_image=expected_runtime_image,
+            base_image=hub_server.agent_cli_image.DEFAULT_BASE_IMAGE,
+            target_image="agent-ubuntu2204-gemini:latest",
             agent_provider=hub_server.AGENT_TYPE_GEMINI,
         )
 
     def test_run_agent_capability_probe_executes_inside_runtime_container(self) -> None:
         runtime_image = "agent-hub-capability-claude-test"
+        run_args = ["--init", "--user", "1002:1007"]
         with patch(
             "agent_hub.server._ensure_agent_capability_runtime_image",
             return_value=runtime_image,
@@ -507,18 +502,42 @@ class HubStateTests(unittest.TestCase):
                 "",
             ),
         ) as run_mock:
-            return_code, output = hub_server._run_agent_capability_probe(["claude", "--help"], 6.5)
+            return_code, output = hub_server._run_agent_capability_probe(
+                ["claude", "--help"],
+                6.5,
+                docker_run_args=run_args,
+            )
 
         self.assertEqual(return_code, 0)
         self.assertEqual(output, "Claude Code help output")
         ensure_runtime_image.assert_called_once_with("claude")
         run_mock.assert_called_once_with(
-            ["docker", "run", "--rm", runtime_image, "claude", "--help"],
+            ["docker", "run", "--rm", "--init", "--user", "1002:1007", runtime_image, "claude", "--help"],
             check=False,
             text=True,
             capture_output=True,
             timeout=6.5,
         )
+
+    def test_agent_capability_probe_docker_run_args_match_chat_user_model(self) -> None:
+        run_args = hub_server._agent_capability_probe_docker_run_args(
+            local_uid=1002,
+            local_gid=1007,
+            local_supp_gids_csv="1007,2000",
+            local_umask="0022",
+            host_codex_dir=Path("/host/codex"),
+            config_file=Path("/host/agent.config.toml"),
+        )
+        self.assertIn("--user", run_args)
+        self.assertIn("1002:1007", run_args)
+        self.assertIn("--tmpfs", run_args)
+        self.assertIn(hub_server.TMP_DIR_TMPFS_SPEC, run_args)
+        self.assertIn("/host/codex:/workspace/.codex", run_args)
+        self.assertIn("/host/agent.config.toml:/workspace/.codex/config.toml:ro", run_args)
+        self.assertIn("HOME=/workspace", run_args)
+        self.assertIn("CONTAINER_HOME=/workspace", run_args)
+        self.assertEqual(run_args.count("--group-add"), 1)
+        self.assertIn("2000", run_args)
 
     def test_run_agent_capability_probe_returns_build_failure_details(self) -> None:
         with patch(
@@ -531,7 +550,11 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("build failed: docker daemon unavailable", output)
 
     def test_agent_capabilities_discovery_updates_cached_modes(self) -> None:
-        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+        def fake_probe(
+            cmd: list[str],
+            _timeout: float,
+            docker_run_args: list[str] | None = None,
+        ) -> tuple[int, str]:
             if cmd == ["codex", "--help"]:
                 return (
                     0,
@@ -636,7 +659,11 @@ Gemini CLI
         )
         calls: list[list[str]] = []
 
-        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+        def fake_probe(
+            cmd: list[str],
+            _timeout: float,
+            docker_run_args: list[str] | None = None,
+        ) -> tuple[int, str]:
             calls.append(list(cmd))
             if cmd == ["codex", "--help"]:
                 return 0, "--model <MODEL>\npossible values: gpt-7-codex"
@@ -685,7 +712,11 @@ Gemini CLI
         self.assertEqual(gemini["reasoning_modes"], ["default"])
 
     def test_agent_capabilities_discovery_parses_numbered_codex_model_list(self) -> None:
-        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+        def fake_probe(
+            cmd: list[str],
+            _timeout: float,
+            docker_run_args: list[str] | None = None,
+        ) -> tuple[int, str]:
             if cmd == ["codex", "--help"]:
                 return (
                     0,
@@ -911,7 +942,11 @@ Gemini CLI
         self.assertEqual(codex["reasoning_modes"], ["default", "low"])
 
     def test_agent_capabilities_discovery_ignores_failed_codex_probe_output(self) -> None:
-        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+        def fake_probe(
+            cmd: list[str],
+            _timeout: float,
+            docker_run_args: list[str] | None = None,
+        ) -> tuple[int, str]:
             if cmd == ["codex", "--help"]:
                 return (
                     2,
@@ -947,7 +982,11 @@ Gemini CLI
         )
 
     def test_agent_capabilities_discovery_preserves_codex_docs_error_when_reasoning_fallback_succeeds(self) -> None:
-        def fake_probe(cmd: list[str], _timeout: float) -> tuple[int, str]:
+        def fake_probe(
+            cmd: list[str],
+            _timeout: float,
+            docker_run_args: list[str] | None = None,
+        ) -> tuple[int, str]:
             if cmd == ["codex", "--help"]:
                 return 0, "Codex CLI"
             if cmd == list(hub_server.AGENT_CAPABILITY_CODEX_REASONING_FALLBACK_COMMAND):
