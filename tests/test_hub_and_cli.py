@@ -6229,9 +6229,9 @@ class CliEnvVarTests(unittest.TestCase):
             setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(setup_cmd)
             assert setup_cmd is not None
-            self.assertIn("--entrypoint", setup_cmd)
-            self.assertIn("bash", setup_cmd)
-            self.assertEqual(setup_cmd[-3], expected_setup_runtime)
+            self.assertNotIn("--entrypoint", setup_cmd)
+            self.assertEqual(setup_cmd[-4], expected_setup_runtime)
+            self.assertEqual(setup_cmd[-3], "bash")
             self.assertEqual(setup_cmd[-2], "-lc")
             setup_script = setup_cmd[-1]
             self.assertIn("set -o pipefail", setup_script)

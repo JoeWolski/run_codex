@@ -1967,10 +1967,9 @@ def main(
                 "run",
                 "--name",
                 container_name,
-                "--entrypoint",
-                "bash",
                 *run_args,
                 setup_runtime_image,
+                "bash",
                 "-lc",
                 setup_bootstrap_script,
             ]

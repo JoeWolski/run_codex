@@ -212,7 +212,7 @@ Behavior highlights:
 - Persists agent home state across runs with dedicated mounts for `~/.codex`, `~/.claude`, `~/.claude.json`, `~/.config/claude`, and `~/.gemini`.
 - Can build and reuse snapshot images for deterministic setup.
 - Supports project-specific base image source from Docker tag, Dockerfile, or Docker context.
-- Snapshot setup scripts run as the mapped host UID/GID (not root); OS-level package installs should be done in the base image layer.
+- Snapshot setup scripts run as the mapped host UID/GID and keep normal user semantics (including `sudo` when permitted by image policy). For deterministic/reproducible builds, prefer installing stable OS-level dependencies in the base image layer.
 - Setup snapshot commits reset image metadata (`USER`, `WORKDIR`, `ENTRYPOINT`, `CMD`) so follow-on provider overlay builds stay deterministic.
 - Applies permissive in-container defaults unless you explicitly override them with trailing agent args:
   Codex uses `--ask-for-approval never --sandbox danger-full-access`; Claude uses `--permission-mode bypassPermissions`; Gemini uses `--approval-mode yolo`.
