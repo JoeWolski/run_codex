@@ -5951,6 +5951,7 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertNotIn("RECURSIVE_WORKSPACE_CHMOD", content)
         self.assertIn("chmod 777 /workspace", content)
         self.assertIn("chown -R agent:${agent_group} /workspace", content)
+        self.assertIn("if command -v npm >/dev/null 2>&1; then npm cache clean --force; fi", content)
 
     def test_agent_hub_dockerfile_uses_build_only_uv_project_environment(self) -> None:
         content = AGENT_HUB_DOCKERFILE.read_text(encoding="utf-8")

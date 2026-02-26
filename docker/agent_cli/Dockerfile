@@ -16,7 +16,7 @@ RUN case "${AGENT_PROVIDER}" in \
       none) echo "Skipping agent CLI install for setup image." ;; \
       *) echo "Unsupported AGENT_PROVIDER='${AGENT_PROVIDER}'" >&2; exit 1 ;; \
     esac \
- && npm cache clean --force \
+ && if command -v npm >/dev/null 2>&1; then npm cache clean --force; fi \
  && rm -rf /var/lib/apt/lists/*
 
 RUN if ! id -u agent >/dev/null 2>&1; then \
