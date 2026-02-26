@@ -5944,17 +5944,11 @@ class CliEnvVarTests(unittest.TestCase):
     def test_agent_cli_dockerfile_precreates_workspace_config_dir_for_runtime_mounts(self) -> None:
         content = AGENT_CLI_DOCKERFILE.read_text(encoding="utf-8")
 
-        self.assertIn("ARG RECURSIVE_WORKSPACE_CHMOD=1", content)
         self.assertIn("/workspace/.config", content)
         self.assertIn("/workspace/tmp", content)
-        self.assertIn(
-            'if [ "${RECURSIVE_WORKSPACE_CHMOD}" = "1" ]; then chmod -R 777 /workspace; fi',
-            content,
-        )
-        self.assertLess(
-            content.index("/workspace/.config"),
-            content.index('if [ "${RECURSIVE_WORKSPACE_CHMOD}" = "1" ]; then chmod -R 777 /workspace; fi'),
-        )
+        self.assertNotIn("RECURSIVE_WORKSPACE_CHMOD", content)
+        self.assertNotIn("chmod 777 /workspace", content)
+        self.assertIn('chown -R "agent:${agent_group}" /workspace', content)
 
     def test_agent_hub_dockerfile_uses_build_only_uv_project_environment(self) -> None:
         content = AGENT_HUB_DOCKERFILE.read_text(encoding="utf-8")
@@ -6122,7 +6116,7 @@ class CliEnvVarTests(unittest.TestCase):
 
         self.assertIn("snapshot bootstrap: preparing writable /workspace/tmp", script)
         self.assertIn("mkdir -p /workspace/tmp", script)
-        self.assertIn("chmod 777 /workspace/tmp", script)
+        self.assertNotIn("chmod", script)
         self.assertLess(
             script.index("mkdir -p /workspace/tmp"),
             script.index("printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'"),
@@ -6191,7 +6185,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert runtime_build_cmd is not None
             self.assertIn("BASE_IMAGE=ubuntu:24.04", runtime_build_cmd)
             self.assertIn("AGENT_PROVIDER=none", runtime_build_cmd)
-            self.assertIn("RECURSIVE_WORKSPACE_CHMOD=1", runtime_build_cmd)
+            self.assertNotIn("RECURSIVE_WORKSPACE_CHMOD", " ".join(runtime_build_cmd))
             setup_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(setup_cmd)
             assert setup_cmd is not None
@@ -7451,7 +7445,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert build_cmd is not None
             self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
             self.assertIn("AGENT_PROVIDER=claude", build_cmd)
-            self.assertIn("RECURSIVE_WORKSPACE_CHMOD=0", build_cmd)
+            self.assertNotIn("RECURSIVE_WORKSPACE_CHMOD", " ".join(build_cmd))
             run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
@@ -7509,7 +7503,7 @@ class CliEnvVarTests(unittest.TestCase):
             assert build_cmd is not None
             self.assertIn(f"BASE_IMAGE={snapshot_tag}", build_cmd)
             self.assertIn("AGENT_PROVIDER=gemini", build_cmd)
-            self.assertIn("RECURSIVE_WORKSPACE_CHMOD=0", build_cmd)
+            self.assertNotIn("RECURSIVE_WORKSPACE_CHMOD", " ".join(build_cmd))
             run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
@@ -7535,12 +7529,10 @@ class CliEnvVarTests(unittest.TestCase):
             base_image: str,
             target_image: str,
             agent_provider: str,
-            recursive_workspace_chmod: bool,
         ) -> None:
             self.assertEqual(base_image, "snapshot:test")
             self.assertEqual(target_image, "agent-runtime-claude-test")
             self.assertEqual(agent_provider, image_cli.AGENT_PROVIDER_CLAUDE)
-            self.assertTrue(recursive_workspace_chmod)
             with lock:
                 build_calls.append(target_image)
             build_started.set()
@@ -9036,8 +9028,6 @@ class DockerEntrypointTests(unittest.TestCase):
                 target_path.read_text(encoding="utf-8"),
                 source_path.read_text(encoding="utf-8"),
             )
-            target_mode = target_path.stat().st_mode & 0o777
-            self.assertEqual(target_mode, 0o600)
 
     def test_prepare_git_credentials_without_source_preserves_gh_env_tokens(self) -> None:
         module = self._load_entrypoint_module()
@@ -9184,7 +9174,6 @@ class DockerEntrypointTests(unittest.TestCase):
             module._ensure_workspace_tmp(workspace_tmp=workspace_tmp)
 
             self.assertTrue(workspace_tmp.is_dir())
-            self.assertEqual(workspace_tmp.stat().st_mode & 0o777, 0o777)
 
 
 if __name__ == "__main__":

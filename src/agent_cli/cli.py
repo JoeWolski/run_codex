@@ -63,8 +63,6 @@ AGENT_TOOLS_CHAT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_CHAT_ID"
 AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
-RECURSIVE_WORKSPACE_CHMOD_ENABLED = "1"
-RECURSIVE_WORKSPACE_CHMOD_DISABLED = "0"
 AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
     PurePosixPath(DEFAULT_CONTAINER_HOME)
     / ".codex"
@@ -360,10 +358,6 @@ def _resolved_agent_hub_data_dir() -> Path:
 def _write_private_text_file(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def _strip_mcp_server_table(config_text: str, server_name: str) -> str:
@@ -1132,7 +1126,6 @@ def _build_snapshot_setup_shell_script(setup_script: str) -> str:
         "set -o pipefail\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: preparing writable /workspace/tmp'\n"
         "mkdir -p /workspace/tmp\n"
-        "chmod 777 /workspace/tmp\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: configuring git safe.directory'\n"
         "git config --global --add safe.directory '*'\n"
         'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ]; then\n'
@@ -1144,7 +1137,6 @@ def _build_snapshot_setup_shell_script(setup_script: str) -> str:
         '  credential_target="${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}"\n'
         "  printf '%s\\n' \"[agent_cli] snapshot bootstrap: copying git credentials to ${credential_target}\"\n"
         '  cp "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" "${credential_target}"\n'
-        '  chmod 600 "${credential_target}"\n'
         "fi\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'\n"
         + normalized_script
@@ -1243,16 +1235,10 @@ def _build_runtime_image(
     base_image: str,
     target_image: str,
     agent_provider: str,
-    recursive_workspace_chmod: bool = True,
 ) -> None:
     click.echo(
         f"Building runtime image '{target_image}' from {DEFAULT_DOCKERFILE} "
         f"(base={base_image}, provider={agent_provider})"
-    )
-    recursive_workspace_chmod_value = (
-        RECURSIVE_WORKSPACE_CHMOD_ENABLED
-        if recursive_workspace_chmod
-        else RECURSIVE_WORKSPACE_CHMOD_DISABLED
     )
     _run(
         [
@@ -1264,8 +1250,6 @@ def _build_runtime_image(
             f"BASE_IMAGE={base_image}",
             "--build-arg",
             f"AGENT_PROVIDER={agent_provider}",
-            "--build-arg",
-            f"RECURSIVE_WORKSPACE_CHMOD={recursive_workspace_chmod_value}",
             "-t",
             target_image,
             str(_repo_root()),
@@ -1279,7 +1263,6 @@ def _ensure_runtime_image_built_if_missing(
     base_image: str,
     target_image: str,
     agent_provider: str,
-    recursive_workspace_chmod: bool = True,
 ) -> None:
     if _docker_image_exists(target_image):
         return
@@ -1290,7 +1273,6 @@ def _ensure_runtime_image_built_if_missing(
             base_image=base_image,
             target_image=target_image,
             agent_provider=agent_provider,
-            recursive_workspace_chmod=recursive_workspace_chmod,
         )
 
 
@@ -1907,7 +1889,6 @@ def main(
                 base_image=ensure_selected_base_image(),
                 target_image=setup_runtime_image,
                 agent_provider=AGENT_PROVIDER_NONE,
-                recursive_workspace_chmod=True,
             )
             script = (setup_script or "").strip() or ":"
             setup_bootstrap_script = _build_snapshot_setup_shell_script(script)
@@ -1963,7 +1944,6 @@ def main(
                 base_image=snapshot_tag,
                 target_image=provider_snapshot_runtime_image,
                 agent_provider=selected_agent_provider,
-                recursive_workspace_chmod=False,
             )
             runtime_image = provider_snapshot_runtime_image
     elif prepare_snapshot_only:
@@ -1973,7 +1953,6 @@ def main(
             base_image=ensure_selected_base_image(),
             target_image=runtime_image,
             agent_provider=selected_agent_provider,
-            recursive_workspace_chmod=True,
         )
 
     if prepare_snapshot_only:
