@@ -328,6 +328,34 @@ class HubStateTests(unittest.TestCase):
 
         self.assertNotEqual(tag_a, tag_b)
 
+    def test_project_setup_snapshot_tag_changes_when_branch_changes(self) -> None:
+        project_main = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        tag_main = self.state._project_setup_snapshot_tag(project_main)
+
+        project_develop = dict(project_main)
+        project_develop["default_branch"] = "develop"
+        tag_develop = self.state._project_setup_snapshot_tag(project_develop)
+
+        self.assertNotEqual(tag_main, tag_develop)
+
+    def test_project_setup_snapshot_tag_changes_when_repo_head_sha_changes(self) -> None:
+        project = self.state.add_project(
+            repo_url="https://example.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        project["repo_head_sha"] = "aaa111"
+        tag_a = self.state._project_setup_snapshot_tag(project)
+
+        project["repo_head_sha"] = "bbb222"
+        tag_b = self.state._project_setup_snapshot_tag(project)
+
+        self.assertNotEqual(tag_a, tag_b)
+
     def test_state_payload_reports_project_build_log_availability(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",

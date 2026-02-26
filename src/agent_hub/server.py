@@ -8702,6 +8702,7 @@ class HubState:
         requires_rebuild = any(field in update for field in snapshot_fields)
         if requires_rebuild:
             project["setup_snapshot_image"] = ""
+            project["repo_head_sha"] = ""
             project.pop("snapshot_updated_at", None)
             project["build_status"] = "pending"
             project["build_error"] = ""
@@ -8884,6 +8885,7 @@ class HubState:
         if current is None:
             raise HTTPException(status_code=404, detail="Project not found.")
         current["setup_snapshot_image"] = snapshot_tag
+        current["repo_head_sha"] = project_copy.get("repo_head_sha") or ""
         current["snapshot_updated_at"] = _iso_now()
         current["build_status"] = "ready"
         current["build_error"] = ""
@@ -10024,6 +10026,8 @@ class HubState:
             {
                 "snapshot_schema_version": _snapshot_schema_version(),
                 "project_id": project.get("id"),
+                "default_branch": project.get("default_branch") or "",
+                "repo_head_sha": project.get("repo_head_sha") or "",
                 "setup_script": str(project.get("setup_script") or ""),
                 "base_mode": normalized_base_mode,
                 "base_value": normalized_base_value,
@@ -10105,6 +10109,8 @@ class HubState:
     ) -> str:
         workspace = self._ensure_project_clone(project)
         self._sync_checkout_to_remote(workspace, project)
+        head_result = _run_for_repo(["rev-parse", "HEAD"], workspace, capture=True)
+        project["repo_head_sha"] = head_result.stdout.strip()
         return self._ensure_project_setup_snapshot(
             workspace,
             project,
