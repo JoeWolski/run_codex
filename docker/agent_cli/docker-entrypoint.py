@@ -52,7 +52,6 @@ def _prepare_git_credentials() -> None:
                     should_write = target_path.read_bytes() != credential_bytes
                 if should_write:
                     target_path.write_bytes(credential_bytes)
-                target_path.chmod(0o600)
             except OSError:
                 pass
 
@@ -64,7 +63,7 @@ def _ensure_workspace_tmp(*, workspace_tmp: Path | None = None) -> None:
     except OSError as exc:
         raise RuntimeError(
             "Workspace tmp bootstrap failed: "
-            f"path={str(target)!r} unable to initialize with mode 0777 ({exc})"
+            f"path={str(target)!r} unable to create directory ({exc})"
         ) from exc
 
 

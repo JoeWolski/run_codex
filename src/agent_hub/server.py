@@ -2225,10 +2225,6 @@ def _verify_openai_api_key(api_key: str, timeout_seconds: float = 8.0) -> None:
 
 def _write_private_env_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
 
     tmp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2236,10 +2232,6 @@ def _write_private_env_file(path: Path, content: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fp:
             fp.write(content)
         os.replace(tmp_path, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
     finally:
         if tmp_path.exists():
             try:
@@ -3375,7 +3367,7 @@ def _docker_fix_path_ownership(path: Path, uid: int, gid: int) -> None:
             f"{path}:/target",
             DEFAULT_AGENT_IMAGE,
             "-lc",
-            f"chown -R {uid}:{gid} /target && chmod -R u+rwX /target",
+            f"chown -R {uid}:{gid} /target",
         ],
         check=False,
         text=True,
@@ -3626,10 +3618,6 @@ class HubState:
         self.chat_runtime_configs_dir.mkdir(parents=True, exist_ok=True)
         self.git_credentials_dir.mkdir(parents=True, exist_ok=True)
         self.host_codex_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.secrets_dir, 0o700)
-        except OSError:
-            pass
         self._reload_github_app_settings()
         self._load_agent_capabilities_cache()
         self._reconcile_project_build_state()
