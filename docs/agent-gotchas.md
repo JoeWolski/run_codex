@@ -24,6 +24,14 @@ Purpose: record recurring high-cost failures and first-try fixes.
 
 - Symptom: `Failed to read config file ... config.toml: Is a directory`.
 - Root cause: mount source path is not daemon-visible as the expected file.
-- First-try fix: move runtime inputs to daemon-visible host paths; avoid container-local `/tmp` mount sources.
-- Verification: mounted config path is a regular file from daemon perspective; chat starts cleanly.
+- First-try fix: move runtime inputs to daemon-visible host paths; avoid container-local `/tmp` mount sources; stage files under `/workspace/tmp` and re-run.
+- Verification: `docker run --rm -v <host-file>:/etc/alpine-release alpine:3.20 sh -lc 'test -f /etc/alpine-release'` succeeds; chat starts cleanly.
 - Scope: hub/tests launching runtime containers through host daemon.
+
+### Runtime container cannot reach hub using `host.docker.internal`
+
+- Symptom: startup/readiness hangs or fails; container-side `curl http://host.docker.internal:<port>/api/state` returns connection failure.
+- Root cause: daemon network namespace does not provide a working `host.docker.internal` route for these containers.
+- First-try fix: start hub with `--host 0.0.0.0` and set `--artifact-publish-base-url` to a container-reachable host/IP (often `$(hostname -I | awk '{print $1}')` in this environment).
+- Verification: `docker run --rm alpine:3.20 sh -lc 'wget -q -T 2 -O - http://<host-ip>:<port>/api/state >/dev/null'` succeeds; chat `ready_ack_at` populates.
+- Scope: local integration and manual runtime launches in Docker-in-Docker environments.

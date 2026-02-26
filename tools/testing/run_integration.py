@@ -10,6 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR = REPO_ROOT / "tools" / "testing" / "select_integration_suites.py"
+PREFLIGHT = REPO_ROOT / "tools" / "testing" / "preflight_integration_env.py"
 DEFAULT_SELECTION_OUTPUT = Path("/workspace/tmp/agent-hub/integration-suite-selection.json")
 MODE_ALL = "all"
 MODE_DIRECT_AGENT_CLI = "direct-agent-cli"
@@ -137,7 +138,22 @@ def main() -> int:
         default=MODE_ALL,
         help="Harness mode: run all suites, direct agent_cli launch coverage, or hub API E2E coverage.",
     )
+    parser.add_argument(
+        "--preflight",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run Docker/daemon mount-network preflight before selecting/running suites.",
+    )
     args = parser.parse_args()
+
+    if args.preflight:
+        preflight_cmd = [sys.executable, str(PREFLIGHT)]
+        preflight = subprocess.run(preflight_cmd, cwd=REPO_ROOT, check=False, text=True, capture_output=True)
+        if preflight.stdout.strip():
+            print(preflight.stdout.rstrip())
+        if preflight.returncode != 0:
+            detail = preflight.stderr.strip() or "integration preflight failed"
+            raise RuntimeError(detail)
 
     changed_files = [str(item) for item in args.changed_file if str(item).strip()]
     changed_files.extend(str(item) for item in args.changed_files if str(item).strip())
