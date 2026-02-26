@@ -62,6 +62,7 @@ AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
 AGENT_TOOLS_TOKEN_ENV = "AGENT_HUB_AGENT_TOOLS_TOKEN"
 AGENT_TOOLS_PROJECT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_PROJECT_ID"
 AGENT_TOOLS_CHAT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_CHAT_ID"
+AGENT_TOOLS_READY_ACK_GUID_ENV = "AGENT_HUB_READY_ACK_GUID"
 AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
@@ -393,6 +394,7 @@ def _agent_tools_env_from_entries(entries: Iterable[str]) -> dict[str, str]:
             AGENT_TOOLS_TOKEN_ENV,
             AGENT_TOOLS_PROJECT_ID_ENV,
             AGENT_TOOLS_CHAT_ID_ENV,
+            AGENT_TOOLS_READY_ACK_GUID_ENV,
         }:
             env_values[normalized_key] = value.strip()
 
@@ -401,6 +403,7 @@ def _agent_tools_env_from_entries(entries: Iterable[str]) -> dict[str, str]:
         AGENT_TOOLS_TOKEN_ENV: env_values.get(AGENT_TOOLS_TOKEN_ENV, ""),
         AGENT_TOOLS_PROJECT_ID_ENV: env_values.get(AGENT_TOOLS_PROJECT_ID_ENV, ""),
         AGENT_TOOLS_CHAT_ID_ENV: env_values.get(AGENT_TOOLS_CHAT_ID_ENV, ""),
+        AGENT_TOOLS_READY_ACK_GUID_ENV: env_values.get(AGENT_TOOLS_READY_ACK_GUID_ENV, ""),
     }
 
 
@@ -654,6 +657,7 @@ def _start_agent_tools_runtime_bridge(
             repo_url=repo_url,
             credential_binding=credential_binding,
         )
+        ready_ack_guid = hub_state.issue_agent_tools_session_ready_ack_guid(session_id)
 
         class _BridgeHandler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -719,7 +723,7 @@ def _start_agent_tools_runtime_bridge(
 
             def do_POST(self) -> None:  # noqa: N802
                 path = urllib.parse.urlsplit(self.path).path
-                if path not in {"/credentials/resolve", "/project-binding", "/artifacts/submit"}:
+                if path not in {"/credentials/resolve", "/project-binding", "/artifacts/submit", "/ack"}:
                     self._send_json(404, {"detail": "Not found."})
                     return
                 try:
@@ -741,6 +745,16 @@ def _start_agent_tools_runtime_bridge(
                             mode=mode,
                             credential_ids=credential_ids,
                         )
+                    elif path == "/ack":
+                        response = {
+                            "ack": hub_state.acknowledge_agent_tools_session_ready(
+                                session_id=session_id,
+                                token=self._request_token(),
+                                guid=payload.get("guid"),
+                                stage=payload.get("stage"),
+                                meta=payload.get("meta"),
+                            )
+                        }
                     else:
                         response = {
                             "artifact": hub_state.submit_session_artifact(
@@ -765,6 +779,7 @@ def _start_agent_tools_runtime_bridge(
             f"{AGENT_TOOLS_TOKEN_ENV}={session_token}",
             f"{AGENT_TOOLS_PROJECT_ID_ENV}={project_id}",
             f"{AGENT_TOOLS_CHAT_ID_ENV}=agent_cli:{session_id}",
+            f"{AGENT_TOOLS_READY_ACK_GUID_ENV}={ready_ack_guid}",
         ]
         runtime_config_path = _build_agent_tools_runtime_config(
             config_path=config_path,

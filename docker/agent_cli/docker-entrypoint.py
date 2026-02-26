@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 
 def _run(command: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -167,6 +169,38 @@ def _ensure_claude_json_file(path: Path) -> None:
         path.write_text("{}\n", encoding="utf-8")
 
 
+def _ack_runtime_ready() -> None:
+    base_url = str(os.environ.get("AGENT_HUB_AGENT_TOOLS_URL") or "").strip().rstrip("/")
+    token = str(os.environ.get("AGENT_HUB_AGENT_TOOLS_TOKEN") or "").strip()
+    guid = str(os.environ.get("AGENT_HUB_READY_ACK_GUID") or "").strip()
+    if not base_url or not token or not guid:
+        return
+    payload = {
+        "guid": guid,
+        "stage": "container_bootstrapped",
+        "meta": {
+            "entrypoint": "docker/agent_cli/docker-entrypoint.py",
+            "pid": os.getpid(),
+        },
+    }
+    request = urllib.request.Request(
+        f"{base_url}/ack",
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "x-agent-hub-agent-tools-token": token,
+        },
+        data=json.dumps(payload).encode("utf-8"),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5.0):
+            return
+    except (urllib.error.URLError, TimeoutError):
+        return
+
+
 def _entrypoint_main() -> None:
     command = list(sys.argv[1:]) if sys.argv[1:] else ["codex"]
     local_home = os.environ.get("LOCAL_HOME", "").strip() or os.environ.get("HOME", "").strip() or "/tmp"
@@ -183,6 +217,7 @@ def _entrypoint_main() -> None:
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _prepare_git_credentials()
     _configure_git_identity()
+    _ack_runtime_ready()
 
     os.execvp(command[0], command)
 

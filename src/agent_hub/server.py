@@ -96,6 +96,7 @@ AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
 AGENT_TOOLS_TOKEN_ENV = "AGENT_HUB_AGENT_TOOLS_TOKEN"
 AGENT_TOOLS_PROJECT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_PROJECT_ID"
 AGENT_TOOLS_CHAT_ID_ENV = "AGENT_HUB_AGENT_TOOLS_CHAT_ID"
+AGENT_TOOLS_READY_ACK_GUID_ENV = "AGENT_HUB_READY_ACK_GUID"
 AGENT_TOOLS_MCP_CONTAINER_SCRIPT_PATH = str(
     PurePosixPath(DEFAULT_CONTAINER_HOME)
     / ".codex"
@@ -406,6 +407,7 @@ RESERVED_ENV_VAR_KEYS = {
     AGENT_TOOLS_TOKEN_ENV,
     AGENT_TOOLS_PROJECT_ID_ENV,
     AGENT_TOOLS_CHAT_ID_ENV,
+    AGENT_TOOLS_READY_ACK_GUID_ENV,
 }
 AGENT_TOOLS_TOKEN_HEADER = "x-agent-hub-agent-tools-token"
 HUB_LOG_LEVEL_CHOICES = ("critical", "error", "warning", "info", "debug")
@@ -425,6 +427,12 @@ EVENT_TYPE_OPENAI_ACCOUNT_SESSION = "openai_account_session"
 EVENT_TYPE_PROJECT_BUILD_LOG = "project_build_log"
 EVENT_TYPE_AUTO_CONFIG_LOG = "auto_config_log"
 EVENT_TYPE_AGENT_CAPABILITIES_CHANGED = "agent_capabilities_changed"
+AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED = "container_bootstrapped"
+AGENT_READY_ACK_STAGE_AGENT_PROCESS_STARTED = "agent_process_started"
+SUPPORTED_AGENT_READY_ACK_STAGES = {
+    AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED,
+    AGENT_READY_ACK_STAGE_AGENT_PROCESS_STARTED,
+}
 
 LOGGER = logging.getLogger("agent_hub")
 LOGGER.addHandler(logging.NullHandler())
@@ -2522,6 +2530,17 @@ def _hash_agent_tools_token(token: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _new_ready_ack_guid() -> str:
+    return uuid.uuid4().hex
+
+
+def _normalize_ready_ack_stage(value: Any) -> str:
+    candidate = _compact_whitespace(str(value or "")).strip().lower()
+    if candidate not in SUPPORTED_AGENT_READY_ACK_STAGES:
+        return AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED
+    return candidate
+
+
 def _normalize_artifact_name(value: Any, fallback: str = "") -> str:
     candidate = _compact_whitespace(str(value or "")).strip()
     if not candidate:
@@ -3752,6 +3771,11 @@ class HubState:
             chat["artifact_publish_token_issued_at"] = str(chat.get("artifact_publish_token_issued_at") or "")
             chat["agent_tools_token_hash"] = str(chat.get("agent_tools_token_hash") or "")
             chat["agent_tools_token_issued_at"] = str(chat.get("agent_tools_token_issued_at") or "")
+            chat["ready_ack_guid"] = str(chat.get("ready_ack_guid") or "").strip()
+            chat["ready_ack_stage"] = _normalize_ready_ack_stage(chat.get("ready_ack_stage"))
+            chat["ready_ack_at"] = str(chat.get("ready_ack_at") or "")
+            ready_ack_meta = chat.get("ready_ack_meta")
+            chat["ready_ack_meta"] = ready_ack_meta if isinstance(ready_ack_meta, dict) else {}
             chat["create_request_id"] = _compact_whitespace(str(chat.get("create_request_id") or "")).strip()
         return state
 
@@ -6532,6 +6556,7 @@ class HubState:
         agent_tools_token: str,
         agent_tools_project_id: str = "",
         agent_tools_chat_id: str = "",
+        ready_ack_guid: str = "",
         repo_url: str = "",
         project: dict[str, Any] | None = None,
         snapshot_tag: str = "",
@@ -6604,6 +6629,9 @@ class HubState:
         cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}"])
         cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}"])
         cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}"])
+        normalized_ready_ack_guid = str(ready_ack_guid or "").strip()
+        if normalized_ready_ack_guid:
+            cmd.extend(["--env-var", f"{AGENT_TOOLS_READY_ACK_GUID_ENV}={normalized_ready_ack_guid}"])
 
         for env_entry in env_vars or []:
             if _is_reserved_env_entry(str(env_entry)):
@@ -6651,6 +6679,14 @@ class HubState:
         container_workspace = str(PurePosixPath(DEFAULT_CONTAINER_HOME) / container_project_name)
         container_output_file = str(PurePosixPath(container_workspace) / output_file.name)
         session_id, session_token = self._create_agent_tools_session(repo_url=repo_url, workspace=workspace)
+        try:
+            ready_ack_guid = self.issue_agent_tools_session_ready_ack_guid(session_id)
+        except HTTPException as exc:
+            if int(exc.status_code) != 404:
+                raise
+            # Some tests mock _create_agent_tools_session without populating in-memory
+            # session state; fall back to a one-off guid so command construction remains deterministic.
+            ready_ack_guid = _new_ready_ack_guid()
         agent_tools_url = f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}"
         agent_tools_chat_id = f"auto-config:{session_id}"
         runtime_config_file = self._prepare_chat_runtime_config(
@@ -6692,6 +6728,7 @@ class HubState:
             repo_url=repo_url,
             artifacts_url=f"{self.artifact_publish_base_url}/api/agent-tools/sessions/{session_id}/artifacts/publish",
             artifacts_token=artifact_publish_token,
+            ready_ack_guid=ready_ack_guid,
             allocate_tty=False,
             context_key=f"auto_config_chat:{session_id}",
             extra_args=extra_args,
@@ -7809,6 +7846,51 @@ class HubState:
         if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
             raise HTTPException(status_code=403, detail="Invalid agent_tools token.")
 
+    @staticmethod
+    def _validated_ready_ack_guid(*, expected: str, submitted: Any) -> str:
+        normalized_expected = str(expected or "").strip()
+        if not normalized_expected:
+            raise HTTPException(status_code=409, detail="Ready acknowledgement is unavailable for this runtime.")
+        normalized_submitted = str(submitted or "").strip()
+        if not normalized_submitted:
+            raise HTTPException(status_code=400, detail="guid is required.")
+        if normalized_submitted != normalized_expected:
+            raise HTTPException(status_code=400, detail="guid does not match the expected runtime readiness token.")
+        return normalized_submitted
+
+    def acknowledge_agent_tools_chat_ready(
+        self,
+        chat_id: str,
+        *,
+        token: Any,
+        guid: Any,
+        stage: Any = AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED,
+        meta: Any = None,
+    ) -> dict[str, Any]:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        self._require_agent_tools_token(chat, token)
+        resolved_guid = self._validated_ready_ack_guid(expected=chat.get("ready_ack_guid"), submitted=guid)
+        resolved_stage = _normalize_ready_ack_stage(stage)
+        resolved_meta = meta if isinstance(meta, dict) else {}
+        acknowledged_at = _iso_now()
+        chat["ready_ack_guid"] = resolved_guid
+        chat["ready_ack_stage"] = resolved_stage
+        chat["ready_ack_at"] = acknowledged_at
+        chat["ready_ack_meta"] = resolved_meta
+        chat["updated_at"] = acknowledged_at
+        state["chats"][chat_id] = chat
+        self.save(state, reason="agent_tools_chat_ready_ack")
+        return {
+            "chat_id": chat_id,
+            "guid": resolved_guid,
+            "stage": resolved_stage,
+            "acknowledged_at": acknowledged_at,
+            "meta": resolved_meta,
+        }
+
     def _chat_and_project_for_agent_tools(self, chat_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         state = self.load()
         chat = state["chats"].get(chat_id)
@@ -8016,10 +8098,30 @@ class HubState:
             "artifacts": [],
             "artifact_current_ids": [],
             "artifact_publish_token_hash": "",
+            "ready_ack_guid": "",
+            "ready_ack_stage": AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED,
+            "ready_ack_at": "",
+            "ready_ack_meta": {},
         }
         with self._agent_tools_sessions_lock:
             self._agent_tools_sessions[session_id] = payload
         return session_id, token
+
+    def issue_agent_tools_session_ready_ack_guid(self, session_id: str) -> str:
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            raise HTTPException(status_code=400, detail="session_id is required.")
+        guid = _new_ready_ack_guid()
+        with self._agent_tools_sessions_lock:
+            session = self._agent_tools_sessions.get(normalized_session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="agent_tools session not found.")
+            session["ready_ack_guid"] = guid
+            session["ready_ack_stage"] = AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED
+            session["ready_ack_at"] = ""
+            session["ready_ack_meta"] = {}
+            self._agent_tools_sessions[normalized_session_id] = session
+        return guid
 
     def _agent_tools_session(self, session_id: str) -> dict[str, Any]:
         normalized_session_id = str(session_id or "").strip()
@@ -8053,6 +8155,37 @@ class HubState:
         if not submitted_hash or not hmac.compare_digest(submitted_hash, expected_hash):
             raise HTTPException(status_code=403, detail="Invalid agent_tools token.")
         return session
+
+    def acknowledge_agent_tools_session_ready(
+        self,
+        session_id: str,
+        *,
+        token: Any,
+        guid: Any,
+        stage: Any = AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED,
+        meta: Any = None,
+    ) -> dict[str, Any]:
+        session = self.require_agent_tools_session_token(session_id, token)
+        resolved_guid = self._validated_ready_ack_guid(expected=session.get("ready_ack_guid"), submitted=guid)
+        resolved_stage = _normalize_ready_ack_stage(stage)
+        resolved_meta = meta if isinstance(meta, dict) else {}
+        acknowledged_at = _iso_now()
+        with self._agent_tools_sessions_lock:
+            active = self._agent_tools_sessions.get(str(session_id))
+            if active is None:
+                raise HTTPException(status_code=404, detail="agent_tools session not found.")
+            active["ready_ack_guid"] = resolved_guid
+            active["ready_ack_stage"] = resolved_stage
+            active["ready_ack_at"] = acknowledged_at
+            active["ready_ack_meta"] = resolved_meta
+            self._agent_tools_sessions[str(session_id)] = active
+        return {
+            "session_id": str(session_id),
+            "guid": resolved_guid,
+            "stage": resolved_stage,
+            "acknowledged_at": acknowledged_at,
+            "meta": resolved_meta,
+        }
 
     def _agent_tools_project_context_from_session(self, session: dict[str, Any]) -> dict[str, Any]:
         project_id = str(session.get("project_id") or "").strip()
@@ -8996,6 +9129,10 @@ class HubState:
             "artifact_publish_token_issued_at": "",
             "agent_tools_token_hash": "",
             "agent_tools_token_issued_at": "",
+            "ready_ack_guid": "",
+            "ready_ack_stage": AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED,
+            "ready_ack_at": "",
+            "ready_ack_meta": {},
             "create_request_id": _compact_whitespace(str(create_request_id or "")).strip(),
             "created_at": now,
             "updated_at": now,
@@ -10275,6 +10412,11 @@ class HubState:
                 self._chat_artifact_history_public_payload(chat_id, entry)
                 for entry in reversed(cleaned_artifact_prompt_history)
             ]
+            chat_copy["ready_ack_guid"] = str(chat_copy.get("ready_ack_guid") or "").strip()
+            chat_copy["ready_ack_stage"] = _normalize_ready_ack_stage(chat_copy.get("ready_ack_stage"))
+            chat_copy["ready_ack_at"] = str(chat_copy.get("ready_ack_at") or "")
+            ready_ack_meta = chat_copy.get("ready_ack_meta")
+            chat_copy["ready_ack_meta"] = ready_ack_meta if isinstance(ready_ack_meta, dict) else {}
             chat_copy.pop("artifact_publish_token_hash", None)
             chat_copy.pop("artifact_publish_token_issued_at", None)
             chat_copy.pop("agent_tools_token_hash", None)
@@ -10432,6 +10574,7 @@ class HubState:
                 self._chat_input_ansi_carry[chat_id] = ""
             artifact_publish_token = _new_artifact_publish_token()
             agent_tools_token = _new_agent_tools_token()
+            ready_ack_guid = _new_ready_ack_guid()
             agent_tools_url = self._chat_agent_tools_url(chat_id)
             agent_tools_project_id = str(project.get("id") or "")
             agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
@@ -10471,10 +10614,26 @@ class HubState:
                 env_vars=chat.get("env_vars"),
                 artifacts_url=self._chat_artifact_publish_url(chat_id),
                 artifacts_token=artifact_publish_token,
+                ready_ack_guid=ready_ack_guid,
                 resume=resume,
                 context_key=f"chat_start:{chat_id}",
                 extra_args=agent_args,
             )
+
+            state = self.load()
+            chat = state["chats"].get(chat_id)
+            if chat is None:
+                raise HTTPException(status_code=404, detail="Chat was removed before runtime launch.")
+            chat["artifact_publish_token_hash"] = _hash_artifact_publish_token(artifact_publish_token)
+            chat["artifact_publish_token_issued_at"] = _iso_now()
+            chat["agent_tools_token_hash"] = _hash_agent_tools_token(agent_tools_token)
+            chat["agent_tools_token_issued_at"] = _iso_now()
+            chat["ready_ack_guid"] = ready_ack_guid
+            chat["ready_ack_stage"] = AGENT_READY_ACK_STAGE_CONTAINER_BOOTSTRAPPED
+            chat["ready_ack_at"] = ""
+            chat["ready_ack_meta"] = {}
+            state["chats"][chat_id] = chat
+            self.save(state, reason="chat_start_runtime_tokens_issued")
 
             proc = self._spawn_chat_process(chat_id, cmd)
         except Exception as exc:
@@ -10502,6 +10661,11 @@ class HubState:
         chat["artifact_publish_token_issued_at"] = _iso_now()
         chat["agent_tools_token_hash"] = _hash_agent_tools_token(agent_tools_token)
         chat["agent_tools_token_issued_at"] = _iso_now()
+        chat["ready_ack_guid"] = str(chat.get("ready_ack_guid") or ready_ack_guid)
+        chat["ready_ack_stage"] = _normalize_ready_ack_stage(chat.get("ready_ack_stage"))
+        chat["ready_ack_at"] = str(chat.get("ready_ack_at") or "")
+        ready_ack_meta = chat.get("ready_ack_meta")
+        chat["ready_ack_meta"] = ready_ack_meta if isinstance(ready_ack_meta, dict) else {}
         chat["last_started_at"] = _iso_now()
         chat["stop_requested_at"] = ""
         state["chats"][chat_id] = chat
@@ -10553,6 +10717,8 @@ class HubState:
         chat["pid"] = None
         chat["artifact_publish_token_hash"] = ""
         chat["artifact_publish_token_issued_at"] = ""
+        chat["agent_tools_token_hash"] = ""
+        chat["agent_tools_token_issued_at"] = ""
         chat["last_exit_code"] = None
         chat["last_exit_at"] = _iso_now()
         chat["stop_requested_at"] = ""
@@ -11968,6 +12134,28 @@ def main(
             credential_ids=payload.get("credential_ids"),
         )
 
+    @app.post("/api/chats/{chat_id}/agent-tools/ack")
+    async def api_agent_tools_ack_chat_ready(chat_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        payload = await request.json()
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        acknowledgement = state.acknowledge_agent_tools_chat_ready(
+            chat_id=chat_id,
+            token=token,
+            guid=payload.get("guid"),
+            stage=payload.get("stage"),
+            meta=payload.get("meta"),
+        )
+        return {"ack": acknowledgement}
+
     @app.post("/api/chats/{chat_id}/agent-tools/artifacts/submit")
     async def api_agent_tools_submit_chat_artifact(chat_id: str, request: Request) -> dict[str, Any]:
         auth_header = str(request.headers.get("authorization") or "")
@@ -12055,6 +12243,28 @@ def main(
             mode=payload.get("mode"),
             credential_ids=payload.get("credential_ids"),
         )
+
+    @app.post("/api/agent-tools/sessions/{session_id}/ack")
+    async def api_agent_tools_ack_session_ready(session_id: str, request: Request) -> dict[str, Any]:
+        auth_header = str(request.headers.get("authorization") or "")
+        token = ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = str(request.headers.get(AGENT_TOOLS_TOKEN_HEADER) or "").strip()
+        payload = await request.json()
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        acknowledgement = state.acknowledge_agent_tools_session_ready(
+            session_id=session_id,
+            token=token,
+            guid=payload.get("guid"),
+            stage=payload.get("stage"),
+            meta=payload.get("meta"),
+        )
+        return {"ack": acknowledgement}
 
     @app.post("/api/agent-tools/sessions/{session_id}/artifacts/publish")
     async def api_publish_session_artifact(session_id: str, request: Request) -> dict[str, Any]:

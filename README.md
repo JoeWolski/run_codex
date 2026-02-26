@@ -145,6 +145,28 @@ If you run with a custom `--config-file` or `--system-prompt-file`, those files 
 - Node.js + Corepack (only when frontend build is needed).
 - Optional NVIDIA GPU + `nvidia-container-toolkit` for GPU passthrough.
 
+## Deterministic Integration Selection
+
+Run integration suites selected from changed files:
+
+```bash
+tools/testing/run_integration.py --base-ref origin/master...HEAD
+```
+
+Dry-run suite selection:
+
+```bash
+tools/testing/run_integration.py --changed-file src/agent_hub/server.py --dry-run
+```
+
+Direct selector usage:
+
+```bash
+tools/testing/select_integration_suites.py --changed-file src/agent_hub/server.py
+```
+
+Current mappings are defined in `tools/testing/select_integration_suites.py` and default to a core ack-route suite when no file mapping matches.
+
 ## Docker-In-Docker Path Note
 
 When `agent_hub` runs inside a container and launches chat runtime containers through a host Docker daemon, use host-visible paths for:

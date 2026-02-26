@@ -89,6 +89,23 @@ TOOL_LIST = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "ack",
+        "description": (
+            "Acknowledge runtime readiness to Agent Hub for deterministic launch synchronization. "
+            "The guid must match the runtime readiness token set by the launcher."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "guid": {"type": "string"},
+                "stage": {"type": "string"},
+                "meta": {"type": "object"},
+            },
+            "required": ["guid"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -403,6 +420,21 @@ def _handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return _tool_response(payload)
     if name == "submit_artifact":
         payload = _submit_artifacts(arguments)
+        return _tool_response(payload)
+    if name == "ack":
+        guid = str(arguments.get("guid") or "").strip()
+        if not guid:
+            raise RuntimeError("ack requires a non-empty guid.")
+        body: dict[str, Any] = {"guid": guid}
+        stage = str(arguments.get("stage") or "").strip()
+        if stage:
+            body["stage"] = stage
+        meta = arguments.get("meta")
+        if meta is not None:
+            if not isinstance(meta, dict):
+                raise RuntimeError("meta must be an object.")
+            body["meta"] = meta
+        payload = _api_request("/ack", method="POST", payload=body)
         return _tool_response(payload)
     return _tool_error(f"Unsupported tool: {name}")
 
