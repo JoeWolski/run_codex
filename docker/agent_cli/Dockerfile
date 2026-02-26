@@ -1,29 +1,14 @@
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=agent-cli-base
 FROM ${BASE_IMAGE}
 ARG AGENT_PROVIDER=codex
 USER root
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV HOME=/root
-
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-    bash \
-    ca-certificates \
-    curl \
-    gh \
-    git \
-    less \
-    openssh-client \
-    python3 \
-    passwd \
-    sudo \
+    docker.io \
  && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
- && apt-get update \
- && apt-get install -y --no-install-recommends nodejs \
- && case "${AGENT_PROVIDER}" in \
+RUN case "${AGENT_PROVIDER}" in \
       codex) npm install -g @openai/codex ;; \
       claude) curl -fsSL https://claude.ai/install.sh | bash \
               && cp -L /root/.local/bin/claude /usr/local/bin/claude ;; \
@@ -40,14 +25,15 @@ RUN if ! id -u agent >/dev/null 2>&1; then \
  && agent_group="$(id -gn agent)" \
  && mkdir -p /home/agent/projects /home/agent/.cache/uv /home/agent/.codex \
  && chown -R "agent:${agent_group}" /home/agent \
- && mkdir -p /tmp \
- && chmod 1777 /tmp \
  && mkdir -p /workspace/.cache/uv /workspace/.codex /workspace/.config /workspace/tmp \
- && chown -R "agent:${agent_group}" /workspace
+ && chown -R agent:${agent_group} /workspace \
+ && chmod 777 /workspace \
+ && chmod -R 777 /workspace/.cache /workspace/.codex /workspace/.config /workspace/tmp
 
 COPY docker/agent_cli/docker-entrypoint.py /usr/local/bin/docker-entrypoint.py
 RUN chmod +x /usr/local/bin/docker-entrypoint.py
 
 WORKDIR /workspace
+USER agent
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.py"]
 CMD ["codex"]
