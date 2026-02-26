@@ -19,6 +19,7 @@ RUN apt-get update \
     docker.io \
     ffmpeg \
     git \
+    gh \
     jq \
     openssh-client \
     python-is-python3 \
