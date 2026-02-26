@@ -20,6 +20,8 @@ SUITE_MAP: list[tuple[str, list[str], list[str]]] = [
         "docker/agent_cli/",
         [
             "tests/integration/test_agent_cli_runtime_ack.py",
+            "tests/integration/test_agent_cli_snapshot_repro_real.py",
+            "tests/integration/test_entrypoint_auto_ack.py",
             "tests/integration/test_chat_lifecycle_ready.py",
         ],
         ["integration.bootstrap", "integration.readiness"],
@@ -37,6 +39,7 @@ SUITE_MAP: list[tuple[str, list[str], list[str]]] = [
         [
             "tests/integration/test_chat_lifecycle_ready.py",
             "tests/integration/test_hub_chat_lifecycle_api.py",
+            "tests/integration/test_hub_api_real_process.py",
             "tests/integration/test_provider_local_e2e.py",
             "tests/integration/test_agent_matrix.py",
             "tests/integration/test_snapshot_builds.py",

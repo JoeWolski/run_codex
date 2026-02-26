@@ -23,11 +23,14 @@ SUPPORTED_MODES = (
 SUITES_BY_MODE: dict[str, set[str]] = {
     MODE_DIRECT_AGENT_CLI: {
         "tests/integration/test_agent_cli_runtime_ack.py",
+        "tests/integration/test_agent_cli_snapshot_repro_real.py",
+        "tests/integration/test_entrypoint_auto_ack.py",
         "tests/integration/test_snapshot_builds.py",
         "tests/integration/test_chat_lifecycle_ready.py",
         "tests/integration/test_agent_matrix.py",
     },
     MODE_HUB_API_E2E: {
+        "tests/integration/test_hub_api_real_process.py",
         "tests/integration/test_hub_chat_lifecycle_api.py",
         "tests/integration/test_agent_tools_ack_routes.py",
         "tests/integration/test_provider_local_e2e.py",
@@ -39,10 +42,13 @@ REQUIRED_SUITES_BY_MODE: dict[str, set[str]] = {
     MODE_DIRECT_AGENT_CLI: {
         "tests/integration/test_snapshot_builds.py",
         "tests/integration/test_agent_cli_runtime_ack.py",
+        "tests/integration/test_agent_cli_snapshot_repro_real.py",
+        "tests/integration/test_entrypoint_auto_ack.py",
     },
     MODE_HUB_API_E2E: {
         "tests/integration/test_hub_chat_lifecycle_api.py",
         "tests/integration/test_agent_tools_ack_routes.py",
+        "tests/integration/test_hub_api_real_process.py",
     },
 }
 
