@@ -1870,6 +1870,7 @@ def main(
 
     for supplemental_gid in supplemental_group_ids:
         run_args.extend(["--group-add", str(supplemental_gid)])
+    run_args.extend(["--group-add", "agent"])
 
     if sys.platform.startswith("linux"):
         run_args.extend(["--add-host", "host.docker.internal:host-gateway"])

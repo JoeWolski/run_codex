@@ -73,6 +73,13 @@ def _set_umask() -> None:
         os.umask(int(local_umask, 8))
 
 
+def _ensure_workspace_permissions() -> None:
+    try:
+        _run(["chmod", "-R", "g+rwx", "/workspace"], check=False)
+    except Exception:
+        pass
+
+
 def _ensure_claude_native_command_path(*, command: list[str], home: str, source_path: Path | None = None) -> None:
     if not command:
         return
@@ -146,6 +153,7 @@ def _entrypoint_main() -> None:
 
     _ensure_workspace_tmp()
     _set_umask()
+    _ensure_workspace_permissions()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
     _prepare_git_credentials()
     _configure_git_identity()

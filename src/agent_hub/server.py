@@ -1650,6 +1650,7 @@ def _agent_capability_probe_docker_run_args(
         if supp_gid == local_gid:
             continue
         run_args.extend(["--group-add", str(supp_gid)])
+    run_args.extend(["--group-add", "agent"])
     return run_args
 
 
@@ -7332,6 +7333,7 @@ class HubState:
             if supp_gid == self.local_gid:
                 continue
             cmd.extend(["--group-add", str(supp_gid)])
+        cmd.extend(["--group-add", "agent"])
         cmd.extend(
             [
                 DEFAULT_AGENT_IMAGE,
