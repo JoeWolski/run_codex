@@ -982,6 +982,27 @@ def _normalize_container_project_name(raw_value: str | None, fallback_name: str)
     return candidate
 
 
+def _is_running_inside_container() -> bool:
+    return Path("/.dockerenv").exists()
+
+
+def _validate_daemon_visible_mount_source(path: Path, *, label: str) -> None:
+    """
+    Fail fast for mount sources that are frequently invisible to a host Docker daemon
+    when agent_cli itself runs inside a container.
+    """
+    if not _is_running_inside_container():
+        return
+    normalized = path.resolve()
+    for disallowed_root in (Path("/tmp"), Path("/var/tmp")):
+        if normalized == disallowed_root or disallowed_root in normalized.parents:
+            raise click.ClickException(
+                f"{label} must not use container-local '{disallowed_root}' when launching via a host Docker daemon. "
+                f"resolved_path={normalized}. "
+                "Use a daemon-visible path (for example under /workspace or a bind-mounted project directory)."
+            )
+
+
 def _normalize_container_path(raw_path: str) -> PurePosixPath:
     normalized = posixpath.normpath(str(raw_path or "").strip())
     if not normalized.startswith("/"):
@@ -1622,6 +1643,7 @@ def main(
     project_path = _to_absolute(project, cwd)
     if not project_path.is_dir():
         raise click.ClickException(f"Project path does not exist: {project_path}")
+    _validate_daemon_visible_mount_source(project_path, label="--project")
 
     config_path = _to_absolute(config_file, cwd)
     if not config_path.is_file():
@@ -1632,6 +1654,7 @@ def main(
             raise click.ClickException(f"Agent config file does not exist: {config_path}")
     if not config_path.is_file():
         raise click.ClickException(f"Agent config file does not exist: {config_path}")
+    _validate_daemon_visible_mount_source(config_path, label="--config-file")
 
     system_prompt_path = _to_absolute(system_prompt_file, cwd)
     if not system_prompt_path.is_file():
@@ -1642,6 +1665,7 @@ def main(
             raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
     if not system_prompt_path.is_file():
         raise click.ClickException(f"System prompt file does not exist: {system_prompt_path}")
+    _validate_daemon_visible_mount_source(system_prompt_path, label="--system-prompt-file")
     core_system_prompt = _read_system_prompt(system_prompt_path)
 
     git_credential_path: Path | None = None
@@ -1707,6 +1731,7 @@ def main(
     container_project_root = _normalize_container_path(container_project_path)
 
     host_agent_home = Path(agent_home_path or (Path.home() / ".agent-home" / user)).resolve()
+    _validate_daemon_visible_mount_source(host_agent_home, label="--agent-home-path")
     host_codex_dir = host_agent_home / ".codex"
     host_claude_dir = host_agent_home / ".claude"
     host_claude_json_file = host_agent_home / ".claude.json"
@@ -1774,11 +1799,13 @@ def main(
     for mount in ro_mounts:
         _reject_mount_inside_project_path(spec=mount, label="--ro-mount", container_project_path=container_project_root)
         host, container = _parse_mount(mount, "--ro-mount")
+        _validate_daemon_visible_mount_source(Path(host), label="--ro-mount")
         ro_mount_flags.append(f"{host}:{container}:ro")
 
     for mount in rw_mounts:
         _reject_mount_inside_project_path(spec=mount, label="--rw-mount", container_project_path=container_project_root)
         host, container = _parse_mount(mount, "--rw-mount")
+        _validate_daemon_visible_mount_source(Path(host), label="--rw-mount")
         rw_mount_flags.append(f"{host}:{container}")
         rw_mount_specs.append((Path(host), container))
 

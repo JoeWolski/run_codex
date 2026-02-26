@@ -647,6 +647,33 @@ def _cli_option_value(args: list[str], *, long_option: str, short_option: str | 
     return selected
 
 
+def _cli_option_values(args: list[str], *, long_option: str, short_option: str | None = None) -> list[str]:
+    normalized_args = [str(arg) for arg in args]
+    values: list[str] = []
+    index = 0
+    while index < len(normalized_args):
+        arg = normalized_args[index]
+        if arg == "--":
+            break
+        if arg == long_option or (short_option and arg == short_option):
+            if index + 1 < len(normalized_args):
+                values.append(str(normalized_args[index + 1]).strip())
+                index += 2
+                continue
+            index += 1
+            continue
+        if arg.startswith(f"{long_option}="):
+            values.append(str(arg.partition("=")[2]).strip())
+            index += 1
+            continue
+        if short_option and arg.startswith(f"{short_option}="):
+            values.append(str(arg.partition("=")[2]).strip())
+            index += 1
+            continue
+        index += 1
+    return values
+
+
 def _auto_config_analysis_model(agent_type: str, agent_args: list[str]) -> str:
     selected_model = _cli_option_value(agent_args, long_option="--model", short_option="-m")
     if selected_model and selected_model.lower() != "default":
@@ -6643,6 +6670,171 @@ class HubState:
             cmd.extend(extra_args)
         return cmd
 
+    @staticmethod
+    def _extract_container_args_from_command(cmd: list[str]) -> list[str]:
+        for index, token in enumerate(cmd):
+            if token == "--":
+                return [str(item) for item in cmd[index + 1 :]]
+        return []
+
+    def _launch_profile_from_command(
+        self,
+        *,
+        mode: str,
+        command: list[str],
+        workspace: Path,
+        runtime_config_file: Path,
+        container_project_name: str,
+        agent_type: str,
+        snapshot_tag: str,
+        prepare_snapshot_only: bool,
+    ) -> dict[str, Any]:
+        runtime_image = ""
+        if snapshot_tag:
+            runtime_image = str(snapshot_tag)
+            if prepare_snapshot_only:
+                try:
+                    runtime_image = str(agent_cli_image._snapshot_setup_runtime_image_for_snapshot(snapshot_tag))
+                except Exception:
+                    runtime_image = str(snapshot_tag)
+
+        return {
+            "mode": str(mode or "").strip(),
+            "generated_at": _iso_now(),
+            "workspace": str(workspace),
+            "runtime_config_file": str(runtime_config_file),
+            "container_project_name": str(container_project_name),
+            "agent_type": _normalize_chat_agent_type(agent_type),
+            "snapshot_tag": str(snapshot_tag or ""),
+            "runtime_image": runtime_image,
+            "prepare_snapshot_only": bool(prepare_snapshot_only),
+            "ro_mounts": _cli_option_values(command, long_option="--ro-mount"),
+            "rw_mounts": _cli_option_values(command, long_option="--rw-mount"),
+            "env_vars": _cli_option_values(command, long_option="--env-var"),
+            "container_args": self._extract_container_args_from_command(command),
+            "command": [str(item) for item in command],
+        }
+
+    def project_snapshot_launch_profile(self, project_id: str) -> dict[str, Any]:
+        state = self.load()
+        project = state["projects"].get(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found.")
+
+        workspace = self._ensure_project_clone(project)
+        self._sync_checkout_to_remote(workspace, project)
+        head_result = _run_for_repo(["rev-parse", "HEAD"], workspace, capture=True)
+        project_for_launch = dict(project)
+        project_for_launch["repo_head_sha"] = head_result.stdout.strip()
+        snapshot_tag = self._project_setup_snapshot_tag(project_for_launch)
+        resolved_project_id = str(project_for_launch.get("id") or project_id).strip()
+        cmd = self._prepare_agent_cli_command(
+            workspace=workspace,
+            container_project_name=_container_project_name(project_for_launch.get("name") or project_for_launch.get("id")),
+            runtime_config_file=self.config_file,
+            agent_type=DEFAULT_CHAT_AGENT_TYPE,
+            agent_tools_url=f"{self.artifact_publish_base_url}/api/projects/{resolved_project_id}/agent-tools",
+            agent_tools_token="snapshot-token",
+            agent_tools_project_id=resolved_project_id,
+            repo_url=str(project_for_launch.get("repo_url") or ""),
+            project=project_for_launch,
+            snapshot_tag=snapshot_tag,
+            ro_mounts=project_for_launch.get("default_ro_mounts"),
+            rw_mounts=project_for_launch.get("default_rw_mounts"),
+            env_vars=project_for_launch.get("default_env_vars"),
+            setup_script=str(project_for_launch.get("setup_script") or ""),
+            prepare_snapshot_only=True,
+            context_key=f"snapshot:{project_for_launch.get('id')}",
+        )
+        return self._launch_profile_from_command(
+            mode="project_snapshot",
+            command=cmd,
+            workspace=workspace,
+            runtime_config_file=self.config_file,
+            container_project_name=_container_project_name(project_for_launch.get("name") or project_for_launch.get("id")),
+            agent_type=DEFAULT_CHAT_AGENT_TYPE,
+            snapshot_tag=snapshot_tag,
+            prepare_snapshot_only=True,
+        )
+
+    def chat_launch_profile(
+        self,
+        chat_id: str,
+        *,
+        resume: bool = False,
+        agent_tools_token: str = "agent-tools-token",
+        artifact_publish_token: str = "artifact-token",
+        ready_ack_guid: str = "ready-ack-guid",
+    ) -> dict[str, Any]:
+        state = self.load()
+        chat = state["chats"].get(chat_id)
+        if chat is None:
+            raise HTTPException(status_code=404, detail="Chat not found.")
+        project = state["projects"].get(chat.get("project_id"))
+        if project is None:
+            raise HTTPException(status_code=404, detail="Parent project missing.")
+
+        snapshot_tag = str(project.get("setup_snapshot_image") or "").strip()
+        expected_snapshot_tag = self._project_setup_snapshot_tag(project)
+        snapshot_ready = (
+            str(project.get("build_status") or "") == "ready"
+            and snapshot_tag
+            and snapshot_tag == expected_snapshot_tag
+        )
+        if not snapshot_ready:
+            raise HTTPException(status_code=409, detail="Project image is not ready yet. Wait for setup build to finish.")
+
+        workspace = self._ensure_chat_clone(chat, project)
+        self._sync_checkout_to_remote(workspace, project)
+        container_project_name = _container_project_name(project.get("name") or project.get("id"))
+        agent_type = _normalize_chat_agent_type(chat.get("agent_type"))
+        runtime_config_file = self._prepare_chat_runtime_config(
+            chat_id,
+            agent_type=agent_type,
+            agent_tools_url=self._chat_agent_tools_url(chat_id),
+            agent_tools_token=agent_tools_token,
+            agent_tools_project_id=str(project.get("id") or ""),
+            agent_tools_chat_id=chat_id,
+        )
+        agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
+        if resume and agent_type == AGENT_TYPE_CODEX:
+            agent_args = []
+        elif resume:
+            agent_args = self._resume_agent_args(agent_type, agent_args)
+
+        cmd = self._prepare_agent_cli_command(
+            workspace=workspace,
+            container_project_name=container_project_name,
+            runtime_config_file=runtime_config_file,
+            agent_type=agent_type,
+            agent_tools_url=self._chat_agent_tools_url(chat_id),
+            agent_tools_token=agent_tools_token,
+            agent_tools_project_id=str(project.get("id") or ""),
+            agent_tools_chat_id=chat_id,
+            repo_url=str(project.get("repo_url") or ""),
+            project=project,
+            snapshot_tag=snapshot_tag,
+            ro_mounts=chat.get("ro_mounts"),
+            rw_mounts=chat.get("rw_mounts"),
+            env_vars=chat.get("env_vars"),
+            artifacts_url=self._chat_artifact_publish_url(chat_id),
+            artifacts_token=artifact_publish_token,
+            ready_ack_guid=ready_ack_guid,
+            resume=resume,
+            context_key=f"chat_launch_profile:{chat_id}",
+            extra_args=agent_args,
+        )
+        return self._launch_profile_from_command(
+            mode="chat_start",
+            command=cmd,
+            workspace=workspace,
+            runtime_config_file=runtime_config_file,
+            container_project_name=container_project_name,
+            agent_type=agent_type,
+            snapshot_tag=snapshot_tag,
+            prepare_snapshot_only=False,
+        )
+
     def _run_temporary_auto_config_chat(
         self,
         workspace: Path,
@@ -11491,6 +11683,7 @@ def main(
     state.schedule_startup_reconcile()
 
     app = FastAPI()
+    app.state.hub_state = state
     frontend_dist = _frontend_dist_dir()
     frontend_index = _frontend_index_file()
 
@@ -11894,6 +12087,10 @@ def main(
             return ""
         return log_path.read_text(encoding="utf-8", errors="ignore")
 
+    @app.get("/api/projects/{project_id}/launch-profile")
+    def api_project_launch_profile(project_id: str) -> dict[str, Any]:
+        return {"launch_profile": state.project_snapshot_launch_profile(project_id)}
+
     @app.post("/api/projects/{project_id}/chats/start")
     async def api_start_new_chat_for_project(project_id: str, request: Request) -> dict[str, Any]:
         payload: dict[str, Any] = {}
@@ -11979,6 +12176,10 @@ def main(
     @app.post("/api/chats/{chat_id}/start")
     def api_start_chat(chat_id: str) -> dict[str, Any]:
         return {"chat": state.start_chat(chat_id)}
+
+    @app.get("/api/chats/{chat_id}/launch-profile")
+    def api_chat_launch_profile(chat_id: str, resume: bool = False) -> dict[str, Any]:
+        return {"launch_profile": state.chat_launch_profile(chat_id, resume=resume)}
 
     @app.post("/api/chats/{chat_id}/refresh-container")
     def api_refresh_chat_container(chat_id: str) -> dict[str, Any]:
