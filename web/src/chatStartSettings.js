@@ -154,8 +154,14 @@ export function buildChatStartConfig(
   if (normalized.model !== "default") {
     args.push("--model", normalized.model);
   }
-  if (normalized.agentType === "codex" && normalized.reasoning !== "default") {
-    args.push("-c", `model_reasoning_effort="${normalized.reasoning}"`);
+  if (normalized.reasoning !== "default") {
+    if (normalized.agentType === "codex") {
+      args.push("-c", `model_reasoning_effort="${normalized.reasoning}"`);
+    } else if (normalized.agentType === "claude") {
+      args.push("--effort", normalized.reasoning);
+    } else if (normalized.agentType === "gemini") {
+      args.push("--thinking-level", normalized.reasoning);
+    }
   }
   return { agentType: normalized.agentType, agentArgs: args };
 }

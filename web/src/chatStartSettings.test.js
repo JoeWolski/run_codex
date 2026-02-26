@@ -134,6 +134,66 @@ test("non-codex agents ignore reasoning mode and normalize invalid model selecti
   });
 });
 
+const FULL_CAPABILITIES = {
+  agents: [
+    {
+      agentType: "codex",
+      models: ["default", "gpt-5-codex", "gpt-5-mini"],
+      reasoningModes: ["default", "low", "medium", "high"]
+    },
+    {
+      agentType: "claude",
+      models: ["default", "claude-3-7-sonnet"],
+      reasoningModes: ["default", "low", "medium", "high"]
+    },
+    {
+      agentType: "gemini",
+      models: ["default", "gemini-2.0-pro"],
+      reasoningModes: ["default", "low", "medium", "high"]
+    }
+  ]
+};
+
+test("buildChatStartConfig passes --effort flag for claude when reasoning is non-default", () => {
+  const payload = buildChatStartConfig(
+    {
+      agentType: "claude",
+      model: "claude-3-7-sonnet",
+      reasoning: "high"
+    },
+    FULL_CAPABILITIES
+  );
+  assert.deepEqual(payload, {
+    agentType: "claude",
+    agentArgs: ["--model", "claude-3-7-sonnet", "--effort", "high"]
+  });
+});
+
+test("buildChatStartConfig passes --thinking-level flag for gemini when reasoning is non-default", () => {
+  const payload = buildChatStartConfig(
+    {
+      agentType: "gemini",
+      model: "default",
+      reasoning: "medium"
+    },
+    FULL_CAPABILITIES
+  );
+  assert.deepEqual(payload, {
+    agentType: "gemini",
+    agentArgs: ["--thinking-level", "medium"]
+  });
+});
+
+test("buildChatStartConfig omits reasoning flags for all agents when set to default", () => {
+  for (const agentType of ["codex", "claude", "gemini"]) {
+    const payload = buildChatStartConfig(
+      { agentType, model: "default", reasoning: "default" },
+      FULL_CAPABILITIES
+    );
+    assert.deepEqual(payload.agentArgs, [], `expected no reasoning args for ${agentType} with default`);
+  }
+});
+
 test("normalizeModeOptions prepends default and de-duplicates values case-insensitively", () => {
   const options = normalizeModeOptions(["Default", " GPT-5 ", "gpt-5", "gpt-5-mini"], ["default"]);
   assert.deepEqual(options, ["default", "gpt-5", "gpt-5-mini"]);
