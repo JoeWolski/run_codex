@@ -1,96 +1,76 @@
 # AGENTS.md
 
-## Core instructions
+## 1) Hierarchy
 
-- In this repository, "core instructions" refers to `SYSTEM_PROMPT.md`.
-- Treat `SYSTEM_PROMPT.md` as the authoritative shared system prompt source across all agents.
-- Use `yarn` (not `npm`) for JavaScript package management in this repository and its subprojects.
+- `SYSTEM_PROMPT.md` is the shared cross-project core prompt.
+- This file defines repository-specific rules.
+- Use `yarn` (not `npm`) for JavaScript package management.
 
-## Design practices
+## 2) Product behavior
 
-- Prefer responsive, optimistic UI behavior.
-- When users request images of UI/UX elements, capture screenshots from the real running application and real backend flow. Do not provide mockups or mocked-backend renderings unless the user explicitly asks for a mock.
-- Any PR that includes UI/UX behavior or layout changes must include image evidence for all changed states against the real backend. Do not consider a UI/UX PR complete until this evidence is attached to the PR.
-- Show immediate feedback on user actions; do not wait for long async operations before updating UI state.
-- Keep layout geometry stable during state transitions to avoid cursor-jump behavior.
-- Keep action controls spatially consistent; toggled states should not move controls unexpectedly.
-- Place loading indicators at the locus of work (where users are looking for progress).
-- Avoid replacing entire components when in-place state transitions can preserve continuity.
-- Support concurrent operations where backend semantics allow it.
-- Use progressive disclosure for dense configuration and details.
-- Hide irrelevant controls and empty sections; show actions only when they are meaningful for current state.
-- Keep interaction patterns keyboard-accessible and predictable.
-- Make status/state explicit with clear, user-facing labels.
+- Prefer responsive, optimistic UI with immediate local feedback.
+- Keep layout/control positions stable through state transitions.
+- Put progress indicators where work is happening.
+- Prefer in-place state transitions over full component swaps.
+- Use progressive disclosure; hide irrelevant controls/empty sections.
+- Keep interactions keyboard-accessible and state labels explicit.
+- Support concurrent operations when backend semantics allow it.
 
-## Data and behavior principles
+## 3) Data and reliability
 
-- Treat server-side state as authoritative for shared/app-critical data.
-- Persist user/app state on the backend so sessions are consistent across devices.
-- Reconcile optimistic client state with server state without causing abrupt UI jumps.
-- Ensure shutdown/cleanup paths are deterministic and do not require repeated user intervention.
-- Do not bundle multiple files into zip/tar archives by default; upload original files individually.
-- Only upload archive files when the user explicitly asks for an archive upload.
-- If an upload batch partially fails, retry only failed files and never re-upload files that already succeeded.
+- Treat server state as authoritative for shared/app-critical data.
+- Persist state on backend for cross-session consistency.
+- Reconcile optimistic state without abrupt UI jumps.
+- Ensure deterministic shutdown/cleanup paths.
+- For batched uploads, retry only failed files.
+- Do not upload archives unless explicitly requested.
 
-## Implementation quality
+## 4) Quality bar
 
-- Favor state-driven rendering over ad hoc DOM behavior.
+- Favor state-driven rendering.
 - Keep async flows cancellation-safe and shutdown-safe.
-- Validate changes with appropriate build/test checks before handoff.
-- Time every new individual test in isolation.
-- If any new individual test takes longer than 1 second, fix it before merge.
-- Long or hanging unit tests are not acceptable.
-- When updating, fixing, or adding features for a specific agent, verify the changes do not break or degrade behavior for any other supported agent.
+- Validate before handoff.
+- Time each new test in isolation.
+- New individual tests must run in <= 1s.
+- Agent-specific changes must not regress other supported agents.
 
-## UI Evidence Workflow
+## 5) UI evidence (required for UI-rendering changes)
 
-- Never commit screenshot files to the repository. Keep UI evidence files untracked and attach them to the PR.
-- For UI/UX PRs, capture every state changed by the PR (for example: default, toggled, loading, success, error, empty, and responsive/mobile variants when relevant).
-- Evidence scope rule: capture sufficient images to cover every UI state changed by the PR, but do not spend extra cycles polishing or expanding evidence beyond what is needed for reviewer verification.
-- Prefer JPG/JPEG for PR UI evidence uploads to reduce file size and improve review loading speed. Use PNG only when PNG is required (for example transparency or lossless detail checks).
-- In the development Docker image, use Playwright Firefox for UI evidence capture (`firefox` browser type). This is the browser runtime expected to be available in-container by default.
-- Prefer Playwright scripts that explicitly launch Firefox (`const { firefox } = await import("playwright");`) when generating PR screenshots from the real app.
-- If browser/runtime availability changes in `docker/development/Dockerfile` (or any image layer it depends on), update this `UI Evidence Workflow` section in the same PR so the documented screenshot browser instructions remain accurate.
-- Treat any change that can alter rendered UI output (for example CSS, spacing/alignment, typography, colors, component structure, visibility conditions, state labels/text, or responsive behavior) as requiring refreshed UI evidence.
-- After each commit or force-push that includes any UI-rendering change, regenerate and replace PR UI images before handoff, even if the visual change seems small.
-- Whenever a PR is updated, explicitly re-check whether existing UI/UX demo images are still accurate for the latest commit. If anything changed visually, regenerate and replace the images in the PR.
-- UI/UX images in the PR body must always reflect the most up-to-date UI state for the current PR head commit. Remove or replace stale images immediately.
-- Before presenting UI/UX evidence to the user or adding it to the PR body, inspect every image to confirm it shows the intended UI state and not an unrelated error, auth issue, setup failure, or transient warning state.
-- Use this exact workflow so image generation is deterministic and does not require rediscovery:
-- 1. Install browser tooling: `cd tools/demo && npm ci`
-- 2. Mirror auth/config context from the active server before launching the evidence server (so screenshots reflect real connected state and do not show unrelated credential/setup errors):
-- `export SOURCE_DATA_DIR=\"${SOURCE_DATA_DIR:-$HOME/.local/share/agent-hub}\"`
-- `export UI_DATA_DIR=/workspace/tmp/agent-hub-ui-evidence`
-- `mkdir -p \"$UI_DATA_DIR\" \"$UI_DATA_DIR/secrets\" \"$HOME/.agent-home/uid-$(id -u)/.codex\"`
-- `if [ -d \"$SOURCE_DATA_DIR/secrets\" ]; then rm -rf \"$UI_DATA_DIR/secrets\" && mkdir -p \"$UI_DATA_DIR/secrets\" && cp -a \"$SOURCE_DATA_DIR/secrets/.\" \"$UI_DATA_DIR/secrets/\"; fi`
-- `if [ -f \"$HOME/.codex/auth.json\" ]; then cp \"$HOME/.codex/auth.json\" \"$HOME/.agent-home/uid-$(id -u)/.codex/auth.json\"; fi`
-- `cp config/agent.config.toml \"$UI_DATA_DIR/agent.config.toml\"`
-- `cp SYSTEM_PROMPT.md \"$UI_DATA_DIR/SYSTEM_PROMPT.md\"`
-- 3. Start real app server in one terminal with mirrored config context: `UV_PROJECT_ENVIRONMENT=.venv-local uv run agent_hub --host 127.0.0.1 --port 8876 --data-dir \"$UI_DATA_DIR\" --config-file \"$UI_DATA_DIR/agent.config.toml\" --system-prompt-file \"$UI_DATA_DIR/SYSTEM_PROMPT.md\" --frontend-build`
-- 4. Sanity-check auth before screenshots (example: `curl -fsS http://127.0.0.1:8876/api/settings/auth`) and do not proceed while unrelated credential/setup errors are visible in UI state targeted for evidence.
-- 5. Capture screenshots in another terminal using Playwright against `http://127.0.0.1:8876` (real backend) and save to `.agent-artifacts/` (or `/workspace/tmp/agent-hub-ui-evidence/`). Prefer `type: "jpeg"`/`.jpg` outputs unless PNG is explicitly needed.
-- Chat view selector note: the Chats page can render in different layout engines (for example classic cards vs FlexLayout tabs), so Playwright screenshot scripts must not assume a single DOM structure for locating chat rows or controls.
-- Startup validation note: when capturing evidence for chat launch behavior, verify state with `/api/state` polling and explicit assertions that failure UI copy is absent (for example `Chat failed. Review the error and retry.`), instead of depending only on a specific transient CSS class like `.status.starting`.
-- Docker-in-Docker gotcha: ensure `UI_DATA_DIR` and any `--config-file` path used for screenshot runs are bind-mountable from the Docker daemon host perspective, not only visible inside the current container.
-- Failure signature for the path issue above: Codex chat startup fails with `Failed to read config file ... config.toml: Is a directory`.
-- Practical fix before evidence capture: verify `<UI_DATA_DIR>/agent.config.toml` is a regular file from the daemon view (not a directory), and clear stale failed chats so `.build-error` banners from older attempts are not mistaken for current UI state.
-- Timing guidance from this environment: after chat reaches `running`/`is_running`, wait about 8-12 seconds before screenshot so terminal content is rendered; if the Codex runtime image is rebuilding, the interactive prompt can take roughly 60-90 seconds to appear.
-- 6. For PR body image rendering on `github.com`, use publicly reachable image URLs. Do not use local-only links such as `/api/chats/.../artifacts/...` in PR markdown.
-- 7. Programmatic upload path for public URLs (CLI-safe): `curl -fsS -F "file=@<image-path>" https://tmpfiles.org/api/v1/upload` and use the returned URL converted from `https://tmpfiles.org/<id>/<name>` to `https://tmpfiles.org/dl/<id>/<name>`.
-- 8. Update the PR body with a `## UI/UX Demo` section containing Markdown image links (`![alt](https://...)`) using `gh api repos/<owner>/<repo>/pulls/<pr-number> -X PATCH --raw-field body=\"$(cat <body-file>)\"`.
-- 9. If using GitHub web manually, drag/drop uploads in the PR editor are allowed, but the resulting images still must appear in the PR body.
-- 10. Once UI/UX PR evidence is finished and the PR is updated, shut down any programs (such as the app server or Playwright/headless browsers) launched to generate it.
-- For Docker-in-Docker integration tests, do not mount runtime paths under container-local `/tmp` directories.
-- Use host-visible, daemon-visible bind-mounted paths for mounts and ensure each mounted path resolves to the same absolute path on the host daemon.
-- Do not use `/tmp` for `--data-dir`, `--config-file`, `--system-prompt-file`, project mounts, or other chat/workspace mounts during integration tests.
-- In the PR Validation section, list the exact commands used for server start, screenshot capture, public URL upload, and PR body update, with pass/fail status.
+- Use real app + real backend (no mock backend unless explicitly requested).
+- Keep screenshots untracked; attach to PR.
+- Cover each changed state (default/loading/success/error/empty/responsive as applicable).
+- Prefer JPG/JPEG; use PNG only when required.
+- Ensure PR images match latest head commit and are free of unrelated auth/setup errors.
+- Use Playwright Firefox in this environment.
 
-## Git safety
+### Required UI evidence flow
 
-- This repository uses a rebase-based workflow.
-- Use branch names in the format `<username>/<feature-name>` (for example: `JoeWolski/fix-build-regression`).
-- Keep each branch as a single commit at all times; amend or squash instead of stacking multiple commits.
-- If you find a feature branch contains multiple commits, collapse it to a single effective commit and use a sensible commit message that describes the resulting change.
-- Never use merges for branch updates or integration; rebase onto the latest default remote branch instead.
-- `git push --force` is allowed on updated feature branches.
-- Never commit non-operational files (for example: generated media, temporary exports, logs, screenshots, or local debug artifacts). Commit only files required for runtime/build/test behavior (source/config/dependency metadata) unless the user explicitly asks to include non-operational files.
+1. Install tooling: `cd tools/demo && yarn install --frozen-lockfile`
+2. Mirror auth/config into `UI_DATA_DIR=/workspace/tmp/agent-hub-ui-evidence`.
+3. Start app with mirrored config and real backend.
+4. Verify auth endpoint before capture: `curl -fsS http://127.0.0.1:8876/api/settings/auth`
+5. Capture screenshots against `http://127.0.0.1:8876`.
+6. Upload to public URLs and update PR body image links.
+7. Stop evidence processes.
+
+### High-impact UI gotchas
+
+- Docker-in-Docker mounts must be daemon-visible; avoid container-local `/tmp` mount sources.
+- Failure signature: `Failed to read config file ... config.toml: Is a directory`.
+- Chats UI selectors vary by layout engine; avoid single-structure selectors.
+- For startup evidence, validate with `/api/state` + explicit failure-copy checks.
+
+## 6) Git workflow
+
+- Rebase-only workflow; do not merge.
+- Branch format: `<username>/<feature-name>`.
+- Keep one effective commit per feature branch (amend/squash as needed).
+- Rebase onto latest default remote branch before final handoff.
+- Force-push updated feature branches when needed.
+- Do not commit non-operational artifacts unless explicitly requested.
+
+## 7) Maintenance
+
+- Keep prompt-context docs minimal, current, and operational.
+- Record recurring high-cost failures in `docs/agent-gotchas.md`.
+- Gotcha format: symptom, root cause, first-try fix, verification, scope.

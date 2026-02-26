@@ -9,11 +9,13 @@ sandbox_mode = "danger-full-access"
 web_search = "live"
 
 project_doc_auto_load = true
-project_doc_fallback_filenames = ["AGENTS.md", "README.md"]
+# Keep default prompt bootstrap concise/high-signal.
+project_doc_fallback_filenames = ["AGENTS.md"]
 project_doc_auto_load_extra_filenames = [
   "docs/repo-map.md",
   "docs/agent-mcp.md",
   "docs/agent-setup.md",
+  "docs/agent-gotchas.md",
 ]
 project_doc_max_bytes = 131072
 

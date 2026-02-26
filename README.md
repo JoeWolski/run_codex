@@ -118,18 +118,21 @@ PATH handling behavior:
 
 ## Chat Agent Prompt Context (Major Files)
 
-For day-to-day prompt/setup changes, these are the main files that assemble most of the chat agent context:
+For day-to-day prompt/setup changes, these are the main files that assemble most of the chat agent context.
 These paths are resolved from each chat's checked-out target project workspace, not from the Agent Hub repository itself (unless Agent Hub is the target project).
 
 1. `config/agent.config.toml`
    - Shared runtime and project-doc bootstrap settings.
    - Passed into Codex chats as `~/.codex/config.toml`.
    - Used to derive project-doc bootstrap hints appended to all providers' shared prompt context.
+   - Default bootstrap doc set is optimized for concise, high-signal context: `AGENTS.md`, `docs/repo-map.md`, `docs/agent-mcp.md`, `docs/agent-setup.md`, `docs/agent-gotchas.md`.
 2. `SYSTEM_PROMPT.md`
    - Source of shared core system instructions across Codex, Claude, and Gemini.
    - Injected by `agent_cli` for each provider (Codex CLI config override, Claude append-system-prompt, Gemini context file sync).
 3. `AGENTS.md` (in the checked-out project repo)
    - Primary repo-specific instruction file loaded by the agent.
+4. `docs/repo-map.md`, `docs/agent-mcp.md`, `docs/agent-setup.md`, `docs/agent-gotchas.md` (optional, recommended)
+   - Compact repository and workflow references intended to reduce ambiguity without loading broad narrative docs.
 
 If you run with a custom `--config-file` or `--system-prompt-file`, those files replace the defaults for chat setup/context.
 
