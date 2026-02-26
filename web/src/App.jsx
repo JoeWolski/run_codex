@@ -45,6 +45,7 @@ import {
   projectRowFromPendingAutoConfig,
   removePendingAutoConfigProject
 } from "./autoConfigProjects";
+import { selectProjectBuildDraft } from "./projectBuildDraft";
 import {
   GIT_PROVIDER_GITHUB,
   GIT_PROVIDER_GITLAB,
@@ -3066,10 +3067,16 @@ function HubApp() {
       return;
     }
     const project = projectsById.get(normalizedProjectId);
-    const draft = projectDraftsRef.current[normalizedProjectId] || projectDrafts[normalizedProjectId];
+    const cachedDraft = projectDraftsRef.current[normalizedProjectId] || projectDrafts[normalizedProjectId] || null;
+    const serverProjectDraft = project ? projectDraftFromProject(project) : null;
+    const draft = selectProjectBuildDraft({
+      isEditing: Boolean(editingProjects[normalizedProjectId]),
+      cachedDraft,
+      serverProjectDraft
+    });
     markProjectBuilding(normalizedProjectId);
     try {
-      await persistProjectSettings(normalizedProjectId, draft || (project ? projectDraftFromProject(project) : null));
+      await persistProjectSettings(normalizedProjectId, draft);
       setEditingProjects((prev) => ({ ...prev, [normalizedProjectId]: false }));
       setPendingProjectBuilds((prev) => {
         const next = { ...prev };
