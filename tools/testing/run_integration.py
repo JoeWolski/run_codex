@@ -10,7 +10,41 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SELECTOR = REPO_ROOT / "tools" / "testing" / "select_integration_suites.py"
-DEFAULT_SELECTION_OUTPUT = REPO_ROOT / "tmp" / "integration-suite-selection.json"
+PREFLIGHT = REPO_ROOT / "tools" / "testing" / "preflight_integration_env.py"
+DEFAULT_SELECTION_OUTPUT = Path("/workspace/tmp/agent-hub/integration-suite-selection.json")
+MODE_ALL = "all"
+MODE_DIRECT_AGENT_CLI = "direct-agent-cli"
+MODE_HUB_API_E2E = "hub-api-e2e"
+SUPPORTED_MODES = (
+    MODE_ALL,
+    MODE_DIRECT_AGENT_CLI,
+    MODE_HUB_API_E2E,
+)
+SUITES_BY_MODE: dict[str, set[str]] = {
+    MODE_DIRECT_AGENT_CLI: {
+        "tests/integration/test_agent_cli_runtime_ack.py",
+        "tests/integration/test_snapshot_builds.py",
+        "tests/integration/test_chat_lifecycle_ready.py",
+        "tests/integration/test_agent_matrix.py",
+    },
+    MODE_HUB_API_E2E: {
+        "tests/integration/test_hub_chat_lifecycle_api.py",
+        "tests/integration/test_agent_tools_ack_routes.py",
+        "tests/integration/test_provider_local_e2e.py",
+        "tests/integration/test_chat_lifecycle_ready.py",
+        "tests/integration/test_agent_matrix.py",
+    },
+}
+REQUIRED_SUITES_BY_MODE: dict[str, set[str]] = {
+    MODE_DIRECT_AGENT_CLI: {
+        "tests/integration/test_snapshot_builds.py",
+        "tests/integration/test_agent_cli_runtime_ack.py",
+    },
+    MODE_HUB_API_E2E: {
+        "tests/integration/test_hub_chat_lifecycle_api.py",
+        "tests/integration/test_agent_tools_ack_routes.py",
+    },
+}
 
 
 def _changed_files_from_git(base_ref: str) -> list[str]:
@@ -60,6 +94,19 @@ def _write_selection_artifact(path: Path, payload: dict[str, list[str]]) -> None
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _filtered_suites_for_mode(suites: list[str], mode: str) -> list[str]:
+    if mode == MODE_ALL:
+        return list(suites)
+    allowed = SUITES_BY_MODE.get(mode, set())
+    required = REQUIRED_SUITES_BY_MODE.get(mode, set())
+    filtered = set(suite for suite in suites if suite in allowed)
+    filtered.update(required)
+    if filtered:
+        return sorted(filtered)
+    # Preserve deterministic behavior if selector output does not overlap with chosen mode.
+    return sorted(allowed)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run deterministic integration suites.")
     parser.add_argument("--base-ref", default="origin/master...HEAD", help="git diff base expression.")
@@ -85,7 +132,28 @@ def main() -> int:
         action="store_true",
         help="Only print selected suites.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=SUPPORTED_MODES,
+        default=MODE_ALL,
+        help="Harness mode: run all suites, direct agent_cli launch coverage, or hub API E2E coverage.",
+    )
+    parser.add_argument(
+        "--preflight",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run Docker/daemon mount-network preflight before selecting/running suites.",
+    )
     args = parser.parse_args()
+
+    if args.preflight:
+        preflight_cmd = [sys.executable, str(PREFLIGHT)]
+        preflight = subprocess.run(preflight_cmd, cwd=REPO_ROOT, check=False, text=True, capture_output=True)
+        if preflight.stdout.strip():
+            print(preflight.stdout.rstrip())
+        if preflight.returncode != 0:
+            detail = preflight.stderr.strip() or "integration preflight failed"
+            raise RuntimeError(detail)
 
     changed_files = [str(item) for item in args.changed_file if str(item).strip()]
     changed_files.extend(str(item) for item in args.changed_files if str(item).strip())
@@ -93,6 +161,7 @@ def main() -> int:
         changed_files = _changed_files_from_git(args.base_ref)
 
     selection = _select_payload(changed_files)
+    selection["suites"] = _filtered_suites_for_mode(selection["suites"], args.mode)
     _write_selection_artifact(Path(args.selection_output), selection)
 
     suites = selection["suites"]
@@ -100,6 +169,7 @@ def main() -> int:
         print("No integration suites selected.")
         return 0
 
+    print(f"Harness mode: {args.mode}")
     print("Selected integration suites:")
     for suite in suites:
         print(f"- {suite}")

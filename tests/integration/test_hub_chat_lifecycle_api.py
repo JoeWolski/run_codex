@@ -184,3 +184,39 @@ class TestHubLifecycleApiIntegration:
         assert response.status_code == 200, response.text
         assert "Unable to find group agent" in response.text
         assert "docker run --group-add agent" in response.text
+
+    def test_launch_profile_routes_use_production_launch_builder(self) -> None:
+        app = self._build_app()
+        state = app.state.hub_state
+        ids = self._seed_ready_project(state, project_id="project-launch-profile")
+        chat = state.create_chat(
+            project_id=ids["project_id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=[],
+            agent_args=[],
+            agent_type=hub_server.AGENT_TYPE_CODEX,
+        )
+
+        with patch.object(hub_server.HubState, "_ensure_project_clone", return_value=Path.cwd()), patch.object(
+            hub_server.HubState, "_ensure_chat_clone", return_value=Path.cwd()
+        ), patch.object(hub_server.HubState, "_sync_checkout_to_remote", return_value=None), patch(
+            "agent_hub.server._run_for_repo", return_value=SimpleNamespace(stdout="deadbeef\n")
+        ), patch.object(
+            hub_server.HubState, "_prepare_chat_runtime_config", return_value=Path.cwd() / "runtime.toml"
+        ):
+            with TestClient(app) as client:
+                project_profile = client.get(f"/api/projects/{ids['project_id']}/launch-profile")
+                chat_profile = client.get(f"/api/chats/{chat['id']}/launch-profile")
+
+        assert project_profile.status_code == 200, project_profile.text
+        project_payload = project_profile.json()["launch_profile"]
+        assert project_payload["mode"] == "project_snapshot"
+        assert "--prepare-snapshot-only" in project_payload["command"]
+
+        assert chat_profile.status_code == 200, chat_profile.text
+        chat_payload = chat_profile.json()["launch_profile"]
+        assert chat_payload["mode"] == "chat_start"
+        assert chat_payload["agent_type"] == hub_server.AGENT_TYPE_CODEX
+        assert any(entry.startswith("AGENT_HUB_READY_ACK_GUID=") for entry in chat_payload["env_vars"])

@@ -1,0 +1,21 @@
+services:
+  gitea:
+    image: gitea/gitea:1.22.6
+    container_name: agent-hub-local-gitea
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__service__DISABLE_REGISTRATION=true
+      - GITEA__server__ROOT_URL=http://127.0.0.1:3000/
+    ports:
+      - "3000:3000"
+      - "2222:22"
+    volumes:
+      - /workspace/tmp/agent-hub-gitea-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
