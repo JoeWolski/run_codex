@@ -1646,11 +1646,11 @@ def _agent_capability_probe_docker_run_args(
         "--env",
         f"PATH={container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     ]
+    run_args.extend(["--group-add", "agent"])
     for supp_gid in _parse_gid_csv(local_supp_gids_csv):
         if supp_gid == local_gid:
             continue
         run_args.extend(["--group-add", str(supp_gid)])
-    run_args.extend(["--group-add", "agent"])
     return run_args
 
 
@@ -7329,11 +7329,11 @@ class HubState:
             "--env",
             f"PATH={container_home}/.codex/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         ]
+        cmd.extend(["--group-add", "agent"])
         for supp_gid in _parse_gid_csv(self.local_supp_gids):
             if supp_gid == self.local_gid:
                 continue
             cmd.extend(["--group-add", str(supp_gid)])
-        cmd.extend(["--group-add", "agent"])
         cmd.extend(
             [
                 DEFAULT_AGENT_IMAGE,

@@ -536,7 +536,8 @@ class HubStateTests(unittest.TestCase):
         self.assertIn("/host/agent.config.toml:/workspace/.codex/config.toml:ro", run_args)
         self.assertIn("HOME=/workspace", run_args)
         self.assertIn("CONTAINER_HOME=/workspace", run_args)
-        self.assertEqual(run_args.count("--group-add"), 1)
+        self.assertEqual(run_args.count("--group-add"), 2)
+        self.assertIn("agent", run_args)
         self.assertIn("2000", run_args)
 
     def test_run_agent_capability_probe_returns_build_failure_details(self) -> None:
