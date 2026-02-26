@@ -167,6 +167,8 @@ tools/testing/select_integration_suites.py --changed-file src/agent_hub/server.p
 
 Current mappings are defined in `tools/testing/select_integration_suites.py` and default to a core ack-route suite when no file mapping matches.
 
+Local provider end-to-end coverage is included in `tests/integration/test_provider_local_e2e.py`, which runs a lightweight local forge harness using `git http-backend` plus GitLab-compatible PAT verification endpoints.
+
 ## Docker-In-Docker Path Note
 
 When `agent_hub` runs inside a container and launches chat runtime containers through a host Docker daemon, use host-visible paths for:
