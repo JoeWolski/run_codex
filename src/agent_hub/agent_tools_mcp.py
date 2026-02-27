@@ -284,10 +284,46 @@ def _expand_artifact_file_paths(submitted_paths: list[str]) -> list[Path]:
 
 
 def _submit_artifact_path(path: Path, *, name: str = "") -> dict[str, Any]:
-    payload: dict[str, Any] = {"path": str(path)}
-    if name:
-        payload["name"] = name
-    response = _api_request("/artifacts/submit", method="POST", payload=payload)
+    base_url = _agent_tools_base_url()
+    url = f"{base_url}/artifacts/submit"
+    token = _agent_tools_token()
+    file_name = str(name).strip() or path.name or "artifact"
+    body = path.read_bytes()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/octet-stream",
+        "x-agent-hub-artifact-name": file_name,
+        "x-agent-hub-agent-tools-token": token,
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "agent-tools-mcp/1.0",
+    }
+    request = urllib.request.Request(url, headers=headers, method="POST", data=body)
+    try:
+        with urllib.request.urlopen(request, timeout=60.0) as response:
+            payload_text = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="ignore")
+        detail = body_text.strip() or f"HTTP {exc.code}"
+        LOGGER.warning(
+            "agent_tools multipart artifact submit failed for %s: HTTP %s body=%s",
+            path,
+            exc.code,
+            body_text.strip()[:400] if body_text else "None",
+        )
+        raise RuntimeError(f"agent_tools API request failed: POST {url} -> {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        LOGGER.error("agent_tools multipart artifact submit failed for %s: %s", path, exc)
+        raise RuntimeError(f"agent_tools API request failed: POST {url}: {exc}") from exc
+
+    if not payload_text.strip():
+        raise RuntimeError(f"agent_tools artifact submit response missing artifact payload for {path}")
+    try:
+        response = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        response_preview = payload_text[:400]
+        if len(payload_text) > 400:
+            response_preview = f"{response_preview}..."
+        raise RuntimeError(f"agent_tools API request returned non-JSON response: {response_preview}") from exc
     artifact_payload = response.get("artifact") if isinstance(response, dict) else None
     if not isinstance(artifact_payload, dict):
         raise RuntimeError(f"agent_tools artifact submit response missing artifact payload for {path}")

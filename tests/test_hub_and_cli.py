@@ -10,6 +10,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import urllib.request
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path, PurePosixPath
@@ -5937,16 +5938,13 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             file_two = tmp_path / "b.txt"
             file_one.write_text("a", encoding="utf-8")
             file_two.write_text("b", encoding="utf-8")
-            captured_payloads: list[dict[str, Any]] = []
+            submitted_calls: list[tuple[str, str]] = []
 
-            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-                self.assertEqual(path, "/artifacts/submit")
-                self.assertEqual(method, "POST")
-                assert payload is not None
-                captured_payloads.append(dict(payload))
-                return self._artifact_payload(str(payload["path"]), str(payload.get("name") or ""))
+            def fake_submit(path: Path, *, name: str = "") -> dict[str, Any]:
+                submitted_calls.append((str(path), str(name)))
+                return self._artifact_payload(str(path), str(name))
 
-            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+            with patch("agent_hub.agent_tools_mcp._submit_artifact_path", side_effect=fake_submit):
                 result = agent_tools_mcp._submit_artifacts(
                     {
                         "paths": [str(file_one), str(file_two)],
@@ -5959,10 +5957,13 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             self.assertEqual(result["processed_count"], 2)
             self.assertEqual(result["succeeded_count"], 2)
             self.assertEqual(result["failed_count"], 0)
-            self.assertEqual(captured_payloads[0]["path"], str(file_one.resolve()))
-            self.assertEqual(captured_payloads[1]["path"], str(file_two.resolve()))
-            self.assertNotIn("name", captured_payloads[0])
-            self.assertNotIn("name", captured_payloads[1])
+            self.assertEqual(
+                submitted_calls,
+                [
+                    (str(file_one.resolve()), ""),
+                    (str(file_two.resolve()), ""),
+                ],
+            )
 
     def test_submit_artifact_accepts_directory_and_rejects_subdirectories(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5973,14 +5974,11 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             (flat_dir / "a.txt").write_text("a", encoding="utf-8")
             submitted_paths: list[str] = []
 
-            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-                self.assertEqual(path, "/artifacts/submit")
-                self.assertEqual(method, "POST")
-                assert payload is not None
-                submitted_paths.append(str(payload.get("path") or ""))
-                return self._artifact_payload(str(payload["path"]), str(payload.get("name") or ""))
+            def fake_submit(path: Path, *, name: str = "") -> dict[str, Any]:
+                submitted_paths.append(str(path))
+                return self._artifact_payload(str(path), str(name))
 
-            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+            with patch("agent_hub.agent_tools_mcp._submit_artifact_path", side_effect=fake_submit):
                 result = agent_tools_mcp._submit_artifacts(
                     {"paths": [str(flat_dir)], "max_attempts": 1, "retry_delay_base_sec": 0, "retry_delay_max_sec": 0}
                 )
@@ -5995,6 +5993,72 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 agent_tools_mcp._submit_artifacts({"paths": [str(nested_dir)]})
             self.assertIn("Subdirectories are not supported for artifact submit", str(ctx.exception))
+
+    def test_submit_artifact_applies_single_name_to_single_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            artifact_file = tmp_path / "report.md"
+            artifact_file.write_text("report", encoding="utf-8")
+            submitted_calls: list[tuple[str, str]] = []
+
+            def fake_submit(path: Path, *, name: str = "") -> dict[str, Any]:
+                submitted_calls.append((str(path), str(name)))
+                return self._artifact_payload(str(path), str(name))
+
+            with patch("agent_hub.agent_tools_mcp._submit_artifact_path", side_effect=fake_submit):
+                result = agent_tools_mcp._submit_artifacts(
+                    {
+                        "paths": [str(artifact_file.resolve())],
+                        "name": "Final Report",
+                        "max_attempts": 1,
+                        "retry_delay_base_sec": 0,
+                        "retry_delay_max_sec": 0,
+                    }
+                )
+
+            self.assertEqual(result["failed_count"], 0)
+            self.assertEqual(submitted_calls, [(str(artifact_file.resolve()), "Final Report")])
+
+    def test_submit_artifact_path_uses_binary_upload_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            artifact_file = tmp_path / "report.md"
+            artifact_file.write_text("report body", encoding="utf-8")
+
+            class FakeResponse:
+                def __enter__(self) -> "FakeResponse":
+                    return self
+
+                def __exit__(self, exc_type, exc, tb) -> None:
+                    return None
+
+                def read(self) -> bytes:
+                    return json.dumps({"artifact": {"id": "a1", "name": "Final Report"}}).encode("utf-8")
+
+            def fake_urlopen(request: urllib.request.Request, timeout: float = 0.0) -> FakeResponse:
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(timeout, 60.0)
+                self.assertIn("/artifacts/submit", request.full_url)
+                content_type = str(request.headers.get("Content-Type") or request.headers.get("Content-type") or "")
+                self.assertEqual(content_type, "application/octet-stream")
+                header_map = {str(k).lower(): str(v) for k, v in request.header_items()}
+                artifact_name = str(header_map.get("x-agent-hub-artifact-name") or "")
+                self.assertEqual(artifact_name, "Final Report")
+                body = bytes(request.data or b"")
+                self.assertEqual(body, b"report body")
+                return FakeResponse()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENT_HUB_AGENT_TOOLS_URL": "http://example.test/api/chats/chat-1/agent-tools",
+                    "AGENT_HUB_AGENT_TOOLS_TOKEN": "token-1",
+                },
+                clear=False,
+            ), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                artifact = agent_tools_mcp._submit_artifact_path(artifact_file.resolve(), name="Final Report")
+
+            self.assertEqual(artifact["id"], "a1")
 
     def test_submit_artifact_rejects_name_for_multiple_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6021,17 +6085,14 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             file_two.write_text("b", encoding="utf-8")
             call_counts: dict[str, int] = {str(file_one.resolve()): 0, str(file_two.resolve()): 0}
 
-            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-                self.assertEqual(path, "/artifacts/submit")
-                self.assertEqual(method, "POST")
-                assert payload is not None
-                normalized_path = str(payload.get("path") or "")
+            def fake_submit(path: Path, *, name: str = "") -> dict[str, Any]:
+                normalized_path = str(path)
                 call_counts[normalized_path] = call_counts.get(normalized_path, 0) + 1
                 if normalized_path == str(file_two.resolve()) and call_counts[normalized_path] == 1:
                     raise RuntimeError("simulated transient failure")
-                return self._artifact_payload(normalized_path, str(payload.get("name") or ""))
+                return self._artifact_payload(normalized_path, str(name))
 
-            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+            with patch("agent_hub.agent_tools_mcp._submit_artifact_path", side_effect=fake_submit):
                 result = agent_tools_mcp._submit_artifacts(
                     {
                         "paths": [str(file_one), str(file_two)],
@@ -6054,17 +6115,14 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             file_two.write_text("b", encoding="utf-8")
             call_counts: dict[str, int] = {str(file_one.resolve()): 0, str(file_two.resolve()): 0}
 
-            def fake_api(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-                self.assertEqual(path, "/artifacts/submit")
-                self.assertEqual(method, "POST")
-                assert payload is not None
-                normalized_path = str(payload.get("path") or "")
+            def fake_submit(path: Path, *, name: str = "") -> dict[str, Any]:
+                normalized_path = str(path)
                 call_counts[normalized_path] = call_counts.get(normalized_path, 0) + 1
                 if normalized_path == str(file_two.resolve()):
                     raise RuntimeError(f"simulated upload failure for {normalized_path}")
-                return self._artifact_payload(normalized_path, str(payload.get("name") or ""))
+                return self._artifact_payload(normalized_path, str(name))
 
-            with patch("agent_hub.agent_tools_mcp._api_request", side_effect=fake_api):
+            with patch("agent_hub.agent_tools_mcp._submit_artifact_path", side_effect=fake_submit):
                 with self.assertRaises(RuntimeError) as ctx:
                     agent_tools_mcp._submit_artifacts(
                         {
@@ -6087,8 +6145,8 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             report_file.write_text("report body", encoding="utf-8")
 
             with patch(
-                "agent_hub.agent_tools_mcp._api_request",
-                return_value=self._artifact_payload(str(report_file.resolve()), "Final Report"),
+                "agent_hub.agent_tools_mcp._submit_artifact_path",
+                return_value=self._artifact_payload(str(report_file.resolve()), "Final Report")["artifact"],
             ):
                 response = agent_tools_mcp._handle_tool_call(
                     "submit_artifact",
