@@ -5082,6 +5082,31 @@ class HubState:
             return ""
         return str(token_record.get("personal_access_token") or "").strip()
 
+    def _recommended_auth_env_vars_for_repo(
+        self,
+        repo_url: str,
+        credential_binding: dict[str, Any] | None = None,
+    ) -> list[str]:
+        token_record = self._personal_access_token_for_repo(
+            repo_url,
+            credential_binding=credential_binding,
+        )
+        if not token_record:
+            return []
+        token = str(token_record.get("personal_access_token") or "").strip()
+        if not token:
+            return []
+        provider = str(token_record.get("provider") or "").strip().lower()
+        if provider == GIT_PROVIDER_GITLAB:
+            return [f"GITLAB_TOKEN={token}"]
+        if provider == GIT_PROVIDER_GITHUB:
+            # Keep both in sync so git/gh workflows work without extra setup.
+            return [
+                f"GITHUB_TOKEN={token}",
+                f"GH_TOKEN={token}",
+            ]
+        return []
+
     def _github_connected_personal_access_tokens(self) -> list[dict[str, Any]]:
         return self._connected_personal_access_tokens(GIT_PROVIDER_GITHUB)
 
@@ -6775,15 +6800,6 @@ class HubState:
         if resume and agent_type == AGENT_TYPE_CODEX:
             cmd.append("--resume")
         cmd.extend(self._openai_credentials_arg())
-        cmd.extend(
-            self._github_git_args_for_repo(
-                repo_url,
-                project=project,
-                context_key=context_key,
-            )
-        )
-        for git_identity_env in self._github_git_identity_env_vars_for_repo(repo_url, project=project):
-            cmd.extend(["--env-var", git_identity_env])
         if snapshot_tag:
             self._append_project_base_args(cmd, workspace, project)
             cmd.extend(["--snapshot-image-tag", snapshot_tag])
@@ -9142,13 +9158,49 @@ class HubState:
             credential_binding=credential_binding,
         )
         normalized_env_vars = self._dedupe_entries(default_env_vars or [])
-        if not any(
-            str(entry).split("=", 1)[0].strip().upper() == "GH_TOKEN"
+        auth_env_vars = self._recommended_auth_env_vars_for_repo(
+            repo_url,
+            credential_binding=normalized_binding,
+        )
+        existing_env_keys = {
+            str(entry).split("=", 1)[0].strip().upper()
             for entry in normalized_env_vars
-        ):
-            gh_token = self._github_personal_access_token_for_repo(repo_url, credential_binding=normalized_binding)
-            if gh_token:
-                normalized_env_vars.append(f"GH_TOKEN={gh_token}")
+            if "=" in str(entry)
+        }
+        github_token_value = ""
+        for entry in normalized_env_vars:
+            raw = str(entry)
+            if "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            normalized_key = key.strip().upper()
+            if normalized_key in {"GITHUB_TOKEN", "GH_TOKEN"} and value:
+                github_token_value = value
+                break
+        if not github_token_value:
+            for entry in auth_env_vars:
+                raw = str(entry)
+                if "=" not in raw:
+                    continue
+                key, value = raw.split("=", 1)
+                normalized_key = key.strip().upper()
+                if normalized_key in {"GITHUB_TOKEN", "GH_TOKEN"} and value:
+                    github_token_value = value
+                    break
+        if github_token_value:
+            if "GITHUB_TOKEN" not in existing_env_keys:
+                normalized_env_vars.append(f"GITHUB_TOKEN={github_token_value}")
+                existing_env_keys.add("GITHUB_TOKEN")
+            if "GH_TOKEN" not in existing_env_keys:
+                normalized_env_vars.append(f"GH_TOKEN={github_token_value}")
+                existing_env_keys.add("GH_TOKEN")
+        for auth_env in auth_env_vars:
+            auth_key = str(auth_env).split("=", 1)[0].strip().upper()
+            if auth_key in {"GITHUB_TOKEN", "GH_TOKEN"}:
+                continue
+            if auth_key and auth_key not in existing_env_keys:
+                normalized_env_vars.append(auth_env)
+                existing_env_keys.add(auth_key)
         resolved_default_branch = str(default_branch or "").strip()
         if not resolved_default_branch:
             git_env = self._github_git_env_for_repo(

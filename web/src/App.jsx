@@ -437,7 +437,14 @@ function envRowsFromArray(entries) {
 }
 
 function isSensitiveEnvVarKey(key) {
-  return String(key || "").trim().toUpperCase() === "GH_TOKEN";
+  const normalized = String(key || "").trim().toUpperCase();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.endsWith("_TOKEN") && /(?:^|_)(?:GITHUB|GITLAB|GH|GL)(?:_|$)/.test(normalized)) {
+    return true;
+  }
+  return normalized === "GH_TOKEN" || normalized === "GITHUB_TOKEN" || normalized === "GITLAB_TOKEN";
 }
 
 function redactedProjectEnvEntry(entry) {

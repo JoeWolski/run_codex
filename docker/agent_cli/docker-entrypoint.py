@@ -29,35 +29,6 @@ def _configure_git_identity() -> None:
     _run(["git", "config", "--global", "user.email", git_user_email])
 
 
-def _prepare_git_credentials() -> None:
-    # Keep runtime git auth deterministic by providing a credential helper file when configured.
-    source_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_SOURCE", "").strip()
-    target_raw = os.environ.get("AGENT_HUB_GIT_CREDENTIALS_FILE", "").strip()
-    if not source_raw:
-        return
-
-    source_path = Path(source_raw)
-    target_path = Path(target_raw or "/tmp/agent_hub_git_credentials")
-    if source_path.is_file():
-        try:
-            credential_bytes = source_path.read_bytes()
-        except OSError:
-            credential_bytes = b""
-        if credential_bytes:
-            try:
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
-            try:
-                should_write = True
-                if target_path.exists():
-                    should_write = target_path.read_bytes() != credential_bytes
-                if should_write:
-                    target_path.write_bytes(credential_bytes)
-            except OSError:
-                pass
-
-
 def _ensure_workspace_tmp(*, workspace_tmp: Path | None = None) -> None:
     target = workspace_tmp or Path("/workspace/tmp")
     try:
@@ -215,7 +186,6 @@ def _entrypoint_main() -> None:
     _ensure_user_in_passwd()
     _ensure_workspace_permissions()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
-    _prepare_git_credentials()
     _configure_git_identity()
     _ack_runtime_ready()
 

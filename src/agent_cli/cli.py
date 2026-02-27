@@ -1166,16 +1166,6 @@ def _build_snapshot_setup_shell_script(setup_script: str) -> str:
         "mkdir -p /workspace/tmp\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: configuring git safe.directory'\n"
         "git config --global --add safe.directory '*'\n"
-        'if [ -n "${AGENT_HUB_GIT_CREDENTIALS_SOURCE:-}" ]; then\n'
-        '  if [ ! -f "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" ]; then\n'
-        "    printf '%s\\n' '[agent_cli] snapshot bootstrap failed: AGENT_HUB_GIT_CREDENTIALS_SOURCE is set but file is missing' >&2\n"
-        "    printf '%s\\n' \"[agent_cli] missing path: ${AGENT_HUB_GIT_CREDENTIALS_SOURCE}\" >&2\n"
-        "    exit 96\n"
-        "  fi\n"
-        '  credential_target="${AGENT_HUB_GIT_CREDENTIALS_FILE:-/tmp/agent_hub_git_credentials}"\n'
-        "  printf '%s\\n' \"[agent_cli] snapshot bootstrap: copying git credentials to ${credential_target}\"\n"
-        '  cp "${AGENT_HUB_GIT_CREDENTIALS_SOURCE}" "${credential_target}"\n'
-        "fi\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'\n"
         + normalized_script
         + "\n"
@@ -1668,35 +1658,14 @@ def main(
     _validate_daemon_visible_mount_source(system_prompt_path, label="--system-prompt-file")
     core_system_prompt = _read_system_prompt(system_prompt_path)
 
-    git_credential_path: Path | None = None
-    git_credential_host_value = ""
-    git_credential_scheme_value = ""
-
-    if git_credential_file:
-        git_credential_path = _to_absolute(git_credential_file, cwd)
-        if not git_credential_path.is_file():
-            raise click.ClickException(f"Git credential file does not exist: {git_credential_path}")
-    if git_credential_host:
-        git_credential_host_value = _normalize_git_credential_host(git_credential_host)
-    if git_credential_scheme:
-        git_credential_scheme_value = _normalize_git_credential_scheme(git_credential_scheme)
-
-    if git_credential_path is None and not git_credential_host_value:
-        discovered_path, discovered_host, discovered_scheme = _discover_agent_hub_git_credentials()
-        if discovered_path is not None and discovered_host:
-            git_credential_path = discovered_path
-            git_credential_host_value = discovered_host
-            git_credential_scheme_value = discovered_scheme or GIT_CREDENTIAL_DEFAULT_SCHEME
-
-    if bool(git_credential_path) != bool(git_credential_host_value):
-        raise click.ClickException(
-            "--git-credential-file and --git-credential-host must be provided together"
-        )
-    if git_credential_host_value and not git_credential_scheme_value:
-        git_credential_scheme_value = GIT_CREDENTIAL_DEFAULT_SCHEME
-    if git_credential_scheme_value and not git_credential_host_value:
-        raise click.ClickException(
-            "--git-credential-scheme requires --git-credential-host"
+    if git_credential_file or git_credential_host or git_credential_scheme:
+        click.echo(
+            (
+                "Ignoring --git-credential-* flags. "
+                "Provide standard provider tokens via --env-var "
+                "(for example GITHUB_TOKEN=... or GITLAB_TOKEN=...)."
+            ),
+            err=True,
         )
 
     uid = local_uid if local_uid is not None else os.getuid()
@@ -1917,23 +1886,6 @@ def main(
 
     if api_key:
         run_args.extend(["--env", f"OPENAI_API_KEY={api_key}"])
-
-    if git_credential_path is not None and git_credential_host_value:
-        git_prefix = f"{git_credential_scheme_value}://{git_credential_host_value}/"
-        git_credential_ssh_host = git_credential_host_value.split(":", 1)[0]
-        run_args.extend(["--volume", f"{git_credential_path}:{GIT_CREDENTIALS_SOURCE_PATH}:ro"])
-        run_args.extend(["--env", "GIT_TERMINAL_PROMPT=0"])
-        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIALS_SOURCE={GIT_CREDENTIALS_SOURCE_PATH}"])
-        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIALS_FILE={GIT_CREDENTIALS_FILE_PATH}"])
-        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIAL_HOST={git_credential_host_value}"])
-        run_args.extend(["--env", f"AGENT_HUB_GIT_CREDENTIAL_SCHEME={git_credential_scheme_value}"])
-        run_args.extend(["--env", "GIT_CONFIG_COUNT=3"])
-        run_args.extend(["--env", "GIT_CONFIG_KEY_0=credential.helper"])
-        run_args.extend(["--env", f"GIT_CONFIG_VALUE_0=store --file={GIT_CREDENTIALS_FILE_PATH}"])
-        run_args.extend(["--env", f"GIT_CONFIG_KEY_1=url.{git_prefix}.insteadOf"])
-        run_args.extend(["--env", f"GIT_CONFIG_VALUE_1=git@{git_credential_ssh_host}:"])
-        run_args.extend(["--env", f"GIT_CONFIG_KEY_2=url.{git_prefix}.insteadOf"])
-        run_args.extend(["--env", f"GIT_CONFIG_VALUE_2=ssh://git@{git_credential_ssh_host}/"])
 
     for env_entry in parsed_env_vars:
         run_args.extend(["--env", env_entry])

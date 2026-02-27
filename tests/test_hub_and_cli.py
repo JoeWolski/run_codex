@@ -268,23 +268,30 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(binding["source"], "auto_create")
         self.assertIsInstance(binding["updated_at"], str)
 
-    def test_project_creation_auto_discovers_github_pat_and_adds_gh_token_env_var(self) -> None:
+    def test_project_creation_auto_discovers_github_pat_and_adds_github_token_env_var(self) -> None:
         self._connect_github_pat()
         project = self.state.add_project(
             repo_url="https://github.com/org/robotics-repo.git",
             default_branch="main",
         )
-        self.assertEqual(project["default_env_vars"], [f"GH_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}"])
+        self.assertEqual(
+            project["default_env_vars"],
+            [
+                f"GITHUB_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}",
+                f"GH_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}",
+            ],
+        )
 
-    def test_project_creation_preserves_explicit_gh_token_env_var(self) -> None:
+    def test_project_creation_preserves_explicit_github_token_env_var(self) -> None:
         self._connect_github_pat()
         project = self.state.add_project(
             repo_url="https://github.com/org/robotics-repo.git",
             default_branch="main",
-            default_env_vars=["GH_TOKEN=manual-token", "FOO=bar"],
+            default_env_vars=["GITHUB_TOKEN=manual-token", "FOO=bar"],
         )
+        self.assertIn("GITHUB_TOKEN=manual-token", project["default_env_vars"])
+        self.assertNotIn(f"GITHUB_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}", project["default_env_vars"])
         self.assertIn("GH_TOKEN=manual-token", project["default_env_vars"])
-        self.assertNotIn(f"GH_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}", project["default_env_vars"])
         self.assertIn("FOO=bar", project["default_env_vars"])
 
     def test_project_creation_auto_discovers_gitlab_credential_binding(self) -> None:
@@ -307,14 +314,13 @@ class HubStateTests(unittest.TestCase):
         self.assertEqual(binding["source"], "auto_create")
         self.assertIsInstance(binding["updated_at"], str)
 
-    def test_project_creation_with_gitlab_auto_discovery_does_not_add_gh_token(self) -> None:
+    def test_project_creation_with_gitlab_auto_discovery_adds_gitlab_token(self) -> None:
         self._connect_gitlab_pat()
         project = self.state.add_project(
             repo_url="https://gitlab.com/org/robotics-repo.git",
             default_branch="main",
         )
-        self.assertEqual(project["default_env_vars"], [])
-        self.assertFalse(any(str(entry).startswith("GH_TOKEN=") for entry in project["default_env_vars"]))
+        self.assertEqual(project["default_env_vars"], [f"GITLAB_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}"])
 
     def test_project_setup_snapshot_tag_includes_runtime_input_fingerprint(self) -> None:
         project = self.state.add_project(
@@ -2480,7 +2486,7 @@ Gemini CLI
             profile="",
             ro_mounts=[],
             rw_mounts=[],
-            env_vars=[],
+            env_vars=list(project["default_env_vars"]),
             agent_args=[],
         )
         latest_snapshot = self.state._project_setup_snapshot_tag(project)
@@ -2540,7 +2546,7 @@ Gemini CLI
         self.assertEqual(captured["started"], {"chat_id": chat["id"], "resume": True})
         self.assertEqual(result, {"id": chat["id"], "status": "running"})
 
-    def test_start_chat_passes_github_app_credentials_when_configured(self) -> None:
+    def test_start_chat_does_not_pass_custom_git_credential_args_for_github_app(self) -> None:
         self._connect_github_app()
         project = self.state.add_project(
             repo_url="https://github.com/org/repo.git",
@@ -2552,7 +2558,7 @@ Gemini CLI
             profile="",
             ro_mounts=[],
             rw_mounts=[],
-            env_vars=[],
+            env_vars=list(project["default_env_vars"]),
             agent_args=[],
         )
 
@@ -2586,16 +2592,12 @@ Gemini CLI
             self.state.start_chat(chat["id"])
 
         cmd = captured["cmd"]
-        self.assertIn("--git-credential-file", cmd)
-        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
-        self.assertTrue(credential_path.exists())
-        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
-        self.assertIn("--git-credential-host", cmd)
-        self.assertIn("github.com", cmd)
+        self.assertNotIn("--git-credential-file", cmd)
+        self.assertNotIn("--git-credential-host", cmd)
         self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_URL=") for entry in cmd))
         self.assertTrue(any(str(entry).startswith("AGENT_HUB_AGENT_TOOLS_TOKEN=") for entry in cmd))
 
-    def test_start_chat_passes_github_pat_credentials_and_identity_when_configured(self) -> None:
+    def test_start_chat_passes_standard_github_token_env_var_when_configured(self) -> None:
         self._connect_github_pat()
         project = self.state.add_project(
             repo_url="https://github.com/org/repo.git",
@@ -2607,7 +2609,7 @@ Gemini CLI
             profile="",
             ro_mounts=[],
             rw_mounts=[],
-            env_vars=[],
+            env_vars=list(project["default_env_vars"]),
             agent_args=[],
         )
 
@@ -2641,16 +2643,14 @@ Gemini CLI
             self.state.start_chat(chat["id"])
 
         cmd = captured["cmd"]
-        self.assertIn("--git-credential-file", cmd)
-        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
-        self.assertTrue(credential_path.exists())
-        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
-        self.assertIn("--git-credential-host", cmd)
-        self.assertIn("github.com", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
+        self.assertNotIn("--git-credential-file", cmd)
+        self.assertNotIn("--git-credential-host", cmd)
+        self.assertIn(f"GITHUB_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}", cmd)
+        self.assertIn(f"GH_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}", cmd)
+        self.assertNotIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
+        self.assertNotIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
 
-    def test_start_chat_passes_gitlab_pat_credentials_and_identity_when_configured(self) -> None:
+    def test_start_chat_passes_standard_gitlab_token_env_var_when_configured(self) -> None:
         self._connect_gitlab_pat()
         project = self.state.add_project(
             repo_url="https://gitlab.com/org/repo.git",
@@ -2662,7 +2662,7 @@ Gemini CLI
             profile="",
             ro_mounts=[],
             rw_mounts=[],
-            env_vars=[],
+            env_vars=list(project["default_env_vars"]),
             agent_args=[],
         )
 
@@ -2698,14 +2698,11 @@ Gemini CLI
             self.state.start_chat(chat["id"])
 
         cmd = captured["cmd"]
-        self.assertIn("--git-credential-file", cmd)
-        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
-        self.assertTrue(credential_path.exists())
-        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
-        self.assertIn("--git-credential-host", cmd)
-        self.assertIn("gitlab.com", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_NAME=GitLab User", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=gitlab-user@example.com", cmd)
+        self.assertNotIn("--git-credential-file", cmd)
+        self.assertNotIn("--git-credential-host", cmd)
+        self.assertIn(f"GITLAB_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}", cmd)
+        self.assertNotIn("AGENT_HUB_GIT_USER_NAME=GitLab User", cmd)
+        self.assertNotIn("AGENT_HUB_GIT_USER_EMAIL=gitlab-user@example.com", cmd)
 
     def test_start_chat_uses_configured_artifact_publish_base_url(self) -> None:
         self.state.artifact_publish_base_url = "http://172.17.0.4:8765/hub"
@@ -3680,12 +3677,8 @@ Gemini CLI
         self.assertEqual(cmd[prompt_index + 1], str(self.state.system_prompt_file))
         self.assertIn("--credentials-file", cmd)
         self.assertIn(str(self.state.openai_credentials_file), cmd)
-        self.assertIn("--git-credential-file", cmd)
-        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
-        self.assertTrue(credential_path.exists())
-        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
-        self.assertIn("--git-credential-host", cmd)
-        self.assertIn("github.com", cmd)
+        self.assertNotIn("--git-credential-file", cmd)
+        self.assertNotIn("--git-credential-host", cmd)
         self.assertIn("--no-alt-screen", cmd)
         self.assertIn("--base", cmd)
         base_index = cmd.index("--base")
@@ -3954,12 +3947,9 @@ Gemini CLI
         self.assertEqual(len(executed), 1)
         cmd = executed[0]
         self.assertIn("agent_cli", cmd)
-        self.assertIn("--git-credential-file", cmd)
-        credential_path = Path(cmd[cmd.index("--git-credential-file") + 1])
-        self.assertTrue(credential_path.exists())
-        self.assertEqual(credential_path.parent, self.state.git_credentials_dir)
-        self.assertIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
-        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
+        self.assertNotIn("--git-credential-file", cmd)
+        self.assertNotIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
+        self.assertNotIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
 
     def test_resize_terminal_sets_pty_size(self) -> None:
         runtime = hub_server.ChatRuntime(process=SimpleNamespace(pid=1), master_fd=42)
@@ -6442,8 +6432,8 @@ class CliEnvVarTests(unittest.TestCase):
             setup_script = setup_cmd[-1]
             self.assertIn("set -o pipefail", setup_script)
             self.assertIn("git config --global --add safe.directory '*'", setup_script)
-            self.assertIn('AGENT_HUB_GIT_CREDENTIALS_SOURCE', setup_script)
-            self.assertIn('AGENT_HUB_GIT_CREDENTIALS_FILE', setup_script)
+            self.assertNotIn("AGENT_HUB_GIT_CREDENTIALS_SOURCE", setup_script)
+            self.assertNotIn("AGENT_HUB_GIT_CREDENTIALS_FILE", setup_script)
             self.assertNotIn("git config --system", setup_script)
             self.assertNotIn("|| true", setup_script)
             self.assertNotIn("chown -R", setup_script)
@@ -6472,6 +6462,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7007,6 +6999,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7058,6 +7052,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7108,6 +7104,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7166,6 +7164,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7225,6 +7225,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7274,6 +7276,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -7319,6 +7323,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -8000,7 +8006,7 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIn(claude_config_mount, run_cmd)
             self.assertIn(gemini_mount, run_cmd)
 
-    def test_cli_mounts_git_credentials_and_sets_git_config_env(self) -> None:
+    def test_cli_ignores_custom_git_credential_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -8021,6 +8027,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -8046,38 +8054,19 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
 
-            self.assertIn(
-                f"{credential_file.resolve()}:{image_cli.GIT_CREDENTIALS_SOURCE_PATH}:ro",
-                run_cmd,
-            )
-
             env_values = [
                 run_cmd[index + 1]
                 for index, part in enumerate(run_cmd[:-1])
                 if part == "--env"
             ]
-            self.assertIn("GIT_TERMINAL_PROMPT=0", env_values)
-            self.assertIn(
-                f"AGENT_HUB_GIT_CREDENTIALS_SOURCE={image_cli.GIT_CREDENTIALS_SOURCE_PATH}",
-                env_values,
-            )
-            self.assertIn(
-                f"AGENT_HUB_GIT_CREDENTIALS_FILE={image_cli.GIT_CREDENTIALS_FILE_PATH}",
-                env_values,
-            )
-            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=github.com", env_values)
-            self.assertIn("GIT_CONFIG_COUNT=3", env_values)
-            self.assertIn("GIT_CONFIG_KEY_0=credential.helper", env_values)
-            self.assertIn(
-                f"GIT_CONFIG_VALUE_0=store --file={image_cli.GIT_CREDENTIALS_FILE_PATH}",
-                env_values,
-            )
-            self.assertIn("GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_1=git@github.com:", env_values)
-            self.assertIn("GIT_CONFIG_KEY_2=url.https://github.com/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@github.com/", env_values)
+            self.assertNotIn("GIT_TERMINAL_PROMPT=0", env_values)
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIALS_") for value in env_values))
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
+            self.assertIn("Ignoring --git-credential-* flags.", result.output)
 
-    def test_cli_mounts_git_credentials_with_host_port_and_http_scheme(self) -> None:
+    def test_cli_ignores_custom_git_credential_flags_with_host_port_and_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -8098,6 +8087,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -8130,14 +8121,13 @@ class CliEnvVarTests(unittest.TestCase):
                 for index, part in enumerate(run_cmd[:-1])
                 if part == "--env"
             ]
-            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=gitlab.local:8929", env_values)
-            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_SCHEME=http", env_values)
-            self.assertIn("GIT_CONFIG_KEY_1=url.http://gitlab.local:8929/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_1=git@gitlab.local:", env_values)
-            self.assertIn("GIT_CONFIG_KEY_2=url.http://gitlab.local:8929/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@gitlab.local/", env_values)
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_SCHEME=") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
+            self.assertIn("Ignoring --git-credential-* flags.", result.output)
 
-    def test_cli_auto_discovers_agent_hub_github_credentials_when_flags_not_provided(self) -> None:
+    def test_cli_does_not_auto_discover_agent_hub_git_credentials_when_flags_not_provided(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -8170,6 +8160,8 @@ class CliEnvVarTests(unittest.TestCase):
             with patch("agent_cli.cli.Path.home", return_value=tmp_path), patch(
                 "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
             ), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -8191,20 +8183,16 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
 
-            self.assertIn(
-                f"{stored_credentials.resolve()}:{image_cli.GIT_CREDENTIALS_SOURCE_PATH}:ro",
-                run_cmd,
-            )
             env_values = [
                 run_cmd[index + 1]
                 for index, part in enumerate(run_cmd[:-1])
                 if part == "--env"
             ]
-            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=github.com", env_values)
-            self.assertIn("GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_1=git@github.com:", env_values)
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
 
-    def test_cli_auto_discovery_parses_github_enterprise_host(self) -> None:
+    def test_cli_does_not_auto_discover_github_enterprise_git_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -8237,6 +8225,8 @@ class CliEnvVarTests(unittest.TestCase):
             with patch("agent_cli.cli.Path.home", return_value=tmp_path), patch(
                 "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
             ), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -8262,13 +8252,11 @@ class CliEnvVarTests(unittest.TestCase):
                 for index, part in enumerate(run_cmd[:-1])
                 if part == "--env"
             ]
-            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=github.enterprise.local", env_values)
-            self.assertIn("GIT_CONFIG_KEY_1=url.https://github.enterprise.local/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_1=git@github.enterprise.local:", env_values)
-            self.assertIn("GIT_CONFIG_KEY_2=url.https://github.enterprise.local/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_2=ssh://git@github.enterprise.local/", env_values)
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
 
-    def test_cli_auto_discovery_parses_host_port_and_scheme(self) -> None:
+    def test_cli_does_not_auto_discover_git_credentials_with_host_port_and_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             project = tmp_path / "project"
@@ -8301,6 +8289,8 @@ class CliEnvVarTests(unittest.TestCase):
             with patch("agent_cli.cli.Path.home", return_value=tmp_path), patch(
                 "agent_cli.cli.shutil.which", return_value="/usr/bin/docker"
             ), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=True
@@ -8326,10 +8316,10 @@ class CliEnvVarTests(unittest.TestCase):
                 for index, part in enumerate(run_cmd[:-1])
                 if part == "--env"
             ]
-            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_HOST=gitlab.local:8929", env_values)
-            self.assertIn("AGENT_HUB_GIT_CREDENTIAL_SCHEME=http", env_values)
-            self.assertIn("GIT_CONFIG_KEY_1=url.http://gitlab.local:8929/.insteadOf", env_values)
-            self.assertIn("GIT_CONFIG_VALUE_1=git@gitlab.local:", env_values)
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_HOST=") for value in env_values))
+            self.assertFalse(any(value.startswith("AGENT_HUB_GIT_CREDENTIAL_SCHEME=") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_KEY_") for value in env_values))
+            self.assertFalse(any(value.startswith("GIT_CONFIG_VALUE_") for value in env_values))
 
     def test_cli_mounts_docker_socket_into_container(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9257,58 +9247,9 @@ class DockerEntrypointTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 module._configure_git_identity()
 
-    def test_prepare_git_credentials_copies_source_and_preserves_gh_env_tokens(self) -> None:
+    def test_entrypoint_module_does_not_define_prepare_git_credentials(self) -> None:
         module = self._load_entrypoint_module()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            source_path = tmp_path / "source-credentials"
-            target_path = tmp_path / "target-credentials"
-            source_path.write_text(
-                "https://agentuser:ghp_test_token_123@github.com\n",
-                encoding="utf-8",
-            )
-
-            with patch.dict(
-                os.environ,
-                {
-                    "AGENT_HUB_GIT_CREDENTIALS_SOURCE": str(source_path),
-                    "AGENT_HUB_GIT_CREDENTIALS_FILE": str(target_path),
-                    "AGENT_HUB_GIT_CREDENTIAL_HOST": "github.com",
-                    "GH_TOKEN": "legacy-gh-token",
-                    "GITHUB_TOKEN": "legacy-github-token",
-                    "GH_HOST": "github.enterprise.local",
-                },
-                clear=False,
-            ):
-                module._prepare_git_credentials()
-                self.assertEqual(os.environ.get("GH_TOKEN"), "legacy-gh-token")
-                self.assertEqual(os.environ.get("GITHUB_TOKEN"), "legacy-github-token")
-                self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
-
-            self.assertTrue(target_path.exists())
-            self.assertEqual(
-                target_path.read_text(encoding="utf-8"),
-                source_path.read_text(encoding="utf-8"),
-            )
-
-    def test_prepare_git_credentials_without_source_preserves_gh_env_tokens(self) -> None:
-        module = self._load_entrypoint_module()
-        with patch.dict(
-            os.environ,
-            {
-                "AGENT_HUB_GIT_CREDENTIALS_SOURCE": "",
-                "AGENT_HUB_GIT_CREDENTIALS_FILE": "",
-                "AGENT_HUB_GIT_CREDENTIAL_HOST": "github.enterprise.local",
-                "GH_TOKEN": "legacy-gh-token",
-                "GITHUB_TOKEN": "legacy-github-token",
-                "GH_HOST": "github.enterprise.local",
-            },
-            clear=False,
-        ):
-            module._prepare_git_credentials()
-            self.assertEqual(os.environ.get("GH_TOKEN"), "legacy-gh-token")
-            self.assertEqual(os.environ.get("GITHUB_TOKEN"), "legacy-github-token")
-            self.assertEqual(os.environ.get("GH_HOST"), "github.enterprise.local")
+        self.assertFalse(hasattr(module, "_prepare_git_credentials"))
 
     def test_ensure_claude_native_command_path_creates_home_symlink(self) -> None:
         module = self._load_entrypoint_module()
@@ -9356,8 +9297,6 @@ class DockerEntrypointTests(unittest.TestCase):
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py"]), patch.object(
             module, "_ensure_workspace_tmp", return_value=None
         ) as ensure_workspace_tmp, patch.object(
-            module, "_prepare_git_credentials", return_value=None
-        ) as prepare_credentials, patch.object(
             module, "_configure_git_identity", return_value=None
         ) as configure_git, patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
@@ -9366,7 +9305,6 @@ class DockerEntrypointTests(unittest.TestCase):
                 module._entrypoint_main()
 
         ensure_workspace_tmp.assert_called_once_with()
-        prepare_credentials.assert_called_once_with()
         configure_git.assert_called_once_with()
         execvp.assert_called_once_with("codex", ["codex"])
 
@@ -9384,8 +9322,6 @@ class DockerEntrypointTests(unittest.TestCase):
         ), patch.object(module.sys, "argv", ["docker-entrypoint.py", "bash", "-lc", "echo ok"]), patch.object(
             module, "_ensure_workspace_tmp", return_value=None
         ) as ensure_workspace_tmp, patch.object(
-            module, "_prepare_git_credentials", return_value=None
-        ), patch.object(
             module, "_configure_git_identity", return_value=None
         ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
@@ -9412,8 +9348,6 @@ class DockerEntrypointTests(unittest.TestCase):
         ) as ensure_workspace_tmp, patch.object(
             module, "_ensure_claude_native_command_path", return_value=None
         ) as ensure_claude_native_path, patch.object(
-            module, "_prepare_git_credentials", return_value=None
-        ), patch.object(
             module, "_configure_git_identity", return_value=None
         ), patch.object(
             module.os, "execvp", side_effect=SystemExit(0)
