@@ -2190,6 +2190,26 @@ def _git_repo_scheme(repo_url: str) -> str:
     return ""
 
 
+def _project_repo_url_validation_error(repo_url: str) -> str:
+    candidate = str(repo_url or "").strip()
+    if not candidate:
+        return "repo_url is required."
+
+    scheme = _git_repo_scheme(candidate)
+    is_scp_ssh = bool(re.match(r"^[^@\s]+@[^:\s]+:.+$", candidate))
+    if scheme in {"ssh", "git+ssh"} or is_scp_ssh:
+        return (
+            "SSH repository URLs are not supported yet. "
+            "Use an HTTPS repository URL (for example, https://github.com/org/repo.git)."
+        )
+    if scheme not in {"http", "https"}:
+        return (
+            "Only HTTP(S) repository URLs are supported right now. "
+            "Use an HTTPS repository URL (for example, https://github.com/org/repo.git)."
+        )
+    return ""
+
+
 def _git_repo_owner(repo_url: str) -> str:
     candidate = str(repo_url or "").strip()
     if not candidate:
@@ -7219,8 +7239,9 @@ class HubState:
         agent_args: Any = None,
     ) -> dict[str, Any]:
         normalized_repo_url = str(repo_url or "").strip()
-        if not normalized_repo_url:
-            raise HTTPException(status_code=400, detail="repo_url is required.")
+        validation_error = _project_repo_url_validation_error(normalized_repo_url)
+        if validation_error:
+            raise HTTPException(status_code=400, detail=validation_error)
         resolved_agent_type = _normalize_chat_agent_type(agent_type)
         if agent_args is None:
             normalized_agent_args: list[str] = []
@@ -9147,19 +9168,21 @@ class HubState:
         default_env_vars: list[str] | None = None,
         credential_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not repo_url:
-            raise HTTPException(status_code=400, detail="repo_url is required.")
+        normalized_repo_url = str(repo_url or "").strip()
+        validation_error = _project_repo_url_validation_error(normalized_repo_url)
+        if validation_error:
+            raise HTTPException(status_code=400, detail=validation_error)
 
         state = self.load()
         project_id = uuid.uuid4().hex
-        project_name = name or _extract_repo_name(repo_url)
+        project_name = name or _extract_repo_name(normalized_repo_url)
         normalized_binding = self._auto_discover_project_credential_binding(
-            repo_url,
+            normalized_repo_url,
             credential_binding=credential_binding,
         )
         normalized_env_vars = self._dedupe_entries(default_env_vars or [])
         auth_env_vars = self._recommended_auth_env_vars_for_repo(
-            repo_url,
+            normalized_repo_url,
             credential_binding=normalized_binding,
         )
         existing_env_keys = {
@@ -9204,10 +9227,10 @@ class HubState:
         resolved_default_branch = str(default_branch or "").strip()
         if not resolved_default_branch:
             git_env = self._github_git_env_for_repo(
-                repo_url,
-                project={"repo_url": repo_url, "credential_binding": normalized_binding},
+                normalized_repo_url,
+                project={"repo_url": normalized_repo_url, "credential_binding": normalized_binding},
             )
-            resolved_default_branch = _detect_default_branch(repo_url, env=git_env)
+            resolved_default_branch = _detect_default_branch(normalized_repo_url, env=git_env)
         normalized_base_mode = _normalize_base_image_mode(base_image_mode)
         normalized_base_value = _normalize_base_image_value(normalized_base_mode, base_image_value)
         if normalized_base_mode == "repo_path" and not normalized_base_value:
@@ -9218,7 +9241,7 @@ class HubState:
         project = {
             "id": project_id,
             "name": project_name,
-            "repo_url": repo_url,
+            "repo_url": normalized_repo_url,
             "setup_script": setup_script or "",
             "base_image_mode": normalized_base_mode,
             "base_image_value": normalized_base_value,
@@ -11485,7 +11508,8 @@ def _html_page() -> str:
     <section>
       <h2>Projects</h2>
       <form id="project-form" class="grid" onsubmit="createProject(event)">
-        <input id="project-repo" required placeholder="git@github.com:org/repo.git or https://..." />
+        <input id="project-repo" required placeholder="https://github.com/org/repo.git" />
+        <div class="muted">SSH repository URLs are not supported yet. Use HTTPS when adding projects.</div>
         <div class="row">
           <input id="project-name" placeholder="Optional project name" />
           <input id="project-branch" placeholder="Default branch (optional, auto-detect)" />

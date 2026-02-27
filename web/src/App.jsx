@@ -376,6 +376,20 @@ function extractProjectNameFromRepoUrl(repoUrl) {
   return withoutGit || "project";
 }
 
+function projectRepoUrlValidationError(repoUrl) {
+  const normalized = String(repoUrl || "").trim();
+  if (!normalized) {
+    return "Repo URL is required.";
+  }
+  if (/^(https?):\/\//i.test(normalized)) {
+    return "";
+  }
+  if (/^[^@\s]+@[^:\s]+:.+$/i.test(normalized) || /^ssh:\/\//i.test(normalized)) {
+    return "SSH repository URLs are not supported yet. Use an HTTPS URL (for example, https://github.com/org/repo.git).";
+  }
+  return "Only HTTP(S) repository URLs are supported right now. Use an HTTPS URL (for example, https://github.com/org/repo.git).";
+}
+
 function normalizeBaseMode(mode) {
   return mode === "repo_path" ? "repo_path" : "tag";
 }
@@ -2667,8 +2681,9 @@ function HubApp() {
 
   async function handleAutoConfigureCreateForm(formSnapshot, autoConfigChatStartSettings = null) {
     const repoUrl = String(formSnapshot.repoUrl || "").trim();
-    if (!repoUrl) {
-      setError("Repo URL is required before auto configure.");
+    const repoUrlError = projectRepoUrlValidationError(repoUrl);
+    if (repoUrlError) {
+      setError(repoUrlError);
       return;
     }
     const resolvedAutoConfigStartSettings = normalizeChatStartSettings(
@@ -2805,8 +2820,9 @@ function HubApp() {
   async function handleCreateProject(event) {
     event.preventDefault();
     const repoUrl = String(createForm.repoUrl || "").trim();
-    if (!repoUrl) {
-      setError("Repo URL is required.");
+    const repoUrlError = projectRepoUrlValidationError(repoUrl);
+    if (repoUrlError) {
+      setError(repoUrlError);
       return;
     }
     const formSnapshot = {
@@ -5155,8 +5171,9 @@ function HubApp() {
                     required
                     value={createForm.repoUrl}
                     onChange={(event) => updateCreateForm({ repoUrl: event.target.value })}
-                    placeholder="git@github.com:org/repo.git or https://..."
+                    placeholder="https://github.com/org/repo.git"
                   />
+                  <div className="muted">SSH repository URLs are not supported yet. Use HTTPS when adding projects.</div>
                   <div className="create-project-config-mode">
                     <div className="create-project-config-mode-inline">
                       <span className="create-project-config-mode-title" id="create-project-config-mode-label">
