@@ -236,6 +236,15 @@ class HubStateTests(unittest.TestCase):
             "base_image_value is required when base_image_mode is 'repo_path'.",
         )
 
+    def test_project_creation_rejects_ssh_repo_url(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.add_project(
+                repo_url="git@github.com:example/repo.git",
+                default_branch="main",
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("SSH repository URLs are not supported yet", str(ctx.exception.detail))
+
     def test_state_payload_backfills_missing_tag_base_value(self) -> None:
         project = self.state.add_project(
             repo_url="https://example.com/org/repo.git",
@@ -5567,6 +5576,15 @@ Gemini CLI
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertIn("cancelled", str(ctx.exception.detail).lower())
         self.assertIsNone(self.state._auto_config_request_state(request_id))
+
+    def test_auto_configure_project_rejects_ssh_repo_url(self) -> None:
+        with self.assertRaises(HTTPException) as ctx:
+            self.state.auto_configure_project(
+                repo_url="git@github.com:example/repo.git",
+                default_branch="",
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("SSH repository URLs are not supported yet", str(ctx.exception.detail))
 
     def test_auto_configure_project_emits_live_logs_for_request_id(self) -> None:
         emitted_logs: list[tuple[str, str, bool]] = []
