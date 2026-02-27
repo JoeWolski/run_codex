@@ -5318,6 +5318,25 @@ Gemini CLI
         updated_payload = self.state.agent_tools_session_credentials_list_payload(session_id)
         self.assertEqual(updated_payload.get("effective_credential_ids"), [credential_id])
 
+    def test_resolve_agent_tools_session_credentials_includes_git_identity_env_for_pat(self) -> None:
+        self._connect_github_pat()
+        session_id, _token = self.state._create_agent_tools_session(repo_url="https://github.com/org/repo.git")
+        resolved = self.state.resolve_agent_tools_session_credentials(
+            session_id=session_id,
+            mode=hub_server.PROJECT_CREDENTIAL_BINDING_MODE_AUTO,
+        )
+        credentials = resolved.get("credentials") or []
+        self.assertGreaterEqual(len(credentials), 1)
+        credential = credentials[0]
+        self.assertEqual(
+            credential.get("git_identity_env"),
+            {
+                "AGENT_HUB_GIT_USER_NAME": "Agent User",
+                "AGENT_HUB_GIT_USER_EMAIL": "agentuser@example.com",
+            },
+        )
+        self.assertEqual(credential.get("account_email"), "agentuser@example.com")
+
     def test_run_temporary_auto_config_chat_uses_container_paths_for_codex_exec(self) -> None:
         workspace = self.tmp_path / "workspace-chat-paths"
         workspace.mkdir(parents=True, exist_ok=True)
@@ -6154,6 +6173,65 @@ class AgentToolsSubmitArtifactToolTests(unittest.TestCase):
             self.assertEqual(structured["processed_count"], 1)
             self.assertEqual(structured["succeeded_count"], 1)
             self.assertEqual(structured["failed_count"], 0)
+
+
+class AgentToolsCredentialResolveToolTests(unittest.TestCase):
+    def test_credentials_resolve_configures_runtime_git_and_identity(self) -> None:
+        api_payload = {
+            "credentials": [
+                {
+                    "credential_line": "https://agentuser:test-token@github.com",
+                    "host": "github.com",
+                    "scheme": "https",
+                    "git_identity_env": {
+                        "AGENT_HUB_GIT_USER_NAME": "Agent User",
+                        "AGENT_HUB_GIT_USER_EMAIL": "agentuser@example.com",
+                    },
+                }
+            ]
+        }
+
+        git_calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], check: bool = False, text: bool = True, capture_output: bool = True):
+            del check, text, capture_output
+            git_calls.append(list(cmd))
+            if cmd[:5] == ["git", "config", "--global", "--get", "user.name"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            if cmd[:5] == ["git", "config", "--global", "--get", "user.email"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch("agent_hub.agent_tools_mcp._api_request", return_value=api_payload), patch(
+            "agent_hub.agent_tools_mcp.subprocess.run",
+            side_effect=fake_run,
+        ):
+            response = agent_tools_mcp._handle_tool_call("credentials_resolve", {"mode": "auto"})
+
+        self.assertFalse(response["isError"])
+        structured = response["structuredContent"]
+        runtime_setup = structured.get("runtime_git_setup") or {}
+        self.assertTrue(runtime_setup.get("configured"))
+        self.assertEqual(runtime_setup.get("credential_file"), "/tmp/agent_hub_git_credentials")
+        self.assertIn(
+            ["git", "config", "--global", "credential.helper", "store --file=/tmp/agent_hub_git_credentials"],
+            git_calls,
+        )
+        self.assertIn(["git", "config", "--global", "user.name", "Agent User"], git_calls)
+        self.assertIn(["git", "config", "--global", "user.email", "agentuser@example.com"], git_calls)
+
+    def test_credentials_resolve_skips_runtime_git_setup_when_no_credentials(self) -> None:
+        with patch("agent_hub.agent_tools_mcp._api_request", return_value={"credentials": []}), patch(
+            "agent_hub.agent_tools_mcp.subprocess.run"
+        ) as run_mock:
+            response = agent_tools_mcp._handle_tool_call("credentials_resolve", {"mode": "auto"})
+
+        self.assertFalse(response["isError"])
+        structured = response["structuredContent"]
+        runtime_setup = structured.get("runtime_git_setup") or {}
+        self.assertFalse(runtime_setup.get("configured"))
+        self.assertEqual(runtime_setup.get("reason"), "no_credentials")
+        run_mock.assert_not_called()
 
 
 class CliEnvVarTests(unittest.TestCase):
@@ -9246,6 +9324,64 @@ class DockerEntrypointTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 module._configure_git_identity()
+
+    def test_configure_git_auth_from_env_sets_global_git_config(self) -> None:
+        module = self._load_entrypoint_module()
+        with self._temporary_exec_dir() as tmp:
+            tmp_path = Path(tmp)
+
+            def fake_run(command: list[str], check: bool = True):
+                del check
+                if command[:2] == ["git", "config"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"Unexpected command: {command}")
+
+            with patch.object(module, "Path", wraps=module.Path) as path_cls, patch.object(
+                module,
+                "_run",
+                side_effect=fake_run,
+            ) as run_mock, patch.dict(
+                os.environ,
+                {
+                    "GITHUB_TOKEN": "ghp_test_token",
+                    "GITHUB_ACTOR": "agentuser",
+                    "AGENT_HUB_GIT_CREDENTIAL_HOST": "github.com",
+                    "AGENT_HUB_GIT_CREDENTIAL_SCHEME": "https",
+                },
+                clear=False,
+            ):
+                path_cls.side_effect = lambda p: tmp_path / "agent_hub_git_credentials" if p == "/tmp/agent_hub_git_credentials" else Path(p)
+                module._configure_git_auth_from_env()
+
+            credential_file = tmp_path / "agent_hub_git_credentials"
+            self.assertTrue(credential_file.exists())
+            self.assertEqual(
+                credential_file.read_text(encoding="utf-8"),
+                "https://agentuser:ghp_test_token@github.com\n",
+            )
+            self.assertEqual(run_mock.call_count, 3)
+            run_mock.assert_has_calls(
+                [
+                    call(["git", "config", "--global", "credential.helper", f"store --file={str(credential_file)}"]),
+                    call(["git", "config", "--global", "--add", "url.https://github.com/.insteadOf", "git@github.com:"]),
+                    call(
+                        ["git", "config", "--global", "--add", "url.https://github.com/.insteadOf", "ssh://git@github.com/"]
+                    ),
+                ]
+            )
+
+    def test_configure_git_auth_from_env_no_token_noop(self) -> None:
+        module = self._load_entrypoint_module()
+        with patch.object(module, "_run") as run_mock, patch.dict(
+            os.environ,
+            {
+                "GITHUB_TOKEN": "",
+                "GH_TOKEN": "",
+            },
+            clear=False,
+        ):
+            module._configure_git_auth_from_env()
+        run_mock.assert_not_called()
 
     def test_entrypoint_module_does_not_define_prepare_git_credentials(self) -> None:
         module = self._load_entrypoint_module()

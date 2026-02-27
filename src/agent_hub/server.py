@@ -8316,6 +8316,7 @@ class HubState:
         scheme = _normalize_github_credential_scheme(credential.get("scheme"), field_name="scheme")
         account_login = str(credential.get("account_login") or "").strip()
         account_name = str(credential.get("account_name") or "").strip()
+        account_email = str(credential.get("account_email") or "").strip()
 
         username = account_login
         secret = ""
@@ -8341,6 +8342,7 @@ class HubState:
             secret = str(matching.get("personal_access_token") or "").strip()
             account_login = str(matching.get("account_login") or "").strip()
             account_name = str(matching.get("account_name") or "").strip()
+            account_email = str(matching.get("account_email") or "").strip()
             host = str(matching.get("host") or "").strip()
             scheme = _normalize_github_credential_scheme(matching.get("scheme"), field_name="scheme")
         else:
@@ -8360,6 +8362,14 @@ class HubState:
         encoded_username = urllib.parse.quote(username, safe="")
         encoded_secret = urllib.parse.quote(secret, safe="")
         credential_line = f"{scheme}://{encoded_username}:{encoded_secret}@{host}"
+        git_identity_env: dict[str, str] = {}
+        if kind == "personal_access_token":
+            git_user_name = account_name or account_login
+            if git_user_name and account_email:
+                git_identity_env = {
+                    "AGENT_HUB_GIT_USER_NAME": git_user_name,
+                    "AGENT_HUB_GIT_USER_EMAIL": account_email,
+                }
         return {
             "credential_id": credential_id,
             "kind": kind,
@@ -8368,12 +8378,14 @@ class HubState:
             "scheme": scheme,
             "account_login": account_login,
             "account_name": account_name,
+            "account_email": account_email,
             "summary": str(credential.get("summary") or ""),
             "username": username,
             "secret": secret,
             "credential_line": credential_line,
             "host_credential_file": credential_file,
             "git_env": self._git_env_for_credentials_file(credential_file, host, scheme=scheme),
+            "git_identity_env": git_identity_env,
         }
 
     def _resolve_agent_tools_credential_ids(

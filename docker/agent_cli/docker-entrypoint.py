@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import urllib.parse
 import urllib.error
 import urllib.request
 
@@ -27,6 +28,30 @@ def _configure_git_identity() -> None:
 
     _run(["git", "config", "--global", "user.name", git_user_name])
     _run(["git", "config", "--global", "user.email", git_user_email])
+
+
+def _configure_git_auth_from_env() -> None:
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()
+    if not github_token:
+        return
+
+    host = os.environ.get("AGENT_HUB_GIT_CREDENTIAL_HOST", "").strip().lower() or "github.com"
+    scheme = os.environ.get("AGENT_HUB_GIT_CREDENTIAL_SCHEME", "").strip().lower() or "https"
+    if scheme not in {"http", "https"}:
+        raise RuntimeError(f"Unsupported AGENT_HUB_GIT_CREDENTIAL_SCHEME: {scheme}")
+
+    username = os.environ.get("GITHUB_ACTOR", "").strip() or "x-access-token"
+    encoded_username = urllib.parse.quote(username, safe="")
+    encoded_token = urllib.parse.quote(github_token, safe="")
+    credential_file = Path("/tmp/agent_hub_git_credentials")
+    credential_file.write_text(f"{scheme}://{encoded_username}:{encoded_token}@{host}\n", encoding="utf-8")
+    os.chmod(credential_file, 0o600)
+
+    host_name = host.rsplit(":", 1)[0] if ":" in host else host
+    git_prefix = f"{scheme}://{host}/"
+    _run(["git", "config", "--global", "credential.helper", f"store --file={str(credential_file)}"])
+    _run(["git", "config", "--global", "--add", f"url.{git_prefix}.insteadOf", f"git@{host_name}:"])
+    _run(["git", "config", "--global", "--add", f"url.{git_prefix}.insteadOf", f"ssh://git@{host_name}/"])
 
 
 def _ensure_workspace_tmp(*, workspace_tmp: Path | None = None) -> None:
@@ -186,6 +211,7 @@ def _entrypoint_main() -> None:
     _ensure_user_in_passwd()
     _ensure_workspace_permissions()
     _ensure_claude_native_command_path(command=command, home=os.environ["HOME"])
+    _configure_git_auth_from_env()
     _configure_git_identity()
     _ack_runtime_ready()
 

@@ -4,10 +4,12 @@ import glob
 import logging
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,7 @@ SUBMIT_ARTIFACT_RETRY_DELAY_BASE_SEC_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_RETRY_DE
 SUBMIT_ARTIFACT_RETRY_DELAY_MAX_SEC_ENV = "AGENT_TOOLS_SUBMIT_ARTIFACT_RETRY_DELAY_MAX_SEC"
 
 LOGGER = logging.getLogger("agent_tools_mcp")
+RUNTIME_GIT_CREDENTIALS_FILE = Path("/tmp/agent_hub_git_credentials")
 
 TOOL_LIST = [
     {
@@ -203,6 +206,130 @@ def _tool_error(message: str) -> dict[str, Any]:
     return {
         "content": [{"type": "text", "text": message}],
         "isError": True,
+    }
+
+
+def _run_git_config(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+
+def _git_global_config_get(key: str) -> str:
+    result = _run_git_config(["config", "--global", "--get", key])
+    if result.returncode != 0:
+        return ""
+    return str(result.stdout or "").strip()
+
+
+def _configure_runtime_git_from_credentials(payload: dict[str, Any]) -> dict[str, Any]:
+    credentials = payload.get("credentials")
+    if not isinstance(credentials, list) or not credentials:
+        return {
+            "configured": False,
+            "reason": "no_credentials",
+            "credential_file": "",
+        }
+
+    credential_lines: list[str] = []
+    seen_lines: set[str] = set()
+    instead_of_hosts: list[tuple[str, str]] = []
+    seen_hosts: set[tuple[str, str]] = set()
+    identity_name = ""
+    identity_email = ""
+
+    for entry in credentials:
+        if not isinstance(entry, dict):
+            continue
+        credential_line = str(entry.get("credential_line") or "").strip()
+        if credential_line and credential_line not in seen_lines:
+            credential_lines.append(credential_line)
+            seen_lines.add(credential_line)
+        try:
+            parsed = urllib.parse.urlsplit(credential_line)
+        except ValueError:
+            parsed = urllib.parse.SplitResult("", "", "", "", "")
+        scheme = str(parsed.scheme or entry.get("scheme") or "").strip().lower()
+        host = str(parsed.hostname or entry.get("host") or "").strip().lower()
+        if parsed.port and host:
+            host = f"{host}:{parsed.port}"
+        if scheme in {"http", "https"} and host:
+            host_key = (scheme, host)
+            if host_key not in seen_hosts:
+                instead_of_hosts.append(host_key)
+                seen_hosts.add(host_key)
+
+        if not identity_name or not identity_email:
+            identity_env = entry.get("git_identity_env")
+            if isinstance(identity_env, dict):
+                candidate_name = str(identity_env.get("AGENT_HUB_GIT_USER_NAME") or "").strip()
+                candidate_email = str(identity_env.get("AGENT_HUB_GIT_USER_EMAIL") or "").strip()
+                if candidate_name and candidate_email:
+                    identity_name = candidate_name
+                    identity_email = candidate_email
+
+    if not credential_lines:
+        return {
+            "configured": False,
+            "reason": "no_credential_lines",
+            "credential_file": "",
+        }
+
+    try:
+        RUNTIME_GIT_CREDENTIALS_FILE.write_text(
+            "".join(f"{line}\n" for line in credential_lines),
+            encoding="utf-8",
+        )
+        os.chmod(RUNTIME_GIT_CREDENTIALS_FILE, 0o600)
+    except OSError as exc:
+        return {
+            "configured": False,
+            "reason": f"credential_file_write_failed:{exc}",
+            "credential_file": str(RUNTIME_GIT_CREDENTIALS_FILE),
+        }
+
+    commands: list[list[str]] = [
+        ["config", "--global", "credential.helper", f"store --file={str(RUNTIME_GIT_CREDENTIALS_FILE)}"],
+    ]
+    for scheme, host in instead_of_hosts:
+        host_name = host.rsplit(":", 1)[0] if ":" in host else host
+        git_prefix = f"{scheme}://{host}/"
+        commands.extend(
+            [
+                ["config", "--global", "--add", f"url.{git_prefix}.insteadOf", f"git@{host_name}:"],
+                ["config", "--global", "--add", f"url.{git_prefix}.insteadOf", f"ssh://git@{host_name}/"],
+            ]
+        )
+
+    existing_name = _git_global_config_get("user.name")
+    existing_email = _git_global_config_get("user.email")
+    if identity_name and identity_email and not existing_name and not existing_email:
+        commands.extend(
+            [
+                ["config", "--global", "user.name", identity_name],
+                ["config", "--global", "user.email", identity_email],
+            ]
+        )
+
+    for command_args in commands:
+        result = _run_git_config(command_args)
+        if result.returncode != 0:
+            stderr = str(result.stderr or "").strip()
+            stdout = str(result.stdout or "").strip()
+            detail = stderr or stdout or f"exit_code={result.returncode}"
+            return {
+                "configured": False,
+                "reason": f"git_config_failed:{detail}",
+                "credential_file": str(RUNTIME_GIT_CREDENTIALS_FILE),
+            }
+
+    return {
+        "configured": True,
+        "reason": "ok",
+        "credential_file": str(RUNTIME_GIT_CREDENTIALS_FILE),
     }
 
 
@@ -446,6 +573,8 @@ def _handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             "credential_ids": arguments.get("credential_ids") or [],
         }
         payload = _api_request("/credentials/resolve", method="POST", payload=body)
+        git_runtime_setup = _configure_runtime_git_from_credentials(payload)
+        payload["runtime_git_setup"] = git_runtime_setup
         return _tool_response(payload)
     if name == "project_attach_credentials":
         body = {
