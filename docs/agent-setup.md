@@ -5,6 +5,10 @@
 - Confirm Docker CLI and daemon reachability.
 - In Docker-in-Docker mode, use daemon-visible host paths for mounts.
 - Do not use container-local `/tmp` for mount-backed runtime inputs (`--data-dir`, `--config-file`, `--system-prompt-file`, workspace mounts).
+- `agent_hub` now provisions runtime temp mounts under the hub data directory:
+  - project snapshot/build: `<data-dir>/tmp/projects/<project-id>/workspace -> /workspace/tmp`
+  - chat runtime: `<data-dir>/tmp/projects/<project-id>/chats/<chat-id> -> /workspace/tmp`
+- For nested Docker workflows, use `AGENT_HUB_TMP_HOST_PATH` (injected into runtime containers) as the daemon-visible host source when launching inner containers.
 
 ## First-run deterministic integration flags (Docker-in-Docker)
 

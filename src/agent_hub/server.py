@@ -90,6 +90,12 @@ GITLAB_PERSONAL_ACCESS_TOKEN_REQUIRED_SCOPES = frozenset({"read_repository", "wr
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 DEFAULT_CONTAINER_HOME = "/workspace"
+DEFAULT_CONTAINER_TMP_DIR = f"{DEFAULT_CONTAINER_HOME}/tmp"
+RUNTIME_TMP_ROOT_DIR_NAME = "tmp"
+RUNTIME_TMP_PROJECTS_DIR_NAME = "projects"
+RUNTIME_TMP_CHATS_DIR_NAME = "chats"
+RUNTIME_TMP_WORKSPACE_DIR_NAME = "workspace"
+AGENT_HUB_TMP_HOST_PATH_ENV = "AGENT_HUB_TMP_HOST_PATH"
 AGENT_TOOLS_MCP_RUNTIME_DIR_NAME = "agent_hub"
 AGENT_TOOLS_MCP_RUNTIME_FILE_NAME = "agent_tools_mcp.py"
 AGENT_TOOLS_URL_ENV = "AGENT_HUB_AGENT_TOOLS_URL"
@@ -2341,6 +2347,27 @@ def _parse_mounts(entries: list[str], direction: str) -> list[str]:
     return output
 
 
+def _mount_container_target(entry: str) -> str:
+    if ":" not in entry:
+        return ""
+    _host, container = entry.split(":", 1)
+    # Keep only the container path portion before optional mode suffix.
+    path = str(container or "").split(":", 1)[0].strip()
+    if not path:
+        return ""
+    return str(PurePosixPath(path))
+
+
+def _contains_container_mount_target(entries: list[str], container_path: str) -> bool:
+    expected = str(PurePosixPath(str(container_path or "").strip() or "/"))
+    if not expected:
+        return False
+    for entry in entries:
+        if _mount_container_target(str(entry or "")) == expected:
+            return True
+    return False
+
+
 def _parse_env_vars(entries: list[str]) -> list[str]:
     output: list[str] = []
     for entry in entries:
@@ -3647,6 +3674,8 @@ class HubState:
         self.project_dir = self.data_dir / "projects"
         self.chat_dir = self.data_dir / "chats"
         self.log_dir = self.data_dir / "logs"
+        self.runtime_tmp_dir = self.data_dir / RUNTIME_TMP_ROOT_DIR_NAME
+        self.runtime_project_tmp_dir = self.runtime_tmp_dir / RUNTIME_TMP_PROJECTS_DIR_NAME
         self.artifacts_dir = self.data_dir / ARTIFACT_STORAGE_DIR_NAME
         self.chat_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_CHAT_DIR_NAME
         self.session_artifacts_dir = self.artifacts_dir / ARTIFACT_STORAGE_SESSION_DIR_NAME
@@ -3695,6 +3724,8 @@ class HubState:
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.chat_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_tmp_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime_project_tmp_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.chat_artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.session_artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -6716,6 +6747,7 @@ class HubState:
         extra_args: list[str] | None = None,
         setup_script: str = "",
         prepare_snapshot_only: bool = False,
+        runtime_tmp_mount: str = "",
     ) -> list[str]:
         agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
         cmd = [
@@ -6755,9 +6787,21 @@ class HubState:
         if snapshot_tag:
             self._append_project_base_args(cmd, workspace, project)
             cmd.extend(["--snapshot-image-tag", snapshot_tag])
-        for mount in ro_mounts or []:
+
+        normalized_ro_mounts = [str(mount) for mount in (ro_mounts or []) if str(mount or "").strip()]
+        normalized_rw_mounts = [str(mount) for mount in (rw_mounts or []) if str(mount or "").strip()]
+        normalized_runtime_tmp_mount = str(runtime_tmp_mount or "").strip()
+        if normalized_runtime_tmp_mount:
+            has_workspace_tmp_mount = _contains_container_mount_target(
+                [*normalized_ro_mounts, *normalized_rw_mounts],
+                DEFAULT_CONTAINER_TMP_DIR,
+            )
+            if not has_workspace_tmp_mount:
+                normalized_rw_mounts.append(f"{normalized_runtime_tmp_mount}:{DEFAULT_CONTAINER_TMP_DIR}")
+
+        for mount in normalized_ro_mounts:
             cmd.extend(["--ro-mount", mount])
-        for mount in rw_mounts or []:
+        for mount in normalized_rw_mounts:
             cmd.extend(["--rw-mount", mount])
 
         if setup_script:
@@ -6774,12 +6818,16 @@ class HubState:
         cmd.extend(["--env-var", f"{AGENT_TOOLS_TOKEN_ENV}={agent_tools_token}"])
         cmd.extend(["--env-var", f"{AGENT_TOOLS_PROJECT_ID_ENV}={agent_tools_project_id}"])
         cmd.extend(["--env-var", f"{AGENT_TOOLS_CHAT_ID_ENV}={agent_tools_chat_id}"])
+        if normalized_runtime_tmp_mount:
+            cmd.extend(["--env-var", f"{AGENT_HUB_TMP_HOST_PATH_ENV}={normalized_runtime_tmp_mount}"])
         normalized_ready_ack_guid = str(ready_ack_guid or "").strip()
         if normalized_ready_ack_guid:
             cmd.extend(["--env-var", f"{AGENT_TOOLS_READY_ACK_GUID_ENV}={normalized_ready_ack_guid}"])
 
         for env_entry in env_vars or []:
             if _is_reserved_env_entry(str(env_entry)):
+                continue
+            if str(env_entry).split("=", 1)[0].strip() == AGENT_HUB_TMP_HOST_PATH_ENV:
                 continue
             cmd.extend(["--env-var", env_entry])
 
@@ -6846,6 +6894,8 @@ class HubState:
         project_for_launch["repo_head_sha"] = head_result.stdout.strip()
         snapshot_tag = self._project_setup_snapshot_tag(project_for_launch)
         resolved_project_id = str(project_for_launch.get("id") or project_id).strip()
+        project_tmp_workspace = self.project_tmp_workdir(resolved_project_id)
+        project_tmp_workspace.mkdir(parents=True, exist_ok=True)
         cmd = self._prepare_agent_cli_command(
             workspace=workspace,
             container_project_name=_container_project_name(project_for_launch.get("name") or project_for_launch.get("id")),
@@ -6862,6 +6912,7 @@ class HubState:
             env_vars=project_for_launch.get("default_env_vars"),
             setup_script=str(project_for_launch.get("setup_script") or ""),
             prepare_snapshot_only=True,
+            runtime_tmp_mount=str(project_tmp_workspace),
             context_key=f"snapshot:{project_for_launch.get('id')}",
         )
         return self._launch_profile_from_command(
@@ -6920,6 +6971,10 @@ class HubState:
         elif resume:
             agent_args = self._resume_agent_args(agent_type, agent_args)
 
+        project_id = str(project.get("id") or "")
+        chat_tmp_workspace = self.chat_tmp_workdir(project_id, chat_id)
+        chat_tmp_workspace.mkdir(parents=True, exist_ok=True)
+
         cmd = self._prepare_agent_cli_command(
             workspace=workspace,
             container_project_name=container_project_name,
@@ -6939,6 +6994,7 @@ class HubState:
             artifacts_token=artifact_publish_token,
             ready_ack_guid=ready_ack_guid,
             resume=resume,
+            runtime_tmp_mount=str(chat_tmp_workspace),
             context_key=f"chat_launch_profile:{chat_id}",
             extra_args=agent_args,
         )
@@ -7942,6 +7998,17 @@ class HubState:
 
     def project_workdir(self, project_id: str) -> Path:
         return self.project_dir / project_id
+
+    def project_tmp_workdir(self, project_id: str) -> Path:
+        return self.runtime_project_tmp_dir / str(project_id or "") / RUNTIME_TMP_WORKSPACE_DIR_NAME
+
+    def chat_tmp_workdir(self, project_id: str, chat_id: str) -> Path:
+        return (
+            self.runtime_project_tmp_dir
+            / str(project_id or "")
+            / RUNTIME_TMP_CHATS_DIR_NAME
+            / str(chat_id or "")
+        )
 
     def chat_log(self, chat_id: str) -> Path:
         return self.log_dir / f"{chat_id}.log"
@@ -10209,6 +10276,51 @@ class HubState:
             managed_paths.add(resolved_workspace)
         return managed_paths
 
+    def _managed_project_tmp_paths(self, state: dict[str, Any]) -> set[Path]:
+        managed_paths: set[Path] = set()
+        project_tmp_root = self.runtime_project_tmp_dir.resolve()
+        projects = state.get("projects")
+        if not isinstance(projects, dict):
+            return managed_paths
+
+        for project_id in projects.keys():
+            tmp_root = self.runtime_project_tmp_dir / str(project_id)
+            try:
+                resolved_tmp_root = tmp_root.resolve()
+                resolved_tmp_root.relative_to(project_tmp_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            managed_paths.add(resolved_tmp_root)
+        return managed_paths
+
+    def _managed_project_tmp_children_paths(self, state: dict[str, Any], project_id: str) -> set[Path]:
+        managed_paths: set[Path] = set()
+        project_tmp_root = (self.runtime_project_tmp_dir / str(project_id)).resolve()
+        project_tmp_workspace = self.project_tmp_workdir(project_id)
+        try:
+            resolved_workspace = project_tmp_workspace.resolve()
+            resolved_workspace.relative_to(project_tmp_root)
+            managed_paths.add(resolved_workspace)
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+        chats = state.get("chats")
+        if not isinstance(chats, dict):
+            return managed_paths
+        for chat_id, chat in chats.items():
+            if not isinstance(chat, dict):
+                continue
+            if str(chat.get("project_id") or "") != str(project_id):
+                continue
+            chat_tmp = self.chat_tmp_workdir(project_id, str(chat_id))
+            try:
+                resolved_chat_tmp = chat_tmp.resolve()
+                resolved_chat_tmp.relative_to(project_tmp_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            managed_paths.add(resolved_chat_tmp)
+        return managed_paths
+
     def _remove_orphan_children(self, root_dir: Path, managed_paths: set[Path]) -> int:
         if not root_dir.exists():
             return 0
@@ -10321,6 +10433,17 @@ class HubState:
             self.project_dir,
             self._managed_project_workspace_paths(state),
         )
+        self._remove_orphan_children(
+            self.runtime_project_tmp_dir,
+            self._managed_project_tmp_paths(state),
+        )
+        projects = state.get("projects")
+        if isinstance(projects, dict):
+            for project_id in projects.keys():
+                self._remove_orphan_children(
+                    self.runtime_project_tmp_dir / str(project_id),
+                    self._managed_project_tmp_children_paths(state, str(project_id)),
+                )
         removed_orphan_log_entries = self._remove_orphan_log_entries(state)
         removed_stale_docker_containers = _docker_remove_stale_containers(STARTUP_STALE_DOCKER_CONTAINER_PREFIXES)
 
@@ -10399,10 +10522,11 @@ class HubState:
         cleared_chats = len(state["chats"])
         state["chats"] = {}
 
-        for path in [self.chat_dir, self.project_dir, self.log_dir, self.artifacts_dir]:
+        for path in [self.chat_dir, self.project_dir, self.log_dir, self.runtime_tmp_dir, self.artifacts_dir]:
             if path.exists():
                 self._delete_path(path)
             path.mkdir(parents=True, exist_ok=True)
+        self.runtime_project_tmp_dir.mkdir(parents=True, exist_ok=True)
         self.chat_artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.session_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -10600,6 +10724,8 @@ class HubState:
             return snapshot_tag
 
         repo_url = str(project.get("repo_url") or "")
+        project_tmp_workspace = self.project_tmp_workdir(resolved_project_id or str(project.get("id") or ""))
+        project_tmp_workspace.mkdir(parents=True, exist_ok=True)
         cmd = self._prepare_agent_cli_command(
             workspace=workspace,
             container_project_name=_container_project_name(project.get("name") or project.get("id")),
@@ -10616,6 +10742,7 @@ class HubState:
             env_vars=project.get("default_env_vars"),
             setup_script=setup_script,
             prepare_snapshot_only=True,
+            runtime_tmp_mount=str(project_tmp_workspace),
             context_key=f"snapshot:{project.get('id')}",
         )
         if log_path is None:
@@ -10979,6 +11106,8 @@ class HubState:
             agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
             chat["agent_type"] = agent_type
             container_workspace = _container_workspace_path_for_project(project.get("name") or project.get("id"))
+            chat_tmp_workspace = self.chat_tmp_workdir(agent_tools_project_id, chat_id)
+            chat_tmp_workspace.mkdir(parents=True, exist_ok=True)
 
             agent_args = [str(arg) for arg in (chat.get("agent_args") or []) if str(arg).strip()]
             if resume and agent_type == AGENT_TYPE_CODEX:
@@ -11006,6 +11135,7 @@ class HubState:
                 artifacts_token=artifact_publish_token,
                 ready_ack_guid=ready_ack_guid,
                 resume=resume,
+                runtime_tmp_mount=str(chat_tmp_workspace),
                 context_key=f"chat_start:{chat_id}",
                 extra_args=agent_args,
             )
