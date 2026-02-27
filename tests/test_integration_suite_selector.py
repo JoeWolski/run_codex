@@ -33,6 +33,7 @@ def test_selector_supports_changed_files_argument() -> None:
     suites = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     assert "tests/integration/test_agent_cli_runtime_ack.py" in suites
     assert "tests/integration/test_snapshot_builds.py" in suites
+    assert "tests/integration/test_agent_cli_snapshot_repro_real.py" in suites
 
 
 def test_selector_unknown_path_falls_back_to_core_set() -> None:
