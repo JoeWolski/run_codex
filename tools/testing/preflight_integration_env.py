@@ -16,6 +16,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TMP_ROOT = Path("/workspace/tmp/agent-hub-preflight")
+LOCAL_REPO_TMP_ROOT = REPO_ROOT / ".tmp" / "agent-hub-preflight"
+DAEMON_VISIBLE_DIR_ENV = "AGENT_HUB_DAEMON_VISIBLE_DIR"
 
 
 def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -70,6 +72,23 @@ def _probe_file_mount(file_path: Path) -> dict[str, Any]:
         "stderr": (result.stderr or "").strip(),
         "command": " ".join(command),
     }
+
+
+def _mount_probe_roots() -> list[Path]:
+    roots: list[Path] = []
+    override = str(os.environ.get(DAEMON_VISIBLE_DIR_ENV) or "").strip()
+    if override:
+        roots.append(Path(override).expanduser())
+    roots.extend([TMP_ROOT, LOCAL_REPO_TMP_ROOT])
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(root)
+    return deduped
 
 
 @dataclass
@@ -142,6 +161,9 @@ def _summary_text(payload: dict[str, Any]) -> str:
         f"- file mount probe: {'ok' if file_probe['ok'] else 'failed'} "
         f"(kind={file_probe['kind']})"
     )
+    selected_root = str(payload.get("selected_mount_probe_root") or "").strip()
+    if selected_root:
+        lines.append(f"  selected probe root: {selected_root}")
     if not file_probe["ok"]:
         lines.append("  first-try fix: move runtime config/system prompt inputs to a daemon-visible path.")
         lines.append("  verification: docker run -v <file>:/etc/alpine-release ... test -f /etc/alpine-release")
@@ -172,18 +194,6 @@ def main() -> int:
 
     docker_ok, docker_detail = _docker_daemon_ok()
     host_ip = _detect_host_ip()
-    TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix="mount-probe-",
-        suffix=".txt",
-        dir=str(TMP_ROOT),
-        delete=False,
-    ) as handle:
-        handle.write("probe\n")
-        probe_path = Path(handle.name)
-
     file_probe: dict[str, Any] = {
         "ok": False,
         "kind": "unknown",
@@ -191,23 +201,60 @@ def main() -> int:
         "stderr": "docker not available",
         "command": "",
     }
+    file_probe_attempts: list[dict[str, Any]] = []
     network_targets: list[dict[str, Any]] = []
     port = 0
-    try:
-        if docker_ok:
-            file_probe = _probe_file_mount(probe_path)
-            health_server = _start_health_server()
+    selected_probe_root = ""
+    if docker_ok:
+        for probe_root in _mount_probe_roots():
             try:
-                port = int(health_server.server.server_address[1])
-                network_targets.append(_probe_container_target("host.docker.internal", port))
-                network_targets.append(_probe_container_target(host_ip, port))
+                probe_root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            probe_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    prefix="mount-probe-",
+                    suffix=".txt",
+                    dir=str(probe_root),
+                    delete=False,
+                ) as handle:
+                    handle.write("probe\n")
+                    probe_path = Path(handle.name)
+                attempt = _probe_file_mount(probe_path)
+                attempt["probe_root"] = str(probe_root)
+                attempt["probe_path"] = str(probe_path)
+            except Exception as exc:
+                attempt = {
+                    "ok": False,
+                    "kind": "unknown",
+                    "returncode": 1,
+                    "stderr": str(exc),
+                    "command": "",
+                    "probe_root": str(probe_root),
+                    "probe_path": str(probe_path) if probe_path is not None else "",
+                }
             finally:
-                health_server.close()
-    finally:
+                if probe_path is not None:
+                    try:
+                        probe_path.unlink()
+                    except OSError:
+                        pass
+            file_probe_attempts.append(attempt)
+            file_probe = attempt
+            if bool(attempt.get("ok")):
+                selected_probe_root = str(probe_root)
+                break
+
+        health_server = _start_health_server()
         try:
-            probe_path.unlink()
-        except OSError:
-            pass
+            port = int(health_server.server.server_address[1])
+            network_targets.append(_probe_container_target("host.docker.internal", port))
+            network_targets.append(_probe_container_target(host_ip, port))
+        finally:
+            health_server.close()
 
     preferred_target = next((entry for entry in network_targets if entry.get("ok")), None)
     recommended_host = str(preferred_target["host"]) if preferred_target else host_ip
@@ -217,6 +264,8 @@ def main() -> int:
             "detail": docker_detail,
         },
         "file_mount_probe": file_probe,
+        "file_mount_probe_attempts": file_probe_attempts,
+        "selected_mount_probe_root": selected_probe_root,
         "network_probe": {
             "port": int(port),
             "targets": network_targets,

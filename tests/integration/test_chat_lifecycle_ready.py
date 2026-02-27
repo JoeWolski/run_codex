@@ -99,6 +99,8 @@ def test_chat_launch_profile_uses_production_command_builder(hub_state: hub_serv
     assert launch_profile["snapshot_tag"]
     assert launch_profile["runtime_config_file"].endswith("runtime.toml")
     assert launch_profile["command"][:4] == ["uv", "run", "--project", str(hub_server._repo_root())]
+    assert any(entry.endswith(":/workspace/tmp") for entry in launch_profile["rw_mounts"])
+    assert any(entry.startswith("AGENT_HUB_TMP_HOST_PATH=") for entry in launch_profile["env_vars"])
     assert any(entry.startswith("AGENT_HUB_READY_ACK_GUID=") for entry in launch_profile["env_vars"])
 
 
@@ -115,3 +117,5 @@ def test_project_snapshot_launch_profile_uses_prepare_snapshot_only(hub_state: h
     assert launch_profile["prepare_snapshot_only"] is True
     assert "setup" in launch_profile["runtime_image"]
     assert "--prepare-snapshot-only" in launch_profile["command"]
+    assert any(entry.endswith(":/workspace/tmp") for entry in launch_profile["rw_mounts"])
+    assert any(entry.startswith("AGENT_HUB_TMP_HOST_PATH=") for entry in launch_profile["env_vars"])
