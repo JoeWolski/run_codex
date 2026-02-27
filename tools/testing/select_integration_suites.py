@@ -37,6 +37,7 @@ SUITE_MAP: list[tuple[str, list[str], list[str]]] = [
     (
         "src/agent_hub/server.py",
         [
+            "tests/integration/test_auto_config_lifecycle.py",
             "tests/integration/test_chat_lifecycle_ready.py",
             "tests/integration/test_hub_chat_lifecycle_api.py",
             "tests/integration/test_hub_api_real_process.py",
