@@ -33,6 +33,7 @@ SUITES_BY_MODE: dict[str, set[str]] = {
         "tests/integration/test_hub_api_real_process.py",
         "tests/integration/test_hub_chat_lifecycle_api.py",
         "tests/integration/test_agent_tools_ack_routes.py",
+        "tests/integration/test_auto_config_lifecycle.py",
         "tests/integration/test_provider_local_e2e.py",
         "tests/integration/test_provider_local_api_real_process.py",
         "tests/integration/test_chat_lifecycle_ready.py",
@@ -50,6 +51,7 @@ REQUIRED_SUITES_BY_MODE: dict[str, set[str]] = {
         "tests/integration/test_hub_chat_lifecycle_api.py",
         "tests/integration/test_agent_tools_ack_routes.py",
         "tests/integration/test_hub_api_real_process.py",
+        "tests/integration/test_auto_config_lifecycle.py",
         "tests/integration/test_provider_local_api_real_process.py",
     },
 }

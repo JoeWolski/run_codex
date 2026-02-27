@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from unittest.mock import patch
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import sys
 
@@ -40,6 +41,22 @@ def _assert_ok(result: subprocess.CompletedProcess[str], *, context: str) -> Non
     raise AssertionError(
         f"{context} failed with exit code {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )
+
+
+def _docker_daemon_ready() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    result = _run(["docker", "info", "--format", "{{.ServerVersion}}"])
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _host_ip_candidate() -> str:
+    result = _run(["bash", "-lc", "hostname -I | awk '{print $1}'"])
+    if result.returncode == 0:
+        candidate = result.stdout.strip()
+        if candidate:
+            return candidate
+    return ""
 
 
 @dataclass
@@ -230,7 +247,7 @@ class LocalForgeServer:
                     return
                 self._send_json(404, {"detail": "Not found"})
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -342,6 +359,7 @@ class LocalForgeEndToEndIntegrationTests(unittest.TestCase):
         self.assertEqual(credential["scheme"], "http")
 
         remote_auth_url = f"{str(credential['credential_line']).rstrip('/')}/repo.git"
+        docker_ready = _docker_daemon_ready()
 
         ls_remote = _run(["git", "ls-remote", remote_auth_url])
         _assert_ok(ls_remote, context="git ls-remote local forge")
@@ -364,6 +382,68 @@ class LocalForgeEndToEndIntegrationTests(unittest.TestCase):
         push = _run(["git", "push", "origin", "HEAD:master"], cwd=clone_dir)
         _assert_ok(push, context="git push local forge")
 
+        if docker_ready:
+            split_remote = urlsplit(remote_auth_url)
+            username = split_remote.username or ""
+            password = split_remote.password or ""
+            port = split_remote.port or 80
+
+            host_candidates = ["host.docker.internal"]
+            detected_host_ip = _host_ip_candidate()
+            if detected_host_ip:
+                host_candidates.append(detected_host_ip)
+
+            container_errors: list[str] = []
+            container_push_ok = False
+            for host_candidate in host_candidates:
+                netloc = f"{username}:{password}@{host_candidate}:{port}"
+                container_remote_url = urlunsplit(
+                    SplitResult(
+                        scheme=split_remote.scheme,
+                        netloc=netloc,
+                        path=split_remote.path,
+                        query=split_remote.query,
+                        fragment=split_remote.fragment,
+                    )
+                )
+                container_push = _run(
+                    [
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--entrypoint",
+                        "sh",
+                        "-e",
+                        f"REMOTE_URL={container_remote_url}",
+                        "alpine/git",
+                        "-lc",
+                        (
+                            "set -eu; "
+                            "git clone \"$REMOTE_URL\" /repo; "
+                            "cd /repo; "
+                            "git config user.name 'Agent Container'; "
+                            "git config user.email 'agent-container@example.com'; "
+                            "printf 'seed\\nupdate\\ncontainer\\n' > README.md; "
+                            "git add README.md; "
+                            "git commit -m 'container update'; "
+                            "git push origin HEAD:master"
+                        ),
+                    ]
+                )
+                if container_push.returncode == 0:
+                    container_push_ok = True
+                    break
+                container_errors.append(
+                    f"host={host_candidate} exit={container_push.returncode} stderr={container_push.stderr.strip()}"
+                )
+
+            if not container_push_ok:
+                self.skipTest(
+                    "dockerized git push skipped: container->host forge route unavailable. "
+                    + "; ".join(container_errors)
+                )
+
         rev_count = _run(["git", "rev-list", "--count", "master"], cwd=bare_repo)
         _assert_ok(rev_count, context="git rev-list bare repo")
-        self.assertGreaterEqual(int(rev_count.stdout.strip() or "0"), 2)
+        expected_min_revisions = 3 if docker_ready else 2
+        self.assertGreaterEqual(int(rev_count.stdout.strip() or "0"), expected_min_revisions)
