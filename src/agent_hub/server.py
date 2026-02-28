@@ -1133,21 +1133,49 @@ def _new_state() -> dict[str, Any]:
         "settings": {
             "default_agent_type": DEFAULT_CHAT_AGENT_TYPE,
             "chat_layout_engine": DEFAULT_CHAT_LAYOUT_ENGINE,
+            "git_user_name": "",
+            "git_user_email": "",
         },
     }
+
+
+def _normalize_git_identity_setting(raw_value: Any, *, field_name: str, strict: bool = False) -> str:
+    value = _compact_whitespace(str(raw_value or "").strip())
+    if any(char in value for char in ("\r", "\n", "\x00")):
+        if strict:
+            raise HTTPException(status_code=400, detail=f"{field_name} must not contain control characters.")
+        value = value.replace("\r", " ").replace("\n", " ").replace("\x00", "")
+        value = _compact_whitespace(value)
+    if len(value) > 256:
+        if strict:
+            raise HTTPException(status_code=400, detail=f"{field_name} must be 256 characters or fewer.")
+        value = value[:256].strip()
+    return value
 
 
 def _normalize_hub_settings_payload(raw_settings: Any) -> dict[str, Any]:
     if not isinstance(raw_settings, dict):
         raw_settings = {}
-    return {
+    normalized = {
         "default_agent_type": _normalize_chat_agent_type(
             raw_settings.get("default_agent_type") or raw_settings.get("defaultAgentType")
         ),
         "chat_layout_engine": _normalize_chat_layout_engine(
             raw_settings.get("chat_layout_engine") or raw_settings.get("chatLayoutEngine")
         ),
+        "git_user_name": _normalize_git_identity_setting(
+            raw_settings.get("git_user_name", raw_settings.get("gitUserName")),
+            field_name="git_user_name",
+        ),
+        "git_user_email": _normalize_git_identity_setting(
+            raw_settings.get("git_user_email", raw_settings.get("gitUserEmail")),
+            field_name="git_user_email",
+        ),
     }
+    if bool(normalized["git_user_name"]) != bool(normalized["git_user_email"]):
+        normalized["git_user_name"] = ""
+        normalized["git_user_email"] = ""
+    return normalized
 
 
 def _normalize_project_credential_binding(raw_binding: Any) -> dict[str, Any]:
@@ -4495,7 +4523,9 @@ class HubState:
             raise HTTPException(status_code=400, detail="Invalid settings payload.")
         has_default_agent_type = "default_agent_type" in update or "defaultAgentType" in update
         has_chat_layout_engine = "chat_layout_engine" in update or "chatLayoutEngine" in update
-        if not has_default_agent_type and not has_chat_layout_engine:
+        has_git_user_name = "git_user_name" in update or "gitUserName" in update
+        has_git_user_email = "git_user_email" in update or "gitUserEmail" in update
+        if not has_default_agent_type and not has_chat_layout_engine and not has_git_user_name and not has_git_user_email:
             raise HTTPException(status_code=400, detail="No settings values provided.")
         state = self.load()
         settings = _normalize_hub_settings_payload(state.get("settings"))
@@ -4509,9 +4539,37 @@ class HubState:
                 update.get("chat_layout_engine", update.get("chatLayoutEngine")),
                 strict=True,
             )
+        if has_git_user_name:
+            settings["git_user_name"] = _normalize_git_identity_setting(
+                update.get("git_user_name", update.get("gitUserName")),
+                field_name="git_user_name",
+                strict=True,
+            )
+        if has_git_user_email:
+            settings["git_user_email"] = _normalize_git_identity_setting(
+                update.get("git_user_email", update.get("gitUserEmail")),
+                field_name="git_user_email",
+                strict=True,
+            )
+        if bool(settings["git_user_name"]) != bool(settings["git_user_email"]):
+            raise HTTPException(
+                status_code=400,
+                detail="git_user_name and git_user_email must both be set or both be empty.",
+            )
         state["settings"] = settings
         self.save(state, reason="settings_updated")
         return settings
+
+    def _git_identity_env_vars_from_settings(self) -> list[str]:
+        settings = self.settings_payload()
+        git_user_name = str(settings.get("git_user_name") or "").strip()
+        git_user_email = str(settings.get("git_user_email") or "").strip()
+        if not git_user_name or not git_user_email:
+            return []
+        return [
+            f"AGENT_HUB_GIT_USER_NAME={git_user_name}",
+            f"AGENT_HUB_GIT_USER_EMAIL={git_user_email}",
+        ]
 
     def _openai_credentials_arg(self) -> list[str]:
         return ["--credentials-file", str(self.openai_credentials_file)]
@@ -6859,6 +6917,8 @@ class HubState:
         normalized_ready_ack_guid = str(ready_ack_guid or "").strip()
         if normalized_ready_ack_guid:
             cmd.extend(["--env-var", f"{AGENT_TOOLS_READY_ACK_GUID_ENV}={normalized_ready_ack_guid}"])
+        for env_entry in self._git_identity_env_vars_from_settings():
+            cmd.extend(["--env-var", env_entry])
 
         for env_entry in env_vars or []:
             if _is_reserved_env_entry(str(env_entry)):

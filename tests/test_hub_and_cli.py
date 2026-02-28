@@ -395,25 +395,37 @@ class HubStateTests(unittest.TestCase):
         initial_settings = self.state.settings_payload()
         self.assertEqual(initial_settings["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
         self.assertEqual(initial_settings["chat_layout_engine"], hub_server.DEFAULT_CHAT_LAYOUT_ENGINE)
+        self.assertEqual(initial_settings["git_user_name"], "")
+        self.assertEqual(initial_settings["git_user_email"], "")
         initial_state_payload = self.state.state_payload()
         self.assertEqual(initial_state_payload["settings"]["default_agent_type"], hub_server.DEFAULT_CHAT_AGENT_TYPE)
         self.assertEqual(initial_state_payload["settings"]["chat_layout_engine"], hub_server.DEFAULT_CHAT_LAYOUT_ENGINE)
+        self.assertEqual(initial_state_payload["settings"]["git_user_name"], "")
+        self.assertEqual(initial_state_payload["settings"]["git_user_email"], "")
 
         updated_settings = self.state.update_settings(
             {
                 "default_agent_type": "claude",
                 "chat_layout_engine": "flexlayout",
+                "git_user_name": "Agent User",
+                "git_user_email": "agent@example.com",
             }
         )
         self.assertEqual(updated_settings["default_agent_type"], "claude")
         self.assertEqual(updated_settings["chat_layout_engine"], "flexlayout")
+        self.assertEqual(updated_settings["git_user_name"], "Agent User")
+        self.assertEqual(updated_settings["git_user_email"], "agent@example.com")
 
         reloaded = self.state.load()
         self.assertEqual(reloaded["settings"]["default_agent_type"], "claude")
         self.assertEqual(reloaded["settings"]["chat_layout_engine"], "flexlayout")
+        self.assertEqual(reloaded["settings"]["git_user_name"], "Agent User")
+        self.assertEqual(reloaded["settings"]["git_user_email"], "agent@example.com")
         updated_state_payload = self.state.state_payload()
         self.assertEqual(updated_state_payload["settings"]["default_agent_type"], "claude")
         self.assertEqual(updated_state_payload["settings"]["chat_layout_engine"], "flexlayout")
+        self.assertEqual(updated_state_payload["settings"]["git_user_name"], "Agent User")
+        self.assertEqual(updated_state_payload["settings"]["git_user_email"], "agent@example.com")
 
     def test_settings_chat_layout_engine_updates_without_changing_default_agent_type(self) -> None:
         self.state.update_settings({"default_agent_type": "gemini"})
@@ -427,6 +439,12 @@ class HubStateTests(unittest.TestCase):
             self.state.update_settings({"chat_layout_engine": "grid-layout"})
         self.assertEqual(exc.exception.status_code, 400)
         self.assertIn("chat_layout_engine must be one of", str(exc.exception.detail))
+
+    def test_settings_require_git_identity_name_and_email_as_pair(self) -> None:
+        with self.assertRaises(HTTPException) as exc:
+            self.state.update_settings({"git_user_name": "Agent User"})
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("must both be set or both be empty", str(exc.exception.detail))
 
     def test_auto_config_analysis_model_prefers_explicit_model(self) -> None:
         self.assertEqual(
@@ -2658,6 +2676,60 @@ Gemini CLI
         self.assertIn(f"GH_TOKEN={TEST_GITHUB_PERSONAL_ACCESS_TOKEN}", cmd)
         self.assertNotIn("AGENT_HUB_GIT_USER_NAME=Agent User", cmd)
         self.assertNotIn("AGENT_HUB_GIT_USER_EMAIL=agentuser@example.com", cmd)
+
+    def test_start_chat_passes_git_identity_env_vars_from_settings(self) -> None:
+        self.state.update_settings(
+            {
+                "git_user_name": "Configured User",
+                "git_user_email": "configured@example.com",
+            }
+        )
+        project = self.state.add_project(
+            repo_url="https://github.com/org/repo.git",
+            default_branch="main",
+            setup_script="echo setup",
+        )
+        chat = self.state.create_chat(
+            project["id"],
+            profile="",
+            ro_mounts=[],
+            rw_mounts=[],
+            env_vars=list(project["default_env_vars"]),
+            agent_args=[],
+        )
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_clone(_: hub_server.HubState, chat_obj: dict[str, str], __: dict[str, str]) -> Path:
+            workspace = self.state.chat_workdir(chat_obj["id"])
+            workspace.mkdir(parents=True, exist_ok=True)
+            return workspace
+
+        class DummyProc:
+            pid = 4245
+
+        def fake_spawn(_: hub_server.HubState, _chat_id: str, cmd: list[str]) -> DummyProc:
+            captured["cmd"] = list(cmd)
+            return DummyProc()
+
+        with patch.object(hub_server.HubState, "_ensure_chat_clone", fake_clone), patch.object(
+            hub_server.HubState, "_sync_checkout_to_remote", lambda *args, **kwargs: None
+        ), patch(
+            "agent_hub.server._docker_image_exists",
+            return_value=True,
+        ), patch(
+            "agent_hub.server._new_artifact_publish_token",
+            return_value="artifact-token-test",
+        ), patch.object(
+            hub_server.HubState,
+            "_spawn_chat_process",
+            fake_spawn,
+        ):
+            self.state.start_chat(chat["id"])
+
+        cmd = captured["cmd"]
+        self.assertIn("AGENT_HUB_GIT_USER_NAME=Configured User", cmd)
+        self.assertIn("AGENT_HUB_GIT_USER_EMAIL=configured@example.com", cmd)
 
     def test_start_chat_passes_standard_gitlab_token_env_var_when_configured(self) -> None:
         self._connect_gitlab_pat()

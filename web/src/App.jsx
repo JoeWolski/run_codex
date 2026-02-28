@@ -81,7 +81,9 @@ const AUTO_CONFIG_CANCELLED_ERROR_TEXT = "Auto-configure was cancelled by user."
 const PROJECT_BUILD_CANCELLED_ERROR_TEXT = "Project build was cancelled by user.";
 const DEFAULT_HUB_SETTINGS = {
   defaultAgentType: DEFAULT_AGENT_TYPE,
-  chatLayoutEngine: DEFAULT_CHAT_LAYOUT_ENGINE
+  chatLayoutEngine: DEFAULT_CHAT_LAYOUT_ENGINE,
+  gitUserName: "",
+  gitUserEmail: ""
 };
 const BRAND_LOGO_ASSET_BY_THEME = Object.freeze({
   light: "/branding/agent-hub-mark-light.svg",
@@ -129,7 +131,9 @@ function normalizeHubStatePayload(rawPayload) {
       ? rawPayload.settings
       : {
         default_agent_type: DEFAULT_HUB_SETTINGS.defaultAgentType,
-        chat_layout_engine: DEFAULT_HUB_SETTINGS.chatLayoutEngine
+        chat_layout_engine: DEFAULT_HUB_SETTINGS.chatLayoutEngine,
+        git_user_name: DEFAULT_HUB_SETTINGS.gitUserName,
+        git_user_email: DEFAULT_HUB_SETTINGS.gitUserEmail
       }
   };
 }
@@ -137,7 +141,9 @@ function normalizeHubStatePayload(rawPayload) {
 function normalizeHubSettings(rawSettings, capabilities = DEFAULT_AGENT_CAPABILITIES) {
   return {
     defaultAgentType: normalizeAgentType(rawSettings?.defaultAgentType || rawSettings?.default_agent_type, capabilities),
-    chatLayoutEngine: normalizeChatLayoutEngine(rawSettings?.chatLayoutEngine || rawSettings?.chat_layout_engine)
+    chatLayoutEngine: normalizeChatLayoutEngine(rawSettings?.chatLayoutEngine || rawSettings?.chat_layout_engine),
+    gitUserName: String(rawSettings?.gitUserName || rawSettings?.git_user_name || "").trim(),
+    gitUserEmail: String(rawSettings?.gitUserEmail || rawSettings?.git_user_email || "").trim()
   };
 }
 
@@ -1692,6 +1698,11 @@ function HubApp() {
   const [hubStateHydrated, setHubStateHydrated] = useState(false);
   const [defaultAgentSettingSaving, setDefaultAgentSettingSaving] = useState(false);
   const [chatLayoutEngineSettingSaving, setChatLayoutEngineSettingSaving] = useState(false);
+  const [gitIdentitySettingSaving, setGitIdentitySettingSaving] = useState(false);
+  const [gitIdentityDraft, setGitIdentityDraft] = useState({
+    gitUserName: DEFAULT_HUB_SETTINGS.gitUserName,
+    gitUserEmail: DEFAULT_HUB_SETTINGS.gitUserEmail
+  });
   const [chatFlexOuterLayoutJson, setChatFlexOuterLayoutJson] = useState(() => {
     const loaded = readLocalStorageJson(CHAT_FLEX_OUTER_LAYOUT_STORAGE_KEY, null);
     return loaded && typeof loaded === "object" ? loaded : null;
@@ -1787,6 +1798,13 @@ function HubApp() {
   agentCapabilitiesRef.current = agentCapabilities;
   chatStartSettingsByProjectRef.current = chatStartSettingsByProject;
   autoConfigStartSettingsRef.current = autoConfigStartSettings;
+
+  useEffect(() => {
+    setGitIdentityDraft({
+      gitUserName: hubSettings.gitUserName,
+      gitUserEmail: hubSettings.gitUserEmail
+    });
+  }, [hubSettings.gitUserEmail, hubSettings.gitUserName]);
 
   const applyStatePayload = useCallback((payload) => {
     const normalizedPayload = normalizeHubStatePayload(payload);
@@ -2484,6 +2502,17 @@ function HubApp() {
     return [{ value: DEFAULT_HUB_SETTINGS.defaultAgentType, label: "Codex" }];
   }, [agentCapabilities]);
   const settingsChatLayoutEngineOptions = useMemo(() => chatLayoutEngineOptions(), []);
+  const gitIdentityDraftNormalized = useMemo(
+    () => ({
+      gitUserName: String(gitIdentityDraft.gitUserName || "").trim(),
+      gitUserEmail: String(gitIdentityDraft.gitUserEmail || "").trim()
+    }),
+    [gitIdentityDraft.gitUserEmail, gitIdentityDraft.gitUserName]
+  );
+  const gitIdentityDraftUnchanged = (
+    gitIdentityDraftNormalized.gitUserName === hubSettings.gitUserName &&
+    gitIdentityDraftNormalized.gitUserEmail === hubSettings.gitUserEmail
+  );
   const createProjectManualMode = shouldShowManualProjectConfigInputs(createProjectConfigMode);
   const autoConfigStartSettingsResolved = normalizeChatStartSettings(
     autoConfigStartSettings,
@@ -2645,6 +2674,48 @@ function HubApp() {
       refreshState().catch(() => {});
     } finally {
       setChatLayoutEngineSettingSaving(false);
+    }
+  }
+
+  async function handleSaveGitIdentitySettings() {
+    const nextGitUserName = String(gitIdentityDraft.gitUserName || "").trim();
+    const nextGitUserEmail = String(gitIdentityDraft.gitUserEmail || "").trim();
+    if (Boolean(nextGitUserName) !== Boolean(nextGitUserEmail)) {
+      setError("Set both git user name and git user email, or clear both.");
+      return;
+    }
+    if (
+      nextGitUserName === hubSettings.gitUserName &&
+      nextGitUserEmail === hubSettings.gitUserEmail
+    ) {
+      return;
+    }
+    setHubState((prev) => ({
+      ...prev,
+      settings: {
+        ...(prev.settings || {}),
+        git_user_name: nextGitUserName,
+        git_user_email: nextGitUserEmail
+      }
+    }));
+    setGitIdentitySettingSaving(true);
+    try {
+      await persistHubSettingsPatch(
+        {
+          git_user_name: nextGitUserName,
+          git_user_email: nextGitUserEmail
+        },
+        {
+          git_user_name: nextGitUserName,
+          git_user_email: nextGitUserEmail
+        }
+      );
+      setError("");
+    } catch (err) {
+      setError(err.message || String(err));
+      refreshState().catch(() => {});
+    } finally {
+      setGitIdentitySettingSaving(false);
     }
   }
 
@@ -5669,6 +5740,65 @@ function HubApp() {
                 ? "Saving chats layout engine..."
                 : "Classic keeps project groups in a vertical stack. FlexLayout groups chats into dockable tabs."}
             </p>
+            <article className="card auth-provider-card settings-git-identity-card">
+              <div className="project-head">
+                <h3>Git identity</h3>
+              </div>
+              <p className="meta settings-git-identity-note">
+                Set the default Git author used in runtime containers for new commits.
+              </p>
+              <form
+                className="settings-git-identity-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  handleSaveGitIdentitySettings();
+                }}
+              >
+                <label className="stack" htmlFor="settings-git-user-name">
+                  <span className="label">Git user name</span>
+                  <input
+                    id="settings-git-user-name"
+                    type="text"
+                    value={gitIdentityDraft.gitUserName}
+                    onChange={(event) =>
+                      setGitIdentityDraft((prev) => ({
+                        ...prev,
+                        gitUserName: event.target.value
+                      }))
+                    }
+                    autoComplete="name"
+                    placeholder="Jane Doe"
+                    disabled={gitIdentitySettingSaving}
+                  />
+                </label>
+                <label className="stack" htmlFor="settings-git-user-email">
+                  <span className="label">Git user email</span>
+                  <input
+                    id="settings-git-user-email"
+                    type="email"
+                    value={gitIdentityDraft.gitUserEmail}
+                    onChange={(event) =>
+                      setGitIdentityDraft((prev) => ({
+                        ...prev,
+                        gitUserEmail: event.target.value
+                      }))
+                    }
+                    autoComplete="email"
+                    placeholder="jane@example.com"
+                    disabled={gitIdentitySettingSaving}
+                  />
+                </label>
+                <div className="actions">
+                  <button
+                    type="submit"
+                    className="btn-secondary btn-small"
+                    disabled={gitIdentitySettingSaving || gitIdentityDraftUnchanged}
+                  >
+                    {gitIdentitySettingSaving ? <SpinnerLabel text="Saving..." /> : "Save Git identity"}
+                  </button>
+                </div>
+              </form>
+            </article>
             <div className="settings-provider-list">
             <article className="card auth-provider-card">
               <div className="project-head">
