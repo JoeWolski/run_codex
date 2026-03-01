@@ -123,6 +123,50 @@ const DEFAULT_AGENT_CAPABILITIES = {
   ]
 };
 
+const UI_LIFECYCLE_TRACE_PREFIX = "[agent-hub-ui]";
+
+const uiLifecycleTrace = (() => {
+  let enabled = false;
+  let sequence = 0;
+  return {
+    setEnabled(nextEnabled) {
+      enabled = Boolean(nextEnabled);
+      if (enabled) {
+        this.log("trace_enabled", {});
+      }
+    },
+    isEnabled() {
+      return enabled;
+    },
+    log(event, payload = {}) {
+      if (!enabled) {
+        return;
+      }
+      sequence += 1;
+      const perfNow = typeof performance !== "undefined" && typeof performance.now === "function"
+        ? Number(performance.now().toFixed(2))
+        : null;
+      const record = {
+        seq: sequence,
+        event: String(event || ""),
+        at: new Date().toISOString(),
+        t_ms: perfNow,
+        ...(payload && typeof payload === "object" ? payload : { value: payload })
+      };
+      console.log(`${UI_LIFECYCLE_TRACE_PREFIX} ${JSON.stringify(record)}`);
+    }
+  };
+})();
+
+function summarizeChatsByStatus(chats) {
+  const summary = {};
+  for (const chat of Array.isArray(chats) ? chats : []) {
+    const status = String(chat?.status || "unknown");
+    summary[status] = (summary[status] || 0) + 1;
+  }
+  return summary;
+}
+
 function normalizeHubStatePayload(rawPayload) {
   return {
     projects: Array.isArray(rawPayload?.projects) ? rawPayload.projects : [],
@@ -765,27 +809,73 @@ function isAutoConfigCancelledError(message) {
 }
 
 async function fetchJson(url, options = {}) {
+  const method = String(options?.method || "GET").toUpperCase();
+  const startedAt = typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+  uiLifecycleTrace.log("fetch_json_start", { url, method });
   const response = await fetch(url, {
     headers: { "Content-Type": "application/json" },
     ...options
   });
+  const elapsedMs = (typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now()) - startedAt;
   if (!response.ok) {
     const text = await response.text();
+    uiLifecycleTrace.log("fetch_json_error", {
+      url,
+      method,
+      status: response.status,
+      elapsed_ms: Number(elapsedMs.toFixed(2))
+    });
     throw new Error(text || `Request failed with status ${response.status}`);
   }
   if (response.status === 204) {
+    uiLifecycleTrace.log("fetch_json_success", {
+      url,
+      method,
+      status: response.status,
+      elapsed_ms: Number(elapsedMs.toFixed(2))
+    });
     return null;
   }
-  return response.json();
+  const payload = await response.json();
+  uiLifecycleTrace.log("fetch_json_success", {
+    url,
+    method,
+    status: response.status,
+    elapsed_ms: Number(elapsedMs.toFixed(2))
+  });
+  return payload;
 }
 
 async function fetchText(url) {
+  const startedAt = typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+  uiLifecycleTrace.log("fetch_text_start", { url });
   const response = await fetch(url);
+  const elapsedMs = (typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now()) - startedAt;
   if (!response.ok) {
     const text = await response.text();
+    uiLifecycleTrace.log("fetch_text_error", {
+      url,
+      status: response.status,
+      elapsed_ms: Number(elapsedMs.toFixed(2))
+    });
     throw new Error(text || `Request failed with status ${response.status}`);
   }
-  return response.text();
+  const text = await response.text();
+  uiLifecycleTrace.log("fetch_text_success", {
+    url,
+    status: response.status,
+    elapsed_ms: Number(elapsedMs.toFixed(2)),
+    text_length: text.length
+  });
+  return text;
 }
 
 function hubEventsSocketUrl() {
@@ -1244,7 +1334,7 @@ function ProjectBuildTerminal({
       fitRef.current = null;
       terminal.dispose();
     };
-  }, []);
+  }, [trace]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -1769,6 +1859,7 @@ function HubApp() {
     defaultGitHostForProvider(GIT_PROVIDER_GITLAB)
   );
   const [showGitlabPersonalAccessTokenDraft, setShowGitlabPersonalAccessTokenDraft] = useState(false);
+  const [lifecycleDebugEnabled, setLifecycleDebugEnabled] = useState(false);
   const stateRefreshInFlightRef = useRef(false);
   const stateRefreshQueuedRef = useRef(false);
   const authRefreshInFlightRef = useRef(false);
@@ -1786,6 +1877,22 @@ function HubApp() {
     layoutsByProjectId: {},
     modelsByProjectId: {}
   });
+  const renderSequenceRef = useRef(0);
+  renderSequenceRef.current += 1;
+  const currentRenderSequence = renderSequenceRef.current;
+  const trace = useCallback((event, payload = {}) => {
+    uiLifecycleTrace.log(event, payload);
+  }, []);
+  trace("hub_app_render", {
+    render_seq: currentRenderSequence,
+    projects: hubState.projects.length,
+    chats: hubState.chats.length,
+    chat_statuses: summarizeChatsByStatus(hubState.chats),
+    pending_sessions: pendingSessions.length,
+    pending_chat_starts: Object.keys(pendingChatStarts || {}).length,
+    pending_container_refreshes: Object.keys(pendingContainerRefreshes || {}).length,
+    active_tab: activeTab
+  });
   const hubSettings = useMemo(
     () => normalizeHubSettings(hubState.settings, agentCapabilities),
     [hubState.settings, agentCapabilities]
@@ -1800,6 +1907,40 @@ function HubApp() {
   autoConfigStartSettingsRef.current = autoConfigStartSettings;
 
   useEffect(() => {
+    uiLifecycleTrace.setEnabled(lifecycleDebugEnabled);
+  }, [lifecycleDebugEnabled]);
+
+  useEffect(() => {
+    trace("hub_app_commit", {
+      render_seq: currentRenderSequence,
+      projects: hubState.projects.length,
+      chats: hubState.chats.length,
+      chat_statuses: summarizeChatsByStatus(hubState.chats),
+      pending_sessions: pendingSessions.length
+    });
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchJson("/api/runtime-flags")
+      .then((payload) => {
+        if (cancelled) {
+          return;
+        }
+        const enabled = Boolean(payload?.ui_lifecycle_debug);
+        setLifecycleDebugEnabled(enabled);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLifecycleDebugEnabled(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     setGitIdentityDraft({
       gitUserName: hubSettings.gitUserName,
       gitUserEmail: hubSettings.gitUserEmail
@@ -1808,6 +1949,11 @@ function HubApp() {
 
   const applyStatePayload = useCallback((payload) => {
     const normalizedPayload = normalizeHubStatePayload(payload);
+    trace("apply_state_payload", {
+      projects: normalizedPayload.projects.length,
+      chats: normalizedPayload.chats.length,
+      chat_statuses: summarizeChatsByStatus(normalizedPayload.chats)
+    });
     setHubState(normalizedPayload);
     setHubStateHydrated(true);
     const serverChatMap = new Map((normalizedPayload.chats || []).map((chat) => [chat.id, chat]));
@@ -1834,9 +1980,17 @@ function HubApp() {
   }, []);
 
   const refreshState = useCallback(async () => {
+    const startedAt = typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now();
+    trace("refresh_state_start", {});
     const payload = await fetchJson("/api/state");
     applyStatePayload(payload);
-  }, [applyStatePayload]);
+    const elapsedMs = (typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : Date.now()) - startedAt;
+    trace("refresh_state_done", { elapsed_ms: Number(elapsedMs.toFixed(2)) });
+  }, [applyStatePayload, trace]);
 
   const refreshAuthSettings = useCallback(async () => {
     const [authPayload, sessionPayload] = await Promise.all([
@@ -1972,9 +2126,11 @@ function HubApp() {
 
   const queueStateRefresh = useCallback(() => {
     if (stateRefreshInFlightRef.current) {
+      trace("queue_state_refresh_coalesced", {});
       stateRefreshQueuedRef.current = true;
       return;
     }
+    trace("queue_state_refresh_start", {});
     stateRefreshInFlightRef.current = true;
     refreshState()
       .then(() => {
@@ -1986,17 +2142,20 @@ function HubApp() {
       .finally(() => {
         stateRefreshInFlightRef.current = false;
         if (stateRefreshQueuedRef.current) {
+          trace("queue_state_refresh_dequeued", {});
           stateRefreshQueuedRef.current = false;
           queueStateRefresh();
         }
       });
-  }, [refreshState]);
+  }, [refreshState, trace]);
 
   const queueAuthRefresh = useCallback(() => {
     if (authRefreshInFlightRef.current) {
+      trace("queue_auth_refresh_coalesced", {});
       authRefreshQueuedRef.current = true;
       return;
     }
+    trace("queue_auth_refresh_start", {});
     authRefreshInFlightRef.current = true;
     refreshAuthSettings()
       .then(() => {
@@ -2008,17 +2167,20 @@ function HubApp() {
       .finally(() => {
         authRefreshInFlightRef.current = false;
         if (authRefreshQueuedRef.current) {
+          trace("queue_auth_refresh_dequeued", {});
           authRefreshQueuedRef.current = false;
           queueAuthRefresh();
         }
       });
-  }, [refreshAuthSettings]);
+  }, [refreshAuthSettings, trace]);
 
   const queueAgentCapabilitiesRefresh = useCallback(() => {
     if (capabilitiesRefreshInFlightRef.current) {
+      trace("queue_capabilities_refresh_coalesced", {});
       capabilitiesRefreshQueuedRef.current = true;
       return;
     }
+    trace("queue_capabilities_refresh_start", {});
     capabilitiesRefreshInFlightRef.current = true;
     refreshAgentCapabilities()
       .catch((err) => {
@@ -2027,11 +2189,12 @@ function HubApp() {
       .finally(() => {
         capabilitiesRefreshInFlightRef.current = false;
         if (capabilitiesRefreshQueuedRef.current) {
+          trace("queue_capabilities_refresh_dequeued", {});
           capabilitiesRefreshQueuedRef.current = false;
           queueAgentCapabilitiesRefresh();
         }
       });
-  }, [refreshAgentCapabilities]);
+  }, [refreshAgentCapabilities, trace]);
 
   const visibleChats = useMemo(() => {
     const serverChats = hubState.chats || [];
@@ -2270,6 +2433,7 @@ function HubApp() {
       if (stopped) {
         return;
       }
+      trace("events_ws_connect_start", { url: hubEventsSocketUrl() });
       ws = new WebSocket(hubEventsSocketUrl());
       ws.addEventListener("message", (event) => {
         if (typeof event.data !== "string") {
@@ -2283,6 +2447,11 @@ function HubApp() {
         }
         const eventType = String(parsed?.type || "");
         const payload = parsed?.payload || {};
+        trace("events_ws_message", {
+          event_type: eventType || "unknown",
+          has_payload: Boolean(payload && typeof payload === "object"),
+          project_build_log_project_id: eventType === "project_build_log" ? String(payload.project_id || "") : ""
+        });
         if (eventType === "pong") {
           return;
         }
@@ -2353,12 +2522,14 @@ function HubApp() {
         }
       });
       ws.addEventListener("close", () => {
+        trace("events_ws_close", { stopped });
         if (stopped) {
           return;
         }
         reconnectTimer = window.setTimeout(connect, 800);
       });
       ws.addEventListener("error", () => {
+        trace("events_ws_error", {});
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
           ws.close();
         }
@@ -2380,7 +2551,8 @@ function HubApp() {
     applyStatePayload,
     queueAgentCapabilitiesRefresh,
     queueAuthRefresh,
-    queueStateRefresh
+    queueStateRefresh,
+    trace
   ]);
 
   useEffect(() => {
@@ -2998,6 +3170,10 @@ function HubApp() {
     try {
       const pendingCreatedAtMs = Date.now();
       uiId = `pending-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+      trace("create_chat_click", {
+        project_id: normalizedProjectId,
+        pending_ui_id: uiId
+      });
       const requestId = `chat-create-${uiId}`;
       const project = projectsById.get(normalizedProjectId);
       const selectedStartSettings = resolveProjectChatStartSettings(
@@ -3026,12 +3202,23 @@ function HubApp() {
       setOpenChats((prev) => ({ ...prev, [uiId]: true }));
       setOpenChatDetails((prev) => ({ ...prev, [uiId]: false }));
       setCollapsedProjectChats((prev) => ({ ...prev, [normalizedProjectId]: false }));
+      trace("create_chat_optimistic_row_added", {
+        project_id: normalizedProjectId,
+        pending_ui_id: uiId,
+        known_server_chat_ids: knownServerChatIds.length
+      });
 
       const response = await fetchJson(`/api/projects/${normalizedProjectId}/chats/start`, {
         method: "POST",
         body: JSON.stringify({ agent_type: agentType, agent_args: agentArgs, request_id: requestId })
       });
       const chatId = response?.chat?.id;
+      trace("create_chat_start_response", {
+        project_id: normalizedProjectId,
+        pending_ui_id: uiId,
+        chat_id: String(chatId || ""),
+        has_chat: Boolean(response?.chat)
+      });
       if (!chatId) {
         removeOptimisticChatRow(uiId);
         setError("Chat start request succeeded but did not include a chat id.");
@@ -3052,14 +3239,28 @@ function HubApp() {
       );
       setPendingChatStarts((prev) => ({ ...prev, [chatId]: Date.now() }));
       setError("");
+      trace("create_chat_state_enqueued", {
+        project_id: normalizedProjectId,
+        pending_ui_id: uiId,
+        chat_id: String(chatId || "")
+      });
       refreshState().catch(() => {});
     } catch (err) {
       if (uiId) {
         removeOptimisticChatRow(uiId);
       }
+      trace("create_chat_error", {
+        project_id: normalizedProjectId,
+        pending_ui_id: uiId,
+        error: err?.message || String(err)
+      });
       setError(err.message || String(err));
       refreshState().catch(() => {});
     } finally {
+      trace("create_chat_finalize", {
+        project_id: normalizedProjectId,
+        pending_ui_id: uiId
+      });
       projectChatCreateLocksRef.current.delete(normalizedProjectId);
       setPendingProjectChatCreates((prev) => {
         if (!prev[normalizedProjectId]) {
@@ -4306,6 +4507,13 @@ function HubApp() {
   }
 
   function renderChatCard(chat, options = {}) {
+    trace("render_chat_card", {
+      chat_id: String(chat?.id || ""),
+      server_chat_id: String(chat?.server_chat_id || ""),
+      status: String(chat?.status || ""),
+      is_running: Boolean(chat?.is_running),
+      is_pending_start: Boolean(chat?.is_pending_start)
+    });
     const resolvedChatId = resolveServerChatId(chat);
     const chatHasServer = hasServerChat(chat);
     const normalizedStatus = String(chat.status || "").toLowerCase();
@@ -4698,6 +4906,11 @@ function HubApp() {
   }
 
   function renderProjectChatGroup(project, keyPrefix = "group") {
+    trace("render_project_chat_group", {
+      project_id: String(project?.id || ""),
+      project_name: String(project?.name || ""),
+      chat_count: (chatsByProject.byProject.get(project.id) || []).length
+    });
     const projectChats = chatsByProject.byProject.get(project.id) || [];
     const buildStatus = String(project.build_status || "pending");
     const canStartChat = buildStatus === "ready";
@@ -4836,6 +5049,10 @@ function HubApp() {
   }
 
   function renderOrphanChatGroup(keyPrefix = "group-orphan") {
+    trace("render_orphan_chat_group", {
+      key: keyPrefix,
+      chat_count: chatsByProject.orphanChats.length
+    });
     return (
       <article className="card project-chat-group" key={keyPrefix}>
         <div
@@ -4866,6 +5083,10 @@ function HubApp() {
   }
 
   function renderClassicChatsLayout() {
+    trace("render_classic_layout", {
+      project_count: orderedProjects.length,
+      orphan_chat_count: chatsByProject.orphanChats.length
+    });
     return (
       <div className="stack chat-groups">
         {orderedProjects.length === 0 ? <div className="empty">No projects yet.</div> : null}
@@ -5160,6 +5381,11 @@ function HubApp() {
   }
 
   function renderFlexLayoutChatsLayout() {
+    trace("render_flex_layout", {
+      project_count: orderedProjects.length,
+      orphan_chat_count: chatsByProject.orphanChats.length,
+      has_outer_model: Boolean(chatFlexOuterModel)
+    });
     if (!chatFlexOuterModel || !chatFlexOuterLayoutReconciledJson) {
       return <div className="empty">No projects yet.</div>;
     }
@@ -5181,6 +5407,7 @@ function HubApp() {
   }
 
   function renderChatsLayoutEngine() {
+    trace("render_chats_layout_engine", { layout_engine: hubSettings.chatLayoutEngine });
     const renderByEngine = {
       [CHAT_LAYOUT_ENGINE_CLASSIC]: renderClassicChatsLayout,
       [CHAT_LAYOUT_ENGINE_FLEXLAYOUT]: renderFlexLayoutChatsLayout

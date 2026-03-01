@@ -1,0 +1,3 @@
+[agent-hub-ui] {"seq":29,"event":"create_chat_click","at":"2026-03-01T15:39:04.659Z","t_ms":2289.14,"project_id":"project-ui-lifecycle","pending_ui_id":"pending-1772379544659-75f93e"}
+[agent-hub-ui] {"seq":30,"event":"create_chat_optimistic_row_added","at":"2026-03-01T15:39:04.660Z","t_ms":2289.62,"project_id":"project-ui-lifecycle","pending_ui_id":"pending-1772379544659-75f93e","known_server_chat_ids":0}
+[agent-hub-ui] {"seq":87,"event":"create_chat_start_response","at":"2026-03-01T15:39:04.744Z","t_ms":2373.86,"project_id":"project-ui-lifecycle","pending_ui_id":"pending-1772379544659-75f93e","chat_id":"813a63353a6d410da325859b3d65a7e1","has_chat":true}
