@@ -46,3 +46,11 @@ Purpose: record recurring high-cost failures and first-try fixes.
   - absolute workspace file (`/workspace/<repo>/<file>`)
   - without host path mapping/rewrite logic
 - Scope: artifact submission from runtime MCP tool in Docker-in-Docker path-mismatch environments.
+
+### Hooks installed in setup snapshot are missing in new chats
+
+- Symptom: setup build logs show `pre-commit installed at .git/hooks/pre-commit`, but fresh chats do not have hooks.
+- Root cause: runtime mounted host checkout over container repo path, and chat clones do not inherit `.git/hooks`.
+- First-try fix: use snapshot-backed image workspace mode (`--project-in-image`) so setup copies repo into image and runs hook install there.
+- Verification: create two fresh chats on same snapshot and confirm `.git/hooks/pre-commit` exists in both without re-running setup.
+- Scope: snapshot-based chat launches where hook state must be shared across chats.

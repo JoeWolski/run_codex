@@ -53,6 +53,9 @@ DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 TMP_DIR_TMPFS_SPEC = "/tmp:mode=1777,exec"
 DEFAULT_RUNTIME_TERM = "xterm-256color"
 DEFAULT_RUNTIME_COLORTERM = "truecolor"
+SNAPSHOT_SOURCE_PROJECT_PATH = str(
+    PurePosixPath(DEFAULT_CONTAINER_HOME) / ".agent-hub-snapshot-source" / "project"
+)
 GIT_CREDENTIALS_SOURCE_PATH = "/tmp/agent_hub_git_credentials_source"
 GIT_CREDENTIALS_FILE_PATH = "/tmp/agent_hub_git_credentials"
 AGENT_HUB_SECRETS_DIR_NAME = "secrets"
@@ -1003,6 +1006,53 @@ def _validate_daemon_visible_mount_source(path: Path, *, label: str) -> None:
             )
 
 
+def _daemon_mount_source_kind(path: Path) -> str:
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{path}:/__agent_cli_mount_probe",
+        "alpine:3.20",
+        "sh",
+        "-lc",
+        "if [ -f /__agent_cli_mount_probe ]; then echo file; "
+        "elif [ -d /__agent_cli_mount_probe ]; then echo dir; "
+        "else echo missing; fi",
+    ]
+    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    if result.returncode != 0:
+        return "unknown"
+    token = str(result.stdout or "").strip().splitlines()
+    if not token:
+        return "unknown"
+    resolved = token[-1].strip().lower()
+    if resolved in {"file", "dir", "missing"}:
+        return resolved
+    return "unknown"
+
+
+def _prepare_daemon_visible_file_mount_source(
+    source: Path,
+    *,
+    label: str,
+) -> Path:
+    source_path = source.resolve()
+    if not source_path.exists() or not source_path.is_file():
+        raise click.ClickException(f"{label} must reference an existing file: {source_path}")
+    _validate_daemon_visible_mount_source(source_path, label=label)
+    if not _is_running_inside_container():
+        return source_path
+
+    source_kind = _daemon_mount_source_kind(source_path)
+    if source_kind == "file":
+        return source_path
+    raise click.ClickException(
+        f"{label} must be daemon-visible as a file but resolved as '{source_kind}': {source_path}. "
+        "Fix host/container path mapping before retrying."
+    )
+
+
 def _normalize_container_path(raw_path: str) -> PurePosixPath:
     normalized = posixpath.normpath(str(raw_path or "").strip())
     if not normalized.startswith("/"):
@@ -1157,8 +1207,16 @@ def _validate_rw_mount(host_path: Path, container_path: str, runtime_uid: int, r
     )
 
 
-def _build_snapshot_setup_shell_script(setup_script: str) -> str:
+def _build_snapshot_setup_shell_script(
+    setup_script: str,
+    *,
+    source_project_path: str,
+    target_project_path: str,
+) -> str:
     normalized_script = (setup_script or "").strip() or ":"
+    source_path = shlex.quote(source_project_path)
+    target_path = shlex.quote(target_project_path)
+    target_parent = shlex.quote(str(PurePosixPath(target_project_path).parent))
     return (
         "set -e\n"
         "set -o pipefail\n"
@@ -1166,6 +1224,12 @@ def _build_snapshot_setup_shell_script(setup_script: str) -> str:
         "mkdir -p /workspace/tmp\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: configuring git safe.directory'\n"
         "git config --global --add safe.directory '*'\n"
+        "printf '%s\\n' '[agent_cli] snapshot bootstrap: copying repository into image workspace'\n"
+        f"mkdir -p {target_parent}\n"
+        f"rm -rf {target_path}\n"
+        f"mkdir -p {target_path}\n"
+        f"cp -a {source_path}/. {target_path}/\n"
+        f"cd {target_path}\n"
         "printf '%s\\n' '[agent_cli] snapshot bootstrap: running project setup script'\n"
         + normalized_script
         + "\n"
@@ -1576,6 +1640,12 @@ def _resolve_base_image(
     help="Build/reuse snapshot image and exit without starting the agent.",
 )
 @click.option(
+    "--project-in-image",
+    is_flag=True,
+    default=False,
+    help="Run without bind-mounting --project; expects repository to already exist in the runtime image.",
+)
+@click.option(
     "--no-alt-screen",
     is_flag=True,
     default=False,
@@ -1621,6 +1691,7 @@ def main(
     setup_script: str | None,
     snapshot_image_tag: str | None,
     prepare_snapshot_only: bool,
+    project_in_image: bool,
     no_alt_screen: bool,
     allocate_tty: bool,
     resume: bool,
@@ -1722,6 +1793,10 @@ def main(
 
     selected_agent_provider = _agent_provider_for_command(selected_agent_command)
     snapshot_tag = (snapshot_image_tag or "").strip()
+    if project_in_image and not snapshot_tag:
+        raise click.ClickException("--project-in-image requires --snapshot-image-tag")
+    if project_in_image and prepare_snapshot_only:
+        raise click.ClickException("--project-in-image cannot be combined with --prepare-snapshot-only")
     cached_snapshot_exists = bool(snapshot_tag) and _docker_image_exists(snapshot_tag)
     if cached_snapshot_exists:
         click.echo(f"Using cached setup snapshot image '{snapshot_tag}'")
@@ -1818,12 +1893,31 @@ def main(
     config_mount_target = f"{container_home_path}/.codex/config.toml"
     mcp_config_mount_target = agent_provider.get_mcp_config_mount_target(container_home_path)
     mcp_config_mount_mode = ""
-    mcp_config_mount_entry = (
-        f"{host_gemini_settings_file}:{mcp_config_mount_target}{mcp_config_mount_mode}"
+    mounted_config_path = _prepare_daemon_visible_file_mount_source(
+        config_path,
+        label="--config-file",
+    )
+    mounted_claude_json_path = _prepare_daemon_visible_file_mount_source(
+        host_claude_json_file,
+        label="Claude settings file",
+    )
+    mounted_gemini_settings_path = _prepare_daemon_visible_file_mount_source(
+        host_gemini_settings_file,
+        label="Gemini settings file",
+    )
+    mcp_mount_source = (
+        mounted_gemini_settings_path
         if isinstance(agent_provider, agent_providers.GeminiProvider)
         else None
     )
-    config_mount_entry = f"{config_path}:{config_mount_target}"
+    mcp_config_mount_entry = (
+        f"{mcp_mount_source}:{mcp_config_mount_target}{mcp_config_mount_mode}"
+        if mcp_mount_source is not None
+        else None
+    )
+    config_mount_entry = f"{mounted_config_path}:{config_mount_target}"
+    project_mount_entry = f"{project_path}:{container_project_path}"
+    use_project_bind_mount = not (bool(snapshot_tag) and (prepare_snapshot_only or project_in_image))
     run_args = [
         "--init",
         "--user",
@@ -1833,15 +1927,13 @@ def main(
         "--workdir",
         container_project_path,
         "--volume",
-        f"{project_path}:{container_project_path}",
-        "--volume",
         f"{DOCKER_SOCKET_PATH}:{DOCKER_SOCKET_PATH}",
         "--volume",
         f"{host_codex_dir}:{container_home_path}/.codex",
         "--volume",
         f"{host_claude_dir}:{container_home_path}/.claude",
         "--volume",
-        f"{host_claude_json_file}:{container_home_path}/.claude.json",
+        f"{mounted_claude_json_path}:{container_home_path}/.claude.json",
         "--volume",
         f"{host_claude_config_dir}:{container_home_path}/.config/claude",
         "--volume",
@@ -1876,6 +1968,8 @@ def main(
         "--env",
         f"UV_PROJECT_ENVIRONMENT={container_project_path}/.venv",
     ]
+    if use_project_bind_mount:
+        run_args.extend(["--volume", project_mount_entry])
 
     run_args.extend(["--group-add", "agent"])
     for supplemental_gid in supplemental_group_ids:
@@ -1910,18 +2004,24 @@ def main(
                 agent_provider=AGENT_PROVIDER_NONE,
             )
             script = (setup_script or "").strip() or ":"
-            setup_bootstrap_script = _build_snapshot_setup_shell_script(script)
+            setup_bootstrap_script = _build_snapshot_setup_shell_script(
+                script,
+                source_project_path=SNAPSHOT_SOURCE_PROJECT_PATH,
+                target_project_path=container_project_path,
+            )
             click.echo(f"Building setup snapshot image '{snapshot_tag}'")
             container_name = (
                 f"agent-setup-{_sanitize_tag_component(project_path.name)}-"
                 f"{_short_hash(snapshot_tag + script)}"
             )
+            setup_run_args = list(run_args)
+            setup_run_args.extend(["--volume", f"{project_path}:{SNAPSHOT_SOURCE_PROJECT_PATH}:ro"])
             setup_cmd = [
                 "docker",
                 "run",
                 "--name",
                 container_name,
-                *run_args,
+                *setup_run_args,
                 setup_runtime_image,
                 "bash",
                 "-lc",
@@ -1997,7 +2097,11 @@ def main(
         )
         if runtime_bridge is not None:
             runtime_run_args = list(run_args)
-            runtime_mount = f"{runtime_bridge.runtime_config_path}:{mcp_config_mount_target}{mcp_config_mount_mode}"
+            runtime_config_mount_source = _prepare_daemon_visible_file_mount_source(
+                runtime_bridge.runtime_config_path,
+                label="agent_tools runtime config",
+            )
+            runtime_mount = f"{runtime_config_mount_source}:{mcp_config_mount_target}{mcp_config_mount_mode}"
             mcp_mount_target = mcp_config_mount_target
 
             replaced_mount = False

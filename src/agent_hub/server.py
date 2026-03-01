@@ -6850,6 +6850,7 @@ class HubState:
         extra_args: list[str] | None = None,
         setup_script: str = "",
         prepare_snapshot_only: bool = False,
+        project_in_image: bool = False,
         runtime_tmp_mount: str = "",
     ) -> list[str]:
         agent_command = AGENT_COMMAND_BY_TYPE.get(agent_type, AGENT_COMMAND_BY_TYPE[DEFAULT_CHAT_AGENT_TYPE])
@@ -6902,6 +6903,8 @@ class HubState:
             cmd.extend(["--setup-script", setup_script])
         if prepare_snapshot_only:
             cmd.append("--prepare-snapshot-only")
+        if project_in_image:
+            cmd.append("--project-in-image")
 
         if artifacts_url:
             cmd.extend(["--env-var", f"AGENT_ARTIFACTS_URL={artifacts_url}"])
@@ -7090,6 +7093,7 @@ class HubState:
             artifacts_token=artifact_publish_token,
             ready_ack_guid=ready_ack_guid,
             resume=resume,
+            project_in_image=True,
             runtime_tmp_mount=str(chat_tmp_workspace),
             context_key=f"chat_launch_profile:{chat_id}",
             extra_args=agent_args,
@@ -11282,6 +11286,7 @@ class HubState:
                 artifacts_token=artifact_publish_token,
                 ready_ack_guid=ready_ack_guid,
                 resume=resume,
+                project_in_image=True,
                 runtime_tmp_mount=str(chat_tmp_workspace),
                 context_key=f"chat_start:{chat_id}",
                 extra_args=agent_args,

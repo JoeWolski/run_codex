@@ -10,6 +10,13 @@
   - chat runtime: `<data-dir>/tmp/projects/<project-id>/chats/<chat-id> -> /workspace/tmp`
 - For nested Docker workflows, use `AGENT_HUB_TMP_HOST_PATH` (injected into runtime containers) as the daemon-visible host source when launching inner containers.
 
+## Snapshot-backed project workspace mode
+
+- Setup snapshots now copy the repository into the snapshot image before executing `setup_script`.
+- Chat launches against snapshot images run with `--project-in-image`, so the repo checkout is not bind-mounted from host.
+- `default_ro_mounts`, `default_rw_mounts`, Docker socket, and `/workspace/tmp` mounts remain unchanged.
+- Any `git` metadata and hooks created by the setup script inside `.git/` become part of the snapshot and are available in all chats using that snapshot tag.
+
 ## First-run deterministic integration flags (Docker-in-Docker)
 
 - Start hub with `--host 0.0.0.0`.

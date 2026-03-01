@@ -75,8 +75,12 @@ def test_prepare_snapshot_reproduces_missing_agent_group_failure(integration_tmp
 
         combined = f"{result.stdout}\n{result.stderr}"
         assert result.returncode != 0, combined
-        assert "Unable to find group agent" in combined
-        assert "docker run" in combined
+        assert (
+            "must be daemon-visible as a file" in combined
+            or "Unable to find group agent" in combined
+        ), combined
+        if "Unable to find group agent" in combined:
+            assert "docker run" in combined
     finally:
         _run(["docker", "rmi", "-f", setup_runtime_tag])
         _run(["docker", "rmi", "-f", snapshot_tag])

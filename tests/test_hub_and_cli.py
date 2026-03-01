@@ -2169,6 +2169,7 @@ Gemini CLI
         self.assertIn("AGENT_ARTIFACT_TOKEN=artifact-token-test", cmd)
         self.assertIn("--snapshot-image-tag", cmd)
         self.assertIn(self.state._project_setup_snapshot_tag(project), cmd)
+        self.assertIn("--project-in-image", cmd)
         self.assertIn("--", cmd)
         self.assertIn("--model", cmd)
         self.assertIn("gpt-5", cmd)
@@ -6516,10 +6517,17 @@ class CliEnvVarTests(unittest.TestCase):
             image_cli._parse_env_var("NO_EQUALS", "--env-var")
 
     def test_snapshot_setup_script_prepares_workspace_tmp(self) -> None:
-        script = image_cli._build_snapshot_setup_shell_script("echo hello")
+        script = image_cli._build_snapshot_setup_shell_script(
+            "echo hello",
+            source_project_path="/workspace/.agent-hub-snapshot-source/project",
+            target_project_path="/workspace/repo",
+        )
 
         self.assertIn("snapshot bootstrap: preparing writable /workspace/tmp", script)
         self.assertIn("mkdir -p /workspace/tmp", script)
+        self.assertIn("snapshot bootstrap: copying repository into image workspace", script)
+        self.assertIn("cp -a /workspace/.agent-hub-snapshot-source/project/. /workspace/repo/", script)
+        self.assertIn("cd /workspace/repo", script)
         self.assertNotIn("chmod", script)
         self.assertLess(
             script.index("mkdir -p /workspace/tmp"),
@@ -6533,6 +6541,41 @@ class CliEnvVarTests(unittest.TestCase):
         self.assertTrue(first_runtime.startswith("agent-runtime-setup-"))
         self.assertTrue(second_runtime.startswith("agent-runtime-setup-"))
         self.assertNotEqual(first_runtime, second_runtime)
+
+    def test_prepare_daemon_visible_file_mount_source_fails_when_daemon_resolves_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "config.toml"
+            source.write_text("model='test'\n", encoding="utf-8")
+            with patch("agent_cli.cli._is_running_inside_container", return_value=True), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind",
+                return_value="dir",
+            ):
+                with self.assertRaises(ClickException) as exc:
+                    image_cli._prepare_daemon_visible_file_mount_source(
+                        source,
+                        label="--config-file",
+                    )
+            self.assertIn("must be daemon-visible as a file", str(exc.exception))
+            self.assertIn("resolved as 'dir'", str(exc.exception))
+
+    def test_prepare_daemon_visible_file_mount_source_accepts_direct_file_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "config.toml"
+            source.write_text("model='test'\n", encoding="utf-8")
+            with patch("agent_cli.cli._is_running_inside_container", return_value=True), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind",
+                return_value="file",
+            ):
+                resolved = image_cli._prepare_daemon_visible_file_mount_source(
+                    source,
+                    label="--config-file",
+                )
+            self.assertEqual(resolved, source.resolve())
 
     def test_snapshot_commit_resets_entrypoint_and_cmd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6550,6 +6593,8 @@ class CliEnvVarTests(unittest.TestCase):
 
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
                 "agent_cli.cli._docker_image_exists", return_value=False
@@ -6597,6 +6642,11 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertEqual(setup_cmd[-4], expected_setup_runtime)
             self.assertEqual(setup_cmd[-3], "bash")
             self.assertEqual(setup_cmd[-2], "-lc")
+            self.assertIn(
+                f"{project.resolve()}:{image_cli.SNAPSHOT_SOURCE_PROJECT_PATH}:ro",
+                setup_cmd,
+            )
+            self.assertNotIn(f"{project.resolve()}:/workspace/project", setup_cmd)
             setup_script = setup_cmd[-1]
             self.assertIn("set -o pipefail", setup_script)
             self.assertIn("git config --global --add safe.directory '*'", setup_script)
@@ -6631,6 +6681,8 @@ class CliEnvVarTests(unittest.TestCase):
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
             ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
@@ -7168,6 +7220,8 @@ class CliEnvVarTests(unittest.TestCase):
             runner = CliRunner()
             with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
                 "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
             ), patch(
                 "agent_cli.cli._read_openai_api_key", return_value=None
             ), patch(
@@ -7928,6 +7982,53 @@ class CliEnvVarTests(unittest.TestCase):
             self.assertIsNotNone(run_cmd)
             assert run_cmd is not None
             self.assertIn(overlay_tag, run_cmd)
+
+    def test_snapshot_runtime_project_in_image_skips_project_bind_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            project = tmp_path / "project"
+            project.mkdir(parents=True, exist_ok=True)
+            config = tmp_path / "agent.config.toml"
+            config.write_text("model = 'test'\n", encoding="utf-8")
+
+            commands: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path | None = None) -> None:
+                del cwd
+                commands.append(list(cmd))
+
+            runner = CliRunner()
+            with patch("agent_cli.cli.shutil.which", return_value="/usr/bin/docker"), patch(
+                "agent_cli.cli._validate_daemon_visible_mount_source", return_value=None
+            ), patch(
+                "agent_cli.cli._daemon_mount_source_kind", return_value="file"
+            ), patch(
+                "agent_cli.cli._read_openai_api_key", return_value=None
+            ), patch(
+                "agent_cli.cli._docker_image_exists", return_value=True
+            ), patch(
+                "agent_cli.cli._run", side_effect=fake_run
+            ):
+                result = runner.invoke(
+                    image_cli.main,
+                    [
+                        "--project",
+                        str(project),
+                        "--config-file",
+                        str(config),
+                        "--snapshot-image-tag",
+                        "snapshot:test",
+                        "--project-in-image",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, msg=result.output)
+            run_cmd = next((cmd for cmd in commands if len(cmd) >= 2 and cmd[:2] == ["docker", "run"]), None)
+            self.assertIsNotNone(run_cmd)
+            assert run_cmd is not None
+            self.assertNotIn(f"{project.resolve()}:/workspace/project", run_cmd)
+            self.assertIn("--workdir", run_cmd)
+            self.assertIn("/workspace/project", run_cmd)
 
     def test_ensure_runtime_image_built_if_missing_waits_for_concurrent_builder(self) -> None:
         target_image = "agent-runtime-claude-test"
